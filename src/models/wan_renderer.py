@@ -1,0 +1,233 @@
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from src.config import WanConfig
+from src.utils.compat import load_diffusers_classes, resolve_torch_dtype
+
+
+class WanRenderer(nn.Module):
+	"""Wan transformer wrapper conditioned directly by Qwen generation states.
+
+	The wrapper removes the text cross-attention branch from the loaded Wan
+	transformer and instead adds projected Qwen generation states to the patch-token
+	representation before the Wan blocks.
+
+	Args:
+		wan_config: Wan branch configuration.
+		condition_dim: Hidden size of the Qwen generation readout.
+		gradient_checkpointing: Whether Wan blocks should use gradient checkpointing.
+	"""
+
+	def __init__(self, wan_config: WanConfig, condition_dim: int, gradient_checkpointing: bool = True):
+		super().__init__()
+		_, _, WanTransformer3DModel = load_diffusers_classes()
+		self.transformer = WanTransformer3DModel.from_pretrained(
+			wan_config.checkpoint_path,
+			subfolder="transformer",
+			local_files_only=True,
+			torch_dtype=resolve_torch_dtype(wan_config.torch_dtype),
+		)
+		if gradient_checkpointing:
+			if hasattr(self.transformer, "enable_gradient_checkpointing"):
+				self.transformer.enable_gradient_checkpointing()
+			else:
+				self.transformer.gradient_checkpointing = True
+
+		self._remove_text_conditioning_modules()
+		self.inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+		self.condition_proj = nn.Linear(condition_dim, self.inner_dim)
+		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim))
+		nn.init.zeros_(self.condition_proj.weight)
+		nn.init.zeros_(self.condition_proj.bias)
+		nn.init.normal_(self.null_cond, std=0.02)
+
+	def _remove_text_conditioning_modules(self) -> None:
+		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""
+
+		for block in self.transformer.blocks:
+			if not hasattr(block, "attn2") or not hasattr(block, "norm2"):
+				raise RuntimeError("The loaded Wan block no longer exposes `attn2`/`norm2`; update the pruning logic.")
+			block.attn2 = None
+			block.norm2 = None
+
+		condition_embedder = self.transformer.condition_embedder
+		if not hasattr(condition_embedder, "text_embedder"):
+			raise RuntimeError("The loaded Wan condition embedder no longer exposes `text_embedder`; update the pruning logic.")
+		condition_embedder.text_embedder = None
+		if hasattr(condition_embedder, "image_embedder"):
+			condition_embedder.image_embedder = None
+
+	def _compute_time_embeddings(
+		self,
+		timestep: Tensor,
+		dtype: torch.dtype,
+		device: torch.device,
+	) -> tuple[Tensor, Tensor]:
+		"""Compute Wan time embeddings from scalar or batched timesteps.
+
+		Args:
+			timestep: Current diffusion timestep for each sample.
+			dtype: Target dtype for the returned tensors.
+			device: Target device.
+
+		Returns:
+			A tuple of:
+			- `temb`, the base time embedding,
+			- `timestep_proj`, the AdaLN modulation parameters reshaped as `(B, 6, D)`.
+		"""
+
+		condition_embedder = self.transformer.condition_embedder
+		timestep = timestep.to(device=device)
+		timestep_features = condition_embedder.timesteps_proj(timestep)
+		timestep_features = timestep_features.to(device=device)
+		temb = condition_embedder.time_embedder(timestep_features).to(dtype=dtype)
+		timestep_proj = condition_embedder.time_proj(condition_embedder.act_fn(temb)).to(dtype=dtype)
+		timestep_proj = timestep_proj.unflatten(1, (6, -1))
+		return temb, timestep_proj
+
+	def _apply_conditioning(self, hidden_states: Tensor, condition_hidden_states: Tensor, token_mask: Tensor | None) -> Tensor:
+		"""Project Qwen states into Wan space and fill padded slots with a learned null token.
+
+		Args:
+			hidden_states: Wan patch-token hidden states with shape `(B, N, D)`.
+			condition_hidden_states: Qwen generation hidden states aligned with Wan tokens.
+			token_mask: Optional boolean mask identifying valid conditioning tokens.
+
+		Returns:
+			The condition tensor projected into Wan hidden space and aligned with `hidden_states`.
+		"""
+
+		condition_hidden_states = self.condition_proj(
+			condition_hidden_states.to(device=hidden_states.device, dtype=hidden_states.dtype)
+		)
+		if token_mask is None:
+			return condition_hidden_states
+
+		null_cond = self.null_cond.to(device=hidden_states.device, dtype=hidden_states.dtype).expand_as(condition_hidden_states)
+		return torch.where(token_mask.unsqueeze(-1), condition_hidden_states, null_cond)
+
+	def _forward_block(
+		self,
+		block: nn.Module,
+		hidden_states: Tensor,
+		timestep_proj: Tensor,
+		rotary_emb,
+	) -> Tensor:
+		"""Run one Wan transformer block without the removed cross-attention path.
+
+		Args:
+			block: One pretrained Wan transformer block.
+			hidden_states: Patch-token hidden states.
+			timestep_proj: Time-conditioning modulation tensor.
+			rotary_emb: Wan rotary embeddings for the current latent grid.
+
+		Returns:
+			Updated hidden states after self-attention and FFN.
+		"""
+
+		shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+			block.scale_shift_table + timestep_proj.float()
+		).chunk(6, dim=1)
+		norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+		attn_output = block.attn1(norm_hidden_states, None, None, rotary_emb)
+		hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+
+		norm_hidden_states = (block.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+			hidden_states
+		)
+		ff_output = block.ffn(norm_hidden_states)
+		hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+		return hidden_states
+
+	# TODO: use rearange from einops, which make the code more readable and succinct, not just this place, but all places in the implementation
+	def _unpatchify(
+		self,
+		hidden_states: Tensor,
+		batch_size: int,
+		post_patch_frames: int,
+		post_patch_height: int,
+		post_patch_width: int,
+	) -> Tensor:
+		"""Reconstruct the `(B, C, T, H, W)` latent tensor from Wan patch tokens.
+
+		Args:
+			hidden_states: Projected Wan patch tokens.
+			batch_size: Batch size.
+			post_patch_frames: Number of temporal patch positions.
+			post_patch_height: Number of height patch positions.
+			post_patch_width: Number of width patch positions.
+
+		Returns:
+			A tensor with shape `(B, C, T, H, W)`.
+		"""
+
+		p_t, p_h, p_w = self.transformer.config.patch_size
+		hidden_states = hidden_states.reshape(
+			batch_size,
+			post_patch_frames,
+			post_patch_height,
+			post_patch_width,
+			p_t,
+			p_h,
+			p_w,
+			-1,
+		)
+		hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+		return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+	def forward(
+		self,
+		hidden_states: Tensor,
+		timestep: Tensor,
+		condition_hidden_states: Tensor,
+		token_mask: Tensor | None = None,
+		return_dict: bool = True,
+	) -> dict[str, Tensor] | Tensor:
+		"""Predict the latent-space denoising output.
+
+		Args:
+			hidden_states: Noisy Wan latents with shape `(B, C, T, H, W)`.
+			timestep: Current timestep per sample.
+			condition_hidden_states: Qwen generation states aligned with Wan patch tokens.
+			token_mask: Optional boolean mask for valid conditioning tokens.
+			return_dict: Whether to return a dict with key `sample`.
+
+		Returns:
+			Either the denoised latent prediction tensor or `{"sample": tensor}`.
+		"""
+
+		batch_size, _, num_frames, height, width = hidden_states.shape
+		p_t, p_h, p_w = self.transformer.config.patch_size
+		post_patch_frames = num_frames // p_t
+		post_patch_height = height // p_h
+		post_patch_width = width // p_w
+		dtype = self.transformer.patch_embedding.weight.dtype
+		device = hidden_states.device
+
+		rotary_emb = self.transformer.rope(hidden_states)
+		hidden_states = self.transformer.patch_embedding(hidden_states.to(dtype=dtype))
+		hidden_states = hidden_states.flatten(2).transpose(1, 2)
+		condition_hidden_states = self._apply_conditioning(hidden_states, condition_hidden_states, token_mask)
+		hidden_states = hidden_states + condition_hidden_states
+
+		temb, timestep_proj = self._compute_time_embeddings(timestep, dtype=hidden_states.dtype, device=device)
+
+		checkpoint_fn = getattr(self.transformer, "_gradient_checkpointing_func", None)
+		for block in self.transformer.blocks:
+			if torch.is_grad_enabled() and self.transformer.gradient_checkpointing and callable(checkpoint_fn):
+				hidden_states = checkpoint_fn(
+					self._forward_block,
+					block, hidden_states, timestep_proj, rotary_emb,
+				)
+			else:
+				hidden_states = self._forward_block(block, hidden_states, timestep_proj, rotary_emb)
+
+		shift, scale = (self.transformer.scale_shift_table.to(device) + temb.unsqueeze(1)).chunk(2, dim=1)
+		hidden_states = (self.transformer.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+		hidden_states = self.transformer.proj_out(hidden_states)
+		output = self._unpatchify(hidden_states, batch_size, post_patch_frames, post_patch_height, post_patch_width)
+
+		if not return_dict:
+			return output
+		return {"sample": output}

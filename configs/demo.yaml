@@ -1,0 +1,59 @@
+dataset:
+  dataset_source: webdataset
+  manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/custom/train-*.tar
+  webdataset_urls: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/FMVC/train-*.tar
+  num_samples: 1000
+  num_reference_images: 3
+  video_num_frames: 81
+  video_frame_stride: 1
+  video_height: 448
+  video_width: 448
+  vis_image_size: 448
+  geo_image_size: 448
+  max_text_length: 512
+  shuffle: true
+  num_workers: 1
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  warmup_steps: 500
+
+training:
+  output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
+  seed: 42
+  num_epochs: 10
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  log_every: 10
+  save_every: 1000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+
+qwen:
+  checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
+  torch_dtype: bfloat16
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+  routed_ffn_mode: lora
+  routed_ffn_lora_rank: 32
+  routed_ffn_lora_alpha: 64
+  routed_ffn_lora_dropout: 0.05
+
+wan:
+  checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Wan2.1-T2V-1.3B
+  torch_dtype: bfloat16
+  vae_enable_slicing: true
+  vae_enable_tiling: true
+  train_scheduler_steps: 1000
+  inference_steps: 30
+
+vggt:
+  checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/VGGT-1B
