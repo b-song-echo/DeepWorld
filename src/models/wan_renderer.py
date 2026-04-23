@@ -1,3 +1,4 @@
+from einops import rearrange
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -140,42 +141,6 @@ class WanRenderer(nn.Module):
 		hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 		return hidden_states
 
-	# TODO: use rearange from einops, which make the code more readable and succinct, not just this place, but all places in the implementation
-	def _unpatchify(
-		self,
-		hidden_states: Tensor,
-		batch_size: int,
-		post_patch_frames: int,
-		post_patch_height: int,
-		post_patch_width: int,
-	) -> Tensor:
-		"""Reconstruct the `(B, C, T, H, W)` latent tensor from Wan patch tokens.
-
-		Args:
-			hidden_states: Projected Wan patch tokens.
-			batch_size: Batch size.
-			post_patch_frames: Number of temporal patch positions.
-			post_patch_height: Number of height patch positions.
-			post_patch_width: Number of width patch positions.
-
-		Returns:
-			A tensor with shape `(B, C, T, H, W)`.
-		"""
-
-		p_t, p_h, p_w = self.transformer.config.patch_size
-		hidden_states = hidden_states.reshape(
-			batch_size,
-			post_patch_frames,
-			post_patch_height,
-			post_patch_width,
-			p_t,
-			p_h,
-			p_w,
-			-1,
-		)
-		hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-		return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
 	def forward(
 		self,
 		hidden_states: Tensor,
@@ -197,11 +162,9 @@ class WanRenderer(nn.Module):
 			Either the denoised latent prediction tensor or `{"sample": tensor}`.
 		"""
 
-		batch_size, _, num_frames, height, width = hidden_states.shape
+		_, _, num_frames, height, width = hidden_states.size()
 		p_t, p_h, p_w = self.transformer.config.patch_size
-		post_patch_frames = num_frames // p_t
-		post_patch_height = height // p_h
-		post_patch_width = width // p_w
+		grid_t, grid_h, grid_w = num_frames // p_t, height // p_h, width // p_w
 		dtype = self.transformer.patch_embedding.weight.dtype
 		device = hidden_states.device
 
@@ -226,8 +189,13 @@ class WanRenderer(nn.Module):
 		shift, scale = (self.transformer.scale_shift_table.to(device) + temb.unsqueeze(1)).chunk(2, dim=1)
 		hidden_states = (self.transformer.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
 		hidden_states = self.transformer.proj_out(hidden_states)
-		output = self._unpatchify(hidden_states, batch_size, post_patch_frames, post_patch_height, post_patch_width)
 
+		# Unpatchification: reconstruct the `(B, C, T, H, W)` latents.
+		output = rearrange(
+			hidden_states,
+			"b (t h w) (pt ph pw c) -> b c (t pt) (h ph) (w pw)",
+			t=grid_t, h=grid_h, w=grid_w, pt=p_t, ph=p_h, pw=p_w,
+		)
 		if not return_dict:
 			return output
 		return {"sample": output}

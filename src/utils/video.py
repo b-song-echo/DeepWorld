@@ -21,11 +21,12 @@ def load_image(path: str | Path) -> Image.Image:
 		A `PIL.Image` converted to RGB.
 	"""
 
-	return Image.open(path).convert("RGB")
+	with Image.open(path) as image:
+		return image.convert("RGB")
 
 
-def center_crop_and_resize(image: Image.Image, height: int, width: int) -> Image.Image:
-	"""Center-crop an image to the requested aspect ratio and resize it.
+def center_crop_to_aspect(image: Image.Image, height: int, width: int) -> Image.Image:
+	"""Center-crop an image to the requested aspect ratio.
 
 	Args:
 		image: Source image.
@@ -33,7 +34,7 @@ def center_crop_and_resize(image: Image.Image, height: int, width: int) -> Image
 		width: Target width.
 
 	Returns:
-		A resized `PIL.Image` with the requested spatial shape.
+		A cropped `PIL.Image` with the requested aspect ratio.
 	"""
 
 	source_w, source_h = image.size
@@ -49,8 +50,28 @@ def center_crop_and_resize(image: Image.Image, height: int, width: int) -> Image
 
 	left = max((source_w - crop_w) // 2, 0)
 	top = max((source_h - crop_h) // 2, 0)
-	image = image.crop((left, top, left + crop_w, top + crop_h))
+	return image.crop((left, top, left + crop_w, top + crop_h))
+
+
+def resize_image(image: Image.Image, height: int, width: int) -> Image.Image:
+	"""Resize an image to the requested spatial shape."""
+
 	return image.resize((width, height), resample=Image.BICUBIC)
+
+
+def center_crop_and_resize(image: Image.Image, height: int, width: int) -> Image.Image:
+	"""Center-crop an image to the requested aspect ratio and resize it.
+
+	Args:
+		image: Source image.
+		height: Target height.
+		width: Target width.
+
+	Returns:
+		A resized `PIL.Image` with the requested spatial shape.
+	"""
+
+	return resize_image(center_crop_to_aspect(image, height, width), height, width)
 
 
 def pil_to_tensor(image: Image.Image, normalize_to_neg_one: bool = False) -> Tensor:

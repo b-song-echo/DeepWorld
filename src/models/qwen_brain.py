@@ -198,7 +198,6 @@ class MoFfn(nn.Module):
 		if modality_ids is None:
 			return self.txt_expert(hidden_states)
 
-		# TODO: prefer flatten and unflatten over reshape, which makes the code more readable and clear in intent, not just for this place, but for all pther places in this codebase
 		flat_hidden = hidden_states.flatten(0, -2)
 		flat_modality = modality_ids.flatten(0, -1)
 		output = torch.empty_like(flat_hidden)
@@ -216,7 +215,6 @@ class MoFfn(nn.Module):
 		return output.view_as(hidden_states)
 
 
-# TODO: is it necessary to inherent GradientCheckpointingLayer? can I simply make it inherent nn.Module?
 class MoFfnQwenDecoderLayer(GradientCheckpointingLayer):
 	"""Qwen decoder layer with the FFN replaced by hard-routed modality experts.
 
@@ -278,6 +276,7 @@ class QwenBrain(nn.Module):
 
 	- frozen Qwen visual features,
 	- frozen VGGT tokens projected into Qwen hidden space,
+	- learned modality marker tokens between the multimodal spans,
 	- prompt token embeddings,
 	- learned generation probe tokens whose final hidden states condition Wan.
 
@@ -292,7 +291,7 @@ class QwenBrain(nn.Module):
 		dtype = resolve_torch_dtype(qwen_config.torch_dtype)
 		# only Qwen3VLModel is needed, but directly loading checkpoint into it results in warnings, here is the workaround
 		self.qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-			qwen_config.checkpoint_path, torch_dtype=dtype,
+			qwen_config.checkpoint_path, local_files_only=True, torch_dtype=dtype,
 		).model
 
 		self.qwen.requires_grad_(False)
@@ -329,18 +328,23 @@ class QwenBrain(nn.Module):
 		self.vggt.requires_grad_(False)
 
 		self.geo_patch_size = self.vggt.aggregator.patch_size
-		# TODO: use size() instead of shape, use dim() instead of ndim, not just at place, but for all places in this codebase
 		geo_hidden_size = self.vggt.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
 		self.geo_bridge = nn.Sequential(
 			nn.Linear(geo_hidden_size, self.hidden_size, dtype=dtype),
 			nn.GELU(),
 			nn.Linear(self.hidden_size, self.hidden_size, dtype=dtype),
 		)
-		
-		self.sep_token = nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype))
-		self.gen_token = nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype))
-		nn.init.normal_(self.sep_token, std=0.02)
-		nn.init.normal_(self.gen_token, std=0.02)
+
+		self.segment_tokens = nn.ParameterDict({
+			"vis": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
+			"geo": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
+			"txt": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
+			"gen": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
+		})
+		self.gen_slot_token = nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype))
+		for token in self.segment_tokens.values():
+			nn.init.normal_(token, std=0.02)
+		nn.init.normal_(self.gen_slot_token, std=0.02)
 
 	def _encode_visual(
 		self, pixel_values: Tensor,
@@ -412,14 +416,14 @@ class QwenBrain(nn.Module):
 
 		patch_size = self.vggt.aggregator.patch_size
 		grid_h = geo_images.size(-2) // patch_size
-		grid_w = geo_images.size(-2) // patch_size
+		grid_w = geo_images.size(-1) // patch_size
 
 		geo_groups: list[list[Tensor]] = []
 		geo_grids: list[list[tuple[int, int, int]]] = []
-		for batch_index in range(geo_images.shape[0]):
+		for batch_index in range(geo_images.size(0)):
 			sample_features: list[Tensor] = []
 			sample_grids: list[tuple[int, int, int]] = []
-			for ref_index in range(geo_images.shape[1]):
+			for ref_index in range(geo_images.size(1)):
 				if not reference_mask[batch_index, ref_index]:
 					continue
 				sample_features.append(geo_tokens[batch_index, ref_index])
@@ -479,6 +483,47 @@ class QwenBrain(nn.Module):
 		next_index = int(positions.max().item()) + 1
 		return positions, next_index
 
+	def _append_span(
+		self,
+		parts: list[Tensor],
+		part_positions: list[Tensor],
+		part_modalities: list[Tensor],
+		embeddings: Tensor,
+		positions: Tensor,
+		modality_id: int,
+	) -> None:
+		"""Append one sequence span and its aligned metadata."""
+
+		parts.append(embeddings)
+		part_positions.append(positions)
+		part_modalities.append(torch.full(
+			(embeddings.size(0),),
+			modality_id,
+			device=embeddings.device,
+			dtype=torch.long,
+		))
+
+	def _append_segment_token(
+		self,
+		token_name: str,
+		modality_id: int,
+		parts: list[Tensor],
+		part_positions: list[Tensor],
+		part_modalities: list[Tensor],
+		cursor: int,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> int:
+		"""Append one learned modality marker token and advance the cursor."""
+
+		segment_token = self.segment_tokens[token_name].to(device=device, dtype=dtype)
+		positions, cursor = self._make_txt_positions(1, cursor, device)
+		self._append_span(
+			parts, part_positions, part_modalities,
+			segment_token, positions, modality_id,
+		)
+		return cursor
+
 	def _build_language_inputs(
 		self,
 		vis_groups: list[list[Tensor]],
@@ -503,6 +548,8 @@ class QwenBrain(nn.Module):
 		Returns:
 			A dictionary containing padded embeddings, masks, position IDs, modality IDs,
 			and bookkeeping for where the generation-token slice lives in each sample.
+			Each sample sequence is prefixed with learned modality marker tokens for the
+			visual, geometry, text, and generation spans.
 		"""
 
 		device = next(self.parameters()).device
@@ -510,7 +557,7 @@ class QwenBrain(nn.Module):
 			txt_input_ids.to(device=device, non_blocking=True)
 		)
 		txt_attention_mask = txt_attention_mask.to(device, non_blocking=True).bool()
-		batch_size = txt_input_ids.shape[0]
+		batch_size = txt_input_ids.size(0)
 
 		sequences: list[Tensor] = []
 		position_ids: list[Tensor] = []
@@ -523,52 +570,67 @@ class QwenBrain(nn.Module):
 			part_modalities: list[Tensor] = []
 			cursor = 0
 
+			cursor = self._append_segment_token(
+				"vis",
+				VIS_MODALITY,
+				parts,
+				part_positions,
+				part_modalities,
+				cursor,
+				device,
+				txt_embeddings.dtype,
+			)
 			for features, grid in zip(vis_groups[batch_index], vis_grids[batch_index]):
 				features = features.to(device)
 				positions, cursor = self._make_grid_positions(grid, cursor, device)
-				parts.append(features)
-				part_positions.append(positions)
-				part_modalities.append(torch.full(
-					(features.size(0),), VIS_MODALITY, device=device, dtype=torch.long
-				))
+				self._append_span(
+					parts, part_positions, part_modalities,
+					features, positions, VIS_MODALITY,
+				)
 
-			separator = self.sep_token.to(device, txt_embeddings.dtype)
-			positions, cursor = self._make_txt_positions(1, cursor, device)
-			parts.append(separator)
-			part_positions.append(positions)
-			part_modalities.append(torch.full(
-				(1,), TXT_MODALITY, device=device, dtype=torch.long)
+			cursor = self._append_segment_token(
+				"geo", GEO_MODALITY, parts, part_positions,
+				part_modalities, cursor, device, txt_embeddings.dtype,
 			)
 
 			for features, grid in zip(geo_groups[batch_index], geo_grids[batch_index]):
 				features = features.to(device)
 				positions, cursor = self._make_grid_positions(grid, cursor, device)
-				parts.append(features)
-				part_positions.append(positions)
-				part_modalities.append(torch.full((
-					features.size(0),), GEO_MODALITY, device=device, dtype=torch.long
-				))
+				self._append_span(
+					parts, part_positions, part_modalities,
+					features, positions, GEO_MODALITY,
+				)
 
 			txt_features = txt_embeddings[batch_index, txt_attention_mask[batch_index]]
-			positions, cursor = self._make_txt_positions(txt_features.shape[0], cursor, device)
-			parts.append(txt_features)
-			part_positions.append(positions)
-			part_modalities.append(torch.full((txt_features.shape[0],), TXT_MODALITY, device=device, dtype=torch.long))
+			cursor = self._append_segment_token(
+				"txt", TXT_MODALITY, parts, part_positions,
+				part_modalities, cursor, device, txt_embeddings.dtype,
+			)
+			positions, cursor = self._make_txt_positions(txt_features.size(0), cursor, device)
+			self._append_span(
+				parts, part_positions, part_modalities,
+				txt_features, positions, TXT_MODALITY,
+			)
 
 			latent_grid = tuple(int(value) for value in latent_patch_grids[batch_index].tolist())
+			cursor = self._append_segment_token(
+				"gen", GEN_MODALITY, parts, part_positions,
+				part_modalities, cursor, device, txt_embeddings.dtype,
+			)
 			gen_positions, cursor = self._make_grid_positions(latent_grid, cursor, device)
 			gen_length = int(torch.prod(latent_patch_grids[batch_index]).item())
 			gen_lengths.append(gen_length)
-			gen_tokens = self.gen_token.to(device=device, dtype=txt_embeddings.dtype).expand(gen_length, -1)
-			parts.append(gen_tokens)
-			part_positions.append(gen_positions)
-			part_modalities.append(torch.full((gen_length,), GEN_MODALITY, device=device, dtype=torch.long))
+			gen_tokens = self.gen_slot_token.to(device=device, dtype=txt_embeddings.dtype).expand(gen_length, -1)
+			self._append_span(
+				parts, part_positions, part_modalities,
+				gen_tokens, gen_positions, GEN_MODALITY,
+			)
 
 			sequences.append(torch.cat(parts, dim=0))
 			position_ids.append(torch.cat(part_positions, dim=1))
 			modality_ids.append(torch.cat(part_modalities, dim=0))
 
-		max_sequence_length = max(sequence.shape[0] for sequence in sequences)
+		max_sequence_length = max(sequence.size(0) for sequence in sequences)
 		inputs_embeds = torch.zeros(batch_size, max_sequence_length, self.hidden_size, device=device, dtype=txt_embeddings.dtype)
 		attention_mask = torch.zeros(batch_size, max_sequence_length, device=device, dtype=torch.long)
 		batched_position_ids = torch.zeros(3, batch_size, max_sequence_length, device=device, dtype=torch.long)
@@ -577,7 +639,7 @@ class QwenBrain(nn.Module):
 
 		gen_slices: list[tuple[int, int]] = []
 		for batch_index, (sequence, pos, mods, gen_length) in enumerate(zip(sequences, position_ids, modality_ids, gen_lengths)):
-			sequence_length = sequence.shape[0]
+			sequence_length = sequence.size(0)
 			inputs_embeds[batch_index, :sequence_length] = sequence
 			attention_mask[batch_index, :sequence_length] = 1
 			batched_position_ids[:, batch_index, :sequence_length] = pos
@@ -633,11 +695,11 @@ class QwenBrain(nn.Module):
 			use_cache=False
 		)
 		last_hidden_state = language_outputs.last_hidden_state
-		max_gen_length = language_inputs["gen_mask"].shape[1]
+		max_gen_length = language_inputs["gen_mask"].size(1)
 		gen_hidden_states = torch.zeros(
-			last_hidden_state.shape[0],
+			last_hidden_state.size(0),
 			max_gen_length,
-			last_hidden_state.shape[-1],
+			last_hidden_state.size(-1),
 			device=last_hidden_state.device,
 			dtype=last_hidden_state.dtype,
 		)

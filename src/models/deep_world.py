@@ -131,14 +131,14 @@ class DeepWorld(nn.Module):
 		p_t, p_h, p_w = self.renderer.transformer.config.patch_size
 		grid = torch.tensor(
 			[
-				latents.shape[2] // p_t,
-				latents.shape[3] // p_h,
-				latents.shape[4] // p_w,
+				latents.size(2) // p_t,
+				latents.size(3) // p_h,
+				latents.size(4) // p_w,
 			],
 			device=latents.device,
 			dtype=torch.long,
 		)
-		return grid.unsqueeze(0).expand(latents.shape[0], -1)
+		return grid.unsqueeze(0).expand(latents.size(0), -1)
 
 	def _build_loss_masks(self, frame_counts: Tensor, latents: Tensor) -> tuple[Tensor, Tensor]:
 		"""Create latent-space and token-space validity masks for padded batches.
@@ -154,7 +154,7 @@ class DeepWorld(nn.Module):
 		"""
 
 		device = latents.device
-		batch_size, _, latent_frames, latent_height, latent_width = latents.shape
+		batch_size, _, latent_frames, latent_height, latent_width = latents.size()
 		valid_latent_frames = ((frame_counts.to(device, non_blocking=True) - 1) // self.vae.config.scale_factor_temporal) + 1
 
 		latent_mask = torch.zeros(batch_size, 1, latent_frames, latent_height, latent_width, device=device, dtype=latents.dtype)
@@ -191,7 +191,7 @@ class DeepWorld(nn.Module):
 		brain_outputs = self.brain(batch, latent_patch_grids=latent_patch_grids)
 
 		noise = torch.randn_like(latents)
-		sigmas = torch.rand(latents.shape[0], device=latents.device, dtype=latents.dtype)
+		sigmas = torch.rand(latents.size(0), device=latents.device, dtype=latents.dtype)
 		sigma_view = sigmas.view(-1, 1, 1, 1, 1)
 		noisy_latents = sigma_view * noise + (1.0 - sigma_view) * latents
 		target = noise - latents
@@ -249,7 +249,7 @@ class DeepWorld(nn.Module):
 
 		latent_frames = (num_frames - 1) // self.vae.config.scale_factor_temporal + 1
 		latents = torch.randn(
-			batch["txt_input_ids"].shape[0],
+			batch["txt_input_ids"].size(0),
 			self.renderer.transformer.config.in_channels,
 			latent_frames,
 			height // self.vae.config.scale_factor_spatial,
@@ -261,13 +261,13 @@ class DeepWorld(nn.Module):
 
 		latent_patch_grids = self._latent_patch_grids(latents)
 		brain_outputs = self.brain(batch, latent_patch_grids=latent_patch_grids)
-		token_mask = brain_outputs["gen_mask"][:, : brain_outputs["gen_hidden_states"].shape[1]]
+		token_mask = brain_outputs["gen_mask"][:, : brain_outputs["gen_hidden_states"].size(1)]
 		self.scheduler.set_timesteps(num_inference_steps or self.config.wan.inference_steps, device=device)
 
 		for timestep in self.scheduler.timesteps:
 			model_output = self.renderer(
 				hidden_states=latents,
-				timestep=timestep.expand(latents.shape[0]),
+				timestep=timestep.expand(latents.size(0)),
 				condition_hidden_states=brain_outputs["gen_hidden_states"],
 				token_mask=token_mask,
 				return_dict=True,

@@ -14,6 +14,7 @@ from transformers import AutoProcessor, get_cosine_schedule_with_warmup
 from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
+from src.utils.compat import get_world_size
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,8 +45,7 @@ def create_accelerator(model: DeepWorld, output_dir: str, grad_acc_steps: int, m
 		A configured `Accelerator`.
 	"""
 
-	# TODO: use a utility function to obtain world_size, rather than relying on environment variable
-	world_size = int(os.environ.get("WORLD_SIZE", "1"))
+	world_size = get_world_size()
 	ignored_modules = [
 		model.vae,
 		model.renderer,
@@ -178,7 +178,9 @@ def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, step: int,
 	torch.save(state_dict, checkpoint_dir / "model.pt")
 
 
-def set_preliminaries():
+def set_preliminaries() -> None:
+	"""Apply process-wide runtime defaults before model construction."""
+
 	os.environ.setdefault("HF_HUB_OFFLINE", "1")
 	os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 	os.environ.setdefault("DIFFUSERS_OFFLINE", "1")

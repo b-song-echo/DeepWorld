@@ -1,3 +1,4 @@
+import os
 import importlib
 import sys
 import types
@@ -30,6 +31,22 @@ def resolve_torch_dtype(name: str) -> torch.dtype:
 	if key not in table:
 		raise ValueError(f"Unsupported torch dtype: {name}")
 	return table[key]
+
+
+def get_world_size() -> int:
+	"""Return the active distributed world size.
+
+	The helper prefers the initialized torch.distributed process group when
+	available, and otherwise falls back to the launcher-provided `WORLD_SIZE`
+	environment variable.
+
+	Returns:
+		The distributed world size, or `1` for single-process execution.
+	"""
+
+	if torch.distributed.is_available() and torch.distributed.is_initialized():
+		return max(int(torch.distributed.get_world_size()), 1)
+	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
 def ensure_local_vggt_importable(repo_root: str | Path | None = None, local_source_dir: str = "vggt-main") -> None:

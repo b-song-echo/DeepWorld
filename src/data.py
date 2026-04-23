@@ -11,13 +11,15 @@ from torch import Tensor
 from torch.utils.data import Dataset, IterableDataset
 
 from src.config import DatasetConfig
+from src.utils.compat import get_world_size
 from src.utils.video import (
-	center_crop_and_resize,
+	center_crop_to_aspect,
 	decode_video_frames,
 	load_image,
 	load_video_frames,
 	load_video_frames_from_raw_frames,
 	pil_to_tensor,
+	resize_image,
 	sample_reference_images,
 )
 
@@ -174,12 +176,31 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 			raise ValueError("`dataset.webdataset_urls` must be provided for `dataset_source=webdataset`.")
 		if config.num_samples <= 0:
 			raise ValueError("`dataset.num_samples` must be positive for `dataset_source=webdataset`.")
+		self.shard_paths = self._resolve_shard_paths(config.webdataset_urls)
 
 	def __len__(self) -> int:
 		"""Return the approximate sample count seen by one distributed process."""
 
-		world_size = max(int(torch.distributed.get_world_size()) if torch.distributed.is_initialized() else 1, 1)
-		return math.ceil(self.config.num_samples / world_size)
+		return math.ceil(self.config.num_samples / get_world_size())
+
+	def _resolve_shard_paths(self, urls: list[str] | str) -> list[str]:
+		"""Resolve the configured shard globs into a stable path list.
+
+		Args:
+			urls: One or more shard glob patterns.
+
+		Returns:
+			A sorted list of matching shard paths.
+
+		Raises:
+			ValueError: If none of the shard patterns match.
+		"""
+
+		patterns = urls if isinstance(urls, list) else [urls]
+		shard_paths = sorted(path for pattern in patterns for path in glob.glob(pattern))
+		if len(shard_paths) == 0:
+			raise ValueError(f"No WebDataset shards matched: {patterns}")
+		return shard_paths
 
 	def _parse_metadata(self, metadata: bytes | str | dict[str, Any]) -> dict[str, Any]:
 		"""Convert the stored metadata payload into a Python dictionary.
@@ -234,11 +255,9 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 
 	def __iter__(self):
 		"""Iterate over grouped `.mp4` + `.json` tar samples."""
-		
-		urls = self.config.webdataset_urls
-		urls = urls if isinstance(urls, list) else [urls]
+
 		dataset = wds.WebDataset(
-			sorted([path for url in urls for path in glob.glob(url)]),
+			self.shard_paths,
 			shardshuffle=100 if self.config.shuffle else False,
 			nodesplitter=wds.split_by_node,
 			workersplitter=wds.split_by_worker,
@@ -313,8 +332,9 @@ class WorldModelBatchCollator:
 
 		for batch_index, sample in enumerate(samples):
 			for ref_index, image in enumerate(sample.reference_images):
-				vis_image = center_crop_and_resize(image, vis_size, vis_size)
-				geo_image = vis_image if geo_size == vis_size else center_crop_and_resize(image, geo_size, geo_size)
+				cropped_image = center_crop_to_aspect(image, vis_size, vis_size)
+				vis_image = resize_image(cropped_image, vis_size, vis_size)
+				geo_image = vis_image if geo_size == vis_size else resize_image(cropped_image, geo_size, geo_size)
 				vis_images_flat.append(vis_image)
 				geo_images[batch_index, ref_index] = pil_to_tensor(geo_image, normalize_to_neg_one=False)
 				reference_mask[batch_index, ref_index] = True
@@ -333,15 +353,15 @@ class WorldModelBatchCollator:
 			- per-sample valid frame counts before padding.
 		"""
 
-		max_frames = max(sample.video.shape[0] for sample in samples)
-		height = samples[0].video.shape[-2]
-		width = samples[0].video.shape[-1]
+		max_frames = max(sample.video.size(0) for sample in samples)
+		height = samples[0].video.size(-2)
+		width = samples[0].video.size(-1)
 		videos = torch.zeros(len(samples), 3, max_frames, height, width, dtype=torch.float32)
 		frame_counts = torch.zeros(len(samples), dtype=torch.long)
 
 		for batch_index, sample in enumerate(samples):
 			video = sample.video
-			num_frames = video.shape[0]
+			num_frames = video.size(0)
 			frame_counts[batch_index] = num_frames
 			videos[batch_index, :, :num_frames] = video.permute(1, 0, 2, 3)
 			if num_frames < max_frames:
