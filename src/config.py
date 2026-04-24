@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Type, TypeVar
 
@@ -6,7 +6,15 @@ import yaml
 
 
 def _resolve_lora_alpha(alpha: int | None, rank: int) -> int:
-	"""Resolve a LoRA alpha value, defaulting to `2 * rank` when omitted."""
+	"""Resolve a LoRA alpha value, defaulting to `2 * rank` when omitted.
+
+	Args:
+		alpha: Optional configured LoRA alpha value.
+		rank: LoRA rank used by the same adapter.
+
+	Returns:
+		The explicit alpha value, or the conventional `2 * rank` default.
+	"""
 
 	return 2 * rank if alpha is None else int(alpha)
 
@@ -30,6 +38,7 @@ class DatasetConfig:
 		max_text_length: Maximum prompt token length after tokenization.
 		shuffle: Whether to use randomized temporal clips during training.
 		num_workers: Number of dataloader workers.
+		prefetch_factor: Number of batches loaded in advance by each worker.
 		pin_memory: Whether to enable pinned-memory dataloader buffers.
 		persistent_workers: Whether worker processes should stay alive across epochs.
 	"""
@@ -48,6 +57,7 @@ class DatasetConfig:
 	max_text_length: int = 512
 	shuffle: bool = True
 	num_workers: int = 8
+	prefetch_factor: int | None = None
 	pin_memory: bool = True
 	persistent_workers: bool = True
 
@@ -86,6 +96,7 @@ class TrainingConfig:
 		log_every: Logging interval in optimizer steps.
 		save_every: Checkpoint interval in optimizer steps.
 		mixed_precision: Accelerate precision mode such as `bf16`.
+		use_fsdp: Whether multi-process training should use FSDP instead of DDP.
 		gradient_checkpointing: Whether model submodules enable checkpointing when supported.
 	"""
 
@@ -96,18 +107,20 @@ class TrainingConfig:
 	gradient_accumulation_steps: int = 1
 	log_every: int = 10
 	save_every: int = 1000
-	eval_every: int = 0
 	mixed_precision: str = "bf16"
+	use_fsdp: bool = True
 	gradient_checkpointing: bool = True
 
 
 @dataclass
-class QwenConfig:
+class QwenBrainConfig:
 	"""Configuration for the Qwen brain branch.
 
 	Attributes:
 		checkpoint_path: Local path to the Qwen3-VL checkpoint directory.
-		torch_dtype: Requested load dtype.
+		transformer_dtype: Requested Qwen language/vision load dtype. If omitted, the checkpoint default is used.
+		vggt_checkpoint_path: Local path to the VGGT checkpoint directory.
+		vggt_dtype: Optional dtype applied to VGGT after loading. If omitted, the checkpoint default is used.
 		lora_rank: LoRA rank used for language-model attention projections.
 		lora_alpha: Optional LoRA scaling factor. If omitted, defaults to `2 * lora_rank`.
 		lora_dropout: LoRA dropout probability.
@@ -119,7 +132,9 @@ class QwenConfig:
 	"""
 
 	checkpoint_path: str = "checkpoints/Qwen3-VL-8B-Instruct"
-	torch_dtype: str = "bfloat16"
+	transformer_dtype: str | None = "bfloat16"
+	vggt_checkpoint_path: str = "checkpoints/VGGT-1B"
+	vggt_dtype: str | None = None
 	lora_rank: int = 32
 	lora_alpha: int | None = None
 	lora_dropout: float = 0.05
@@ -135,12 +150,13 @@ class QwenConfig:
 
 
 @dataclass
-class WanConfig:
+class WanRendererConfig:
 	"""Configuration for the Wan renderer branch.
 
 	Attributes:
 		checkpoint_path: Local path to the Wan diffusers checkpoint directory.
-		torch_dtype: Requested load dtype.
+		transformer_dtype: Requested Wan transformer load dtype. If omitted, the checkpoint default is used.
+		vae_dtype: Optional Wan VAE load dtype. If omitted, the checkpoint default is used.
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
@@ -149,22 +165,12 @@ class WanConfig:
 	"""
 
 	checkpoint_path: str = "checkpoints/Wan2.1-T2V-1.3B-Diffusers"
-	torch_dtype: str = "bfloat16"
+	transformer_dtype: str | None = "bfloat16"
+	vae_dtype: str | None = None
 	vae_enable_slicing: bool = False
 	vae_enable_tiling: bool = False
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
-
-
-@dataclass
-class VGGTConfig:
-	"""Configuration for the frozen VGGT geometry encoder.
-
-	Attributes:
-		checkpoint_path: Local path to the VGGT checkpoint directory.
-	"""
-
-	checkpoint_path: str = "checkpoints/VGGT-1B"
 
 
 @dataclass
@@ -174,9 +180,8 @@ class WorldModelConfig:
 	dataset: DatasetConfig = field(default_factory=DatasetConfig)
 	optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 	training: TrainingConfig = field(default_factory=TrainingConfig)
-	qwen: QwenConfig = field(default_factory=QwenConfig)
-	wan: WanConfig = field(default_factory=WanConfig)
-	vggt: VGGTConfig = field(default_factory=VGGTConfig)
+	qwen_brain: QwenBrainConfig = field(default_factory=QwenBrainConfig)
+	wan_renderer: WanRendererConfig = field(default_factory=WanRendererConfig)
 
 
 T = TypeVar("T")
@@ -193,6 +198,10 @@ def _dataclass_from_dict(cls: Type[T], payload: Dict[str, Any]) -> T:
 		An instance of `cls`.
 	"""
 
+	valid_fields = {field.name for field in fields(cls)}
+	unknown_fields = sorted(set(payload) - valid_fields)
+	if unknown_fields:
+		raise ValueError(f"Unknown {cls.__name__} config field(s): {', '.join(unknown_fields)}")
 	return cls(**payload)
 
 
@@ -208,11 +217,14 @@ def load_config(path: str | Path) -> WorldModelConfig:
 
 	with Path(path).open("r", encoding="utf-8") as handle:
 		payload = yaml.safe_load(handle) or {}
+	valid_sections = {field.name for field in fields(WorldModelConfig)}
+	unknown_sections = sorted(set(payload) - valid_sections)
+	if unknown_sections:
+		raise ValueError(f"Unknown root config section(s): {', '.join(unknown_sections)}")
 	return WorldModelConfig(
 		dataset=_dataclass_from_dict(DatasetConfig, payload.get("dataset", {})),
 		optimizer=_dataclass_from_dict(OptimizerConfig, payload.get("optimizer", {})),
 		training=_dataclass_from_dict(TrainingConfig, payload.get("training", {})),
-		qwen=_dataclass_from_dict(QwenConfig, payload.get("qwen", {})),
-		wan=_dataclass_from_dict(WanConfig, payload.get("wan", {})),
-		vggt=_dataclass_from_dict(VGGTConfig, payload.get("vggt", {})),
+		qwen_brain=_dataclass_from_dict(QwenBrainConfig, payload.get("qwen_brain", {})),
+		wan_renderer=_dataclass_from_dict(WanRendererConfig, payload.get("wan_renderer", {})),
 	)

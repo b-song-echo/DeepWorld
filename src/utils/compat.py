@@ -7,18 +7,21 @@ from pathlib import Path
 import torch
 
 
-def resolve_torch_dtype(name: str) -> torch.dtype:
+def resolve_torch_dtype(name: str | None) -> torch.dtype | None:
 	"""Convert a user-facing dtype string into a `torch.dtype`.
 
 	Args:
-		name: String such as `bf16`, `bfloat16`, `fp16`, or `float32`.
+		name: String such as `bf16`, `bfloat16`, `fp16`, or `float32`, or `None`.
 
 	Returns:
-		The matching `torch.dtype`.
+		The matching `torch.dtype`, or `None` when the checkpoint default should be used.
 
 	Raises:
 		ValueError: If the string is not recognized.
 	"""
+	if name is None:
+		return None
+
 	table = {
 		"float16": torch.float16,
 		"fp16": torch.float16,

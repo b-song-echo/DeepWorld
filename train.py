@@ -1,11 +1,12 @@
 import os
 import argparse
+import json
 import math
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
-from accelerate.utils import set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
@@ -32,7 +33,52 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-def create_accelerator(model: DeepWorld, output_dir: str, grad_acc_steps: int, mixed_precision: str) -> Accelerator:
+def align_fsdp_managed_dtypes(model: DeepWorld) -> None:
+	"""Align non-ignored module dtypes for FSDP flattening.
+
+	FSDP requires each flattened parameter group to use one dtype. Frozen encoders
+	that intentionally keep their own dtype are ignored by FSDP; all remaining
+	trainable and wrapped modules are cast to the Qwen language-model dtype.
+
+	Args:
+		model: Unprepared world-model instance.
+	"""
+
+	target_dtype = next(model.brain.language_model.parameters()).dtype
+	managed_modules = (
+		model.brain.language_model,
+		model.brain.geo_bridge,
+		model.brain.segment_tokens,
+		model.renderer.transformer,
+		model.renderer.condition_proj,
+	)
+	managed_parameters = (
+		model.brain.gen_slot_token,
+		model.renderer.null_cond,
+	)
+	managed_dtypes = {
+		parameter.dtype
+		for module in managed_modules
+		for parameter in module.parameters(recurse=True)
+	}
+	managed_dtypes.update(parameter.dtype for parameter in managed_parameters)
+	if managed_dtypes <= {target_dtype}:
+		return
+
+	for module in managed_modules:
+		module.to(dtype=target_dtype)
+	for parameter in managed_parameters:
+		with torch.no_grad():
+			parameter.data = parameter.data.to(dtype=target_dtype)
+
+
+def create_accelerator(
+	model: DeepWorld,
+	output_dir: str,
+	grad_acc_steps: int,
+	mixed_precision: str,
+	use_fsdp: bool,
+) -> Accelerator:
 	"""Create the Accelerate runtime and optional in-code FSDP plugin.
 
 	Args:
@@ -40,18 +86,21 @@ def create_accelerator(model: DeepWorld, output_dir: str, grad_acc_steps: int, m
 		output_dir: Directory used for tracker output.
 		grad_acc_steps: Gradient accumulation steps.
 		mixed_precision: Mixed precision mode such as `bf16`.
+		use_fsdp: Whether multi-process training should use FSDP instead of DDP.
 
 	Returns:
 		A configured `Accelerator`.
 	"""
 
 	world_size = get_world_size()
+	fsdp_enabled = use_fsdp and world_size > 1
+	if fsdp_enabled:
+		align_fsdp_managed_dtypes(model)
+
 	ignored_modules = [
-		model.vae,
-		model.renderer,
-		model.brain.vggt,
-		model.brain.geo_bridge,
-		model.brain.qwen.visual,
+		model.renderer.vae,
+		model.brain.geometry_encoder,
+		model.brain.vision_encoder,
 	]
 
 	fsdp_plugin = FullyShardedDataParallelPlugin(
@@ -63,20 +112,23 @@ def create_accelerator(model: DeepWorld, output_dir: str, grad_acc_steps: int, m
 		backward_prefetch="BACKWARD_PRE",
 		forward_prefetch=False,
 		activation_checkpointing=False,
-		sync_module_states=True,
 		ignored_modules=ignored_modules,
 		use_orig_params=True,
 		limit_all_gathers=True,
 		cpu_ram_efficient_loading=True,
+		sync_module_states=True,
 		cpu_offload=False
-	)
+	) if fsdp_enabled else None
 	
 	return Accelerator(
 		gradient_accumulation_steps=grad_acc_steps,
 		mixed_precision=mixed_precision,
 		log_with="tensorboard",
-		project_dir=output_dir,
-		fsdp_plugin=fsdp_plugin if world_size > 1 else None,
+		project_config=ProjectConfiguration(
+			project_dir=output_dir,
+			logging_dir=str(Path(output_dir) / "logs"),
+		),
+		fsdp_plugin=fsdp_plugin,
 	)
 
 
@@ -124,10 +176,11 @@ def log_parameter_summary(accelerator: Accelerator, model: DeepWorld) -> None:
 		f"trainable={_format_count(trainable_parameters)} ({_format_bytes(trainable_bytes)})."
 	)
 	for name, module in (
-		("brain.qwen", model.brain.qwen),
-		("brain.vggt", model.brain.vggt),
-		("renderer", model.renderer),
-		("vae", model.vae),
+		("brain.language_model", model.brain.language_model),
+		("brain.vision_encoder", model.brain.vision_encoder),
+		("brain.geometry_encoder", model.brain.geometry_encoder),
+		("renderer.transformer", model.renderer.transformer),
+		("renderer.vae", model.renderer.vae),
 	):
 		module_parameters, module_bytes = _count_parameters(module)
 		module_trainable, _ = _count_parameters(module, trainable_only=True)
@@ -156,7 +209,7 @@ def log_runtime_setup(accelerator: Accelerator, model: torch.nn.Module) -> None:
 		pass
 	accelerator.print(
 		f"FSDP active={is_fsdp_wrapped}. Ignored branches: "
-		"`vae`, `renderer`, `brain.vggt`, `brain.geo_bridge`, `brain.qwen.visual`."
+		"`renderer.vae`, `brain.geometry_encoder`, `brain.vision_encoder`."
 	)
 
 
@@ -170,12 +223,14 @@ def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, step: int,
 		output_dir: Root directory where checkpoints should be written.
 	"""
 
-	if not accelerator.is_main_process:
-		return
-	checkpoint_dir = output_dir / f"checkpoint-{step}"
-	checkpoint_dir.mkdir(parents=True, exist_ok=True)
+	# NOTE: accelerator.get_state_dict must be called on every processes, or the program will hang because the main process is indefinitely waiting for others.
+	accelerator.wait_for_everyone()
 	state_dict = accelerator.get_state_dict(model)
-	torch.save(state_dict, checkpoint_dir / "model.pt")
+	if accelerator.is_main_process:
+		checkpoint_dir = output_dir / f"checkpoint-{step}"
+		checkpoint_dir.mkdir(parents=True, exist_ok=True)
+		torch.save(state_dict, checkpoint_dir / "model.pt")
+	accelerator.wait_for_everyone()
 
 
 def set_preliminaries() -> None:
@@ -220,15 +275,20 @@ def main() -> None:
 		output_dir=config.training.output_dir,
 		grad_acc_steps=config.training.gradient_accumulation_steps,
 		mixed_precision=config.training.mixed_precision,
+		use_fsdp=config.training.use_fsdp,
 	)
-	accelerator.init_trackers("world-model", config=vars(config.training))
+	accelerator.init_trackers(
+		"DeepWorld",
+		config=vars(config.training),
+		init_kwargs={"tensorboard": {"flush_secs": 10, "max_queue": 1}},
+	)
+	metrics_log = None
+	if accelerator.is_main_process:
+		metrics_log = (output_dir / "metrics.jsonl").open("a", encoding="utf-8", buffering=1)
+		metrics_log.write(json.dumps({"event": "start", "step": 0}, sort_keys=True) + "\n")
+		metrics_log.flush()
+		os.fsync(metrics_log.fileno())
 	log_parameter_summary(accelerator, model)
-
-	# ----------------------
-	# FSDP preparation breaks, still not solved
-	# this is a workaround
-	# model.to(accelerator.device)
-	# ----------------------
 	
 	optimizer = AdamW(
 		[p for p in model.parameters() if p.requires_grad],
@@ -239,12 +299,12 @@ def main() -> None:
 	)
 
 	dataset = build_dataset(config.dataset)
-	processor = AutoProcessor.from_pretrained(config.qwen.checkpoint_path, local_files_only=True)
+	processor = AutoProcessor.from_pretrained(config.qwen_brain.checkpoint_path, local_files_only=True)
 	collator = WorldModelBatchCollator(
 		dataset_config=config.dataset,
 		tokenizer=processor.tokenizer,
 		image_processor=processor.image_processor,
-		geo_patch_size=model.brain.vggt.aggregator.patch_size,
+		geo_patch_size=model.brain.geo_patch_size,
 	)
 	if collator.geo_image_size != config.dataset.vis_image_size:
 		accelerator.print(
@@ -255,10 +315,11 @@ def main() -> None:
 	dataloader = DataLoader(
 		dataset=dataset,
 		batch_size=config.training.per_device_batch_size,
-		shuffle=config.dataset.shuffle if not isinstance(dataset, IterableDataset) else False,
+		shuffle=(not isinstance(dataset, IterableDataset)) and config.dataset.shuffle,
 		num_workers=config.dataset.num_workers,
 		pin_memory=config.dataset.pin_memory and torch.cuda.is_available(),
 		persistent_workers=config.dataset.persistent_workers and config.dataset.num_workers > 0,
+		prefetch_factor=config.dataset.prefetch_factor,
 		collate_fn=collator
 	)
 
@@ -303,12 +364,20 @@ def main() -> None:
 					loss_value = accelerator.gather(loss.detach().float()).mean().item()
 					progress_bar.update(1)
 					progress_bar.set_postfix(step=global_step - 1, epoch=epoch + 1, loss=f"{loss_value:.4f}")
-					if config.training.log_every > 0 and global_step % config.training.log_every == 0:
-						accelerator.log({
+					should_log = config.training.log_every > 0 and (
+						global_step == 1 or global_step % config.training.log_every == 0
+					)
+					if should_log:
+						metrics = {
 							"train/loss": loss_value,
 							"train/lr": lr_scheduler.get_last_lr()[0],
 							"train/epoch": epoch + 1,
-						}, step=global_step)
+						}
+						accelerator.log(metrics, step=global_step)
+						if metrics_log is not None:
+							metrics_log.write(json.dumps({"step": global_step, **metrics}, sort_keys=True) + "\n")
+							metrics_log.flush()
+							os.fsync(metrics_log.fileno())
 					if config.training.save_every > 0 and global_step % config.training.save_every == 0:
 						accelerator.wait_for_everyone()
 						save_checkpoint(accelerator, model, global_step, output_dir)
@@ -316,6 +385,8 @@ def main() -> None:
 	progress_bar.close()
 	accelerator.wait_for_everyone()
 	save_checkpoint(accelerator, model, global_step, output_dir)
+	if metrics_log is not None:
+		metrics_log.close()
 	accelerator.end_training()
 
 

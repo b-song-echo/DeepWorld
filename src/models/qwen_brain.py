@@ -8,7 +8,7 @@ from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import GradientCheckpointingLayer
 
 from vggt.models.vggt import VGGT
-from src.config import QwenConfig, VGGTConfig
+from src.config import QwenBrainConfig
 from src.utils.compat import resolve_torch_dtype
 
 
@@ -70,7 +70,7 @@ class LoraLinear(nn.Module):
 
 
 def inject_lora_layers(
-	child: nn.Module, target_names: Iterable[str],
+	module: nn.Module, target_names: Iterable[str],
 	rank: int, alpha: int, dropout: float
 ) -> None:
 	"""Recursively replace selected linear submodules with `LoRALinear`.
@@ -83,10 +83,10 @@ def inject_lora_layers(
 		dropout: LoRA dropout probability.
 	"""
 
-	for name, child in list(child.named_children()):
+	for name, child in list(module.named_children()):
 		if isinstance(child, nn.Linear) and name in target_names:
-			child = LoraLinear(child, rank=rank, alpha=alpha, dropout=dropout)
-			setattr(child, name, child)
+			lora_child = LoraLinear(child, rank=rank, alpha=alpha, dropout=dropout)
+			setattr(module, name, lora_child)
 		else:
 			inject_lora_layers(child, target_names, rank, alpha, dropout)
 
@@ -281,22 +281,25 @@ class QwenBrain(nn.Module):
 	- learned generation probe tokens whose final hidden states condition Wan.
 
 	Args:
-		qwen_config: Qwen branch configuration.
-		vggt_config: VGGT branch configuration.
+		qwen_config: Qwen brain branch configuration.
 		gradient_checkpointing: Whether to enable checkpointing in the Qwen text stack.
 	"""
 
-	def __init__(self, qwen_config: QwenConfig, vggt_config: VGGTConfig, gradient_checkpointing: bool = True):
+	def __init__(self, qwen_config: QwenBrainConfig, gradient_checkpointing: bool = True):
 		super().__init__()
-		dtype = resolve_torch_dtype(qwen_config.torch_dtype)
-		# only Qwen3VLModel is needed, but directly loading checkpoint into it results in warnings, here is the workaround
-		self.qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-			qwen_config.checkpoint_path, local_files_only=True, torch_dtype=dtype,
-		).model
+		qwen_load_kwargs = {"local_files_only": True}
+		transformer_dtype = resolve_torch_dtype(qwen_config.transformer_dtype)
+		if transformer_dtype is not None:
+			qwen_load_kwargs["torch_dtype"] = transformer_dtype
 
-		self.qwen.requires_grad_(False)
-		self.hidden_size = self.qwen.config.text_config.hidden_size
-		self.vis_patch_size = self.qwen.config.vision_config.spatial_merge_size
+		# only Qwen3VLModel is needed, but directly loading checkpoint into it results in warnings, here is the workaround
+		qwen = Qwen3VLForConditionalGeneration.from_pretrained(qwen_config.checkpoint_path, **qwen_load_kwargs).model
+		qwen.requires_grad_(False)
+		self.language_model = qwen.language_model
+		self.vision_encoder = qwen.visual
+		self.get_image_features = qwen.get_image_features
+		self.hidden_size = qwen.config.text_config.hidden_size
+		self.vis_patch_size = qwen.config.vision_config.spatial_merge_size
 
 		replaced_layers = [MoFfnQwenDecoderLayer(
 			original_layer=layer,
@@ -304,11 +307,11 @@ class QwenBrain(nn.Module):
 			moffn_lora_rank=qwen_config.routed_ffn_lora_rank,
 			moffn_lora_alpha=qwen_config.routed_ffn_lora_alpha,
 			moffn_lora_dropout=qwen_config.routed_ffn_lora_dropout,
-		) for layer in self.qwen.language_model.layers]
-		self.qwen.language_model.layers = nn.ModuleList(replaced_layers)
+		) for layer in self.language_model.layers]
+		self.language_model.layers = nn.ModuleList(replaced_layers)
 		
 		inject_lora_layers(
-			self.qwen.language_model,
+			self.language_model,
 			target_names=qwen_config.lora_target_modules,
 			rank=qwen_config.lora_rank,
 			alpha=qwen_config.lora_alpha,
@@ -317,31 +320,35 @@ class QwenBrain(nn.Module):
 
 		if gradient_checkpointing:
 			kwargs = {"use_reentrant": False}
-			self.qwen.language_model.gradient_checkpointing_enable(kwargs)
-			self.qwen.language_model.config.use_cache = False
+			self.language_model.gradient_checkpointing_enable(kwargs)
+			self.language_model.config.use_cache = False
 
-		self.vggt = VGGT.from_pretrained(
-			vggt_config.checkpoint_path, local_files_only=True,
+		self.geometry_encoder = VGGT.from_pretrained(
+			qwen_config.vggt_checkpoint_path, local_files_only=True,
 			enable_camera=False, enable_point=False,
 			enable_depth=False, enable_track=False,
 		)
-		self.vggt.requires_grad_(False)
+		vggt_dtype = resolve_torch_dtype(qwen_config.vggt_dtype)
+		if vggt_dtype is not None:
+			self.geometry_encoder.to(dtype=vggt_dtype)
+		self.geometry_encoder.requires_grad_(False)
 
-		self.geo_patch_size = self.vggt.aggregator.patch_size
-		geo_hidden_size = self.vggt.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
+		trainable_dtype = next(self.language_model.parameters()).dtype
+		self.geo_patch_size = self.geometry_encoder.aggregator.patch_size
+		geo_hidden_size = self.geometry_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
 		self.geo_bridge = nn.Sequential(
-			nn.Linear(geo_hidden_size, self.hidden_size, dtype=dtype),
+			nn.Linear(geo_hidden_size, self.hidden_size, dtype=trainable_dtype),
 			nn.GELU(),
-			nn.Linear(self.hidden_size, self.hidden_size, dtype=dtype),
+			nn.Linear(self.hidden_size, self.hidden_size, dtype=trainable_dtype),
 		)
 
 		self.segment_tokens = nn.ParameterDict({
-			"vis": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
-			"geo": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
-			"txt": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
-			"gen": nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype)),
+			"vis": nn.Parameter(torch.empty(1, self.hidden_size, dtype=trainable_dtype)),
+			"geo": nn.Parameter(torch.empty(1, self.hidden_size, dtype=trainable_dtype)),
+			"txt": nn.Parameter(torch.empty(1, self.hidden_size, dtype=trainable_dtype)),
+			"gen": nn.Parameter(torch.empty(1, self.hidden_size, dtype=trainable_dtype)),
 		})
-		self.gen_slot_token = nn.Parameter(torch.empty(1, self.hidden_size, dtype=dtype))
+		self.gen_slot_token = nn.Parameter(torch.empty(1, self.hidden_size, dtype=trainable_dtype))
 		for token in self.segment_tokens.values():
 			nn.init.normal_(token, std=0.02)
 		nn.init.normal_(self.gen_slot_token, std=0.02)
@@ -364,9 +371,9 @@ class QwenBrain(nn.Module):
 		"""
 
 		device = next(self.parameters()).device
-		vis_dtype = next(self.qwen.visual.parameters()).dtype
+		vis_dtype = next(self.vision_encoder.parameters()).dtype
 		with torch.no_grad():
-			image_features = self.qwen.get_image_features(
+			image_features = self.get_image_features(
 				pixel_values=pixel_values.to(device, vis_dtype, non_blocking=True),
 				image_grid_thw=image_grid_thw.to(device, non_blocking=True),
 				return_dict=True,
@@ -405,16 +412,16 @@ class QwenBrain(nn.Module):
 		"""
 
 		device = next(self.parameters()).device
-		vggt_dtype = next(self.vggt.aggregator.parameters()).dtype
+		vggt_dtype = next(self.geometry_encoder.aggregator.parameters()).dtype
 		bridge_dtype = self.geo_bridge[0].weight.dtype
 		with torch.no_grad():
-			aggregated_tokens, patch_start_idx = self.vggt.aggregator(
+			aggregated_tokens, patch_start_idx = self.geometry_encoder.aggregator(
 				geo_images.to(device, vggt_dtype, non_blocking=True)
 			)
 			geo_tokens = aggregated_tokens[-1][:, :, patch_start_idx:, :]
 		geo_tokens = self.geo_bridge(geo_tokens.to(bridge_dtype))
 
-		patch_size = self.vggt.aggregator.patch_size
+		patch_size = self.geometry_encoder.aggregator.patch_size
 		grid_h = geo_images.size(-2) // patch_size
 		grid_w = geo_images.size(-1) // patch_size
 
@@ -553,7 +560,7 @@ class QwenBrain(nn.Module):
 		"""
 
 		device = next(self.parameters()).device
-		txt_embeddings = self.qwen.language_model.embed_tokens(
+		txt_embeddings = self.language_model.embed_tokens(
 			txt_input_ids.to(device=device, non_blocking=True)
 		)
 		txt_attention_mask = txt_attention_mask.to(device, non_blocking=True).bool()
@@ -686,7 +693,7 @@ class QwenBrain(nn.Module):
 			latent_patch_grids=latent_patch_grids,
 		)
 		
-		language_outputs = self.qwen.language_model(
+		language_outputs = self.language_model(
 			input_ids=None,
 			inputs_embeds=language_inputs["inputs_embeds"],
 			attention_mask=language_inputs["attention_mask"],

@@ -13,6 +13,7 @@ dataset:
   max_text_length: 512
   shuffle: true
   num_workers: 1
+  prefetch_factor: 1
   pin_memory: true
   persistent_workers: false
 
@@ -33,11 +34,14 @@ training:
   log_every: 10
   save_every: 1000
   mixed_precision: bf16
+  use_fsdp: true
   gradient_checkpointing: true
 
-qwen:
+qwen_brain:
   checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
-  torch_dtype: bfloat16
+  transformer_dtype: bfloat16
+  vggt_checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/VGGT-1B
+  vggt_dtype: null
   lora_rank: 32
   lora_alpha: 64
   lora_dropout: 0.05
@@ -47,13 +51,11 @@ qwen:
   routed_ffn_lora_alpha: 64
   routed_ffn_lora_dropout: 0.05
 
-wan:
+wan_renderer:
   checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Wan2.1-T2V-1.3B
-  torch_dtype: bfloat16
+  transformer_dtype: bfloat16
+  vae_dtype: null
   vae_enable_slicing: true
   vae_enable_tiling: true
   train_scheduler_steps: 1000
   inference_steps: 30
-
-vggt:
-  checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/VGGT-1B

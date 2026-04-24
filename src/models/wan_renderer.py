@@ -3,45 +3,73 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.config import WanConfig
+from src.config import WanRendererConfig
 from src.utils.compat import load_diffusers_classes, resolve_torch_dtype
 
 
 class WanRenderer(nn.Module):
-	"""Wan transformer wrapper conditioned directly by Qwen generation states.
+	"""Wan VAE and transformer wrapper conditioned by Qwen generation states.
 
-	The wrapper removes the text cross-attention branch from the loaded Wan
-	transformer and instead adds projected Qwen generation states to the patch-token
-	representation before the Wan blocks.
+	The renderer owns the paired Wan VAE and transformer. It handles latent
+	encoding/decoding, removes the transformer's text cross-attention branch, and
+	adds projected Qwen generation states to the Wan patch-token representation.
 
 	Args:
-		wan_config: Wan branch configuration.
+		wan_config: Wan renderer branch configuration.
 		condition_dim: Hidden size of the Qwen generation readout.
 		gradient_checkpointing: Whether Wan blocks should use gradient checkpointing.
 	"""
 
-	def __init__(self, wan_config: WanConfig, condition_dim: int, gradient_checkpointing: bool = True):
+	def __init__(self, wan_config: WanRendererConfig, condition_dim: int, gradient_checkpointing: bool = True):
 		super().__init__()
-		_, _, WanTransformer3DModel = load_diffusers_classes()
-		self.transformer = WanTransformer3DModel.from_pretrained(
-			wan_config.checkpoint_path,
-			subfolder="transformer",
-			local_files_only=True,
-			torch_dtype=resolve_torch_dtype(wan_config.torch_dtype),
-		)
+		AutoencoderKLWan, _, WanTransformer3DModel = load_diffusers_classes()
+		transformer_load_kwargs = {
+			"subfolder": "transformer",
+			"local_files_only": True,
+		}
+		transformer_dtype = resolve_torch_dtype(wan_config.transformer_dtype)
+		if transformer_dtype is not None:
+			transformer_load_kwargs["torch_dtype"] = transformer_dtype
+		self.transformer = WanTransformer3DModel.from_pretrained(wan_config.checkpoint_path, **transformer_load_kwargs)
 		if gradient_checkpointing:
 			if hasattr(self.transformer, "enable_gradient_checkpointing"):
 				self.transformer.enable_gradient_checkpointing()
 			else:
 				self.transformer.gradient_checkpointing = True
 
+		vae_load_kwargs = {
+			"subfolder": "vae",
+			"local_files_only": True,
+		}
+		vae_dtype = resolve_torch_dtype(wan_config.vae_dtype)
+		if vae_dtype is not None:
+			vae_load_kwargs["torch_dtype"] = vae_dtype
+		self.vae = AutoencoderKLWan.from_pretrained(wan_config.checkpoint_path, **vae_load_kwargs)
+		if wan_config.vae_enable_slicing and hasattr(self.vae, "enable_slicing"):
+			self.vae.enable_slicing()
+		if wan_config.vae_enable_tiling and hasattr(self.vae, "enable_tiling"):
+			self.vae.enable_tiling()
+		self.vae.requires_grad_(False)
+
 		self._remove_text_conditioning_modules()
 		self.inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
-		self.condition_proj = nn.Linear(condition_dim, self.inner_dim)
-		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim))
+		trainable_dtype = self.transformer.patch_embedding.weight.dtype
+		self.condition_proj = nn.Linear(condition_dim, self.inner_dim, dtype=trainable_dtype)
+		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim, dtype=trainable_dtype))
 		nn.init.zeros_(self.condition_proj.weight)
 		nn.init.zeros_(self.condition_proj.bias)
 		nn.init.normal_(self.null_cond, std=0.02)
+
+		latents_mean = torch.tensor(
+			self.vae.config.latents_mean,
+			dtype=torch.float32,
+		).view(1, self.vae.config.z_dim, 1, 1, 1)
+		latents_recip_std = 1.0 / torch.tensor(
+			self.vae.config.latents_std,
+			dtype=torch.float32,
+		).view(1, self.vae.config.z_dim, 1, 1, 1)
+		self.latents_mean = nn.Buffer(latents_mean, persistent=False)
+		self.latents_recip_std = nn.Buffer(latents_recip_std, persistent=False)
 
 	def _remove_text_conditioning_modules(self) -> None:
 		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""
@@ -58,6 +86,63 @@ class WanRenderer(nn.Module):
 		condition_embedder.text_embedder = None
 		if hasattr(condition_embedder, "image_embedder"):
 			condition_embedder.image_embedder = None
+
+	def encode_videos(self, videos: Tensor, sample_posterior: bool = True) -> Tensor:
+		"""Encode GT videos into normalized Wan latent space.
+
+		Args:
+			videos: Input video tensor with shape `(B, 3, T, H, W)` in Wan pixel space.
+			sample_posterior: Whether to sample from the VAE posterior instead of using its mode.
+
+		Returns:
+			Normalized latent tensor using the Wan transformer's dtype.
+		"""
+
+		vae_parameter = next(self.vae.parameters())
+		videos = videos.to(device=vae_parameter.device, dtype=vae_parameter.dtype, non_blocking=True)
+		with torch.no_grad():
+			posterior = self.vae.encode(videos).latent_dist
+			latents = posterior.sample() if sample_posterior else posterior.mode()
+		latents = (latents.float() - self.latents_mean.to(latents.device)) * self.latents_recip_std.to(latents.device)
+		return latents.to(self.transformer.patch_embedding.weight.dtype)
+
+	def decode_latents(self, latents: Tensor) -> Tensor:
+		"""Decode normalized Wan latents back into video space.
+
+		Args:
+			latents: Normalized latent tensor.
+
+		Returns:
+			Decoded video tensor in Wan output pixel range.
+		"""
+
+		vae_parameter = next(self.vae.parameters())
+		latents = latents / self.latents_recip_std.to(latents.device) + self.latents_mean.to(latents.device)
+		latents = latents.to(device=vae_parameter.device, dtype=vae_parameter.dtype)
+		with torch.no_grad():
+			return self.vae.decode(latents, return_dict=False)[0]
+
+	def latent_patch_grids(self, latents: Tensor) -> Tensor:
+		"""Compute the Wan patch-token grid for a latent tensor.
+
+		Args:
+			latents: Latent tensor with shape `(B, C, T, H, W)`.
+
+		Returns:
+			A tensor of shape `(B, 3)` containing `(t, h, w)` patch-grid sizes.
+		"""
+
+		p_t, p_h, p_w = self.transformer.config.patch_size
+		grid = torch.tensor(
+			[
+				latents.size(2) // p_t,
+				latents.size(3) // p_h,
+				latents.size(4) // p_w,
+			],
+			device=latents.device,
+			dtype=torch.long,
+		)
+		return grid.unsqueeze(0).expand(latents.size(0), -1)
 
 	def _compute_time_embeddings(
 		self,
