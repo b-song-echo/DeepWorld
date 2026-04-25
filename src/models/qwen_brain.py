@@ -325,9 +325,9 @@ class QwenBrain(nn.Module):
 		self.txt_bridge = nn.Linear(
 			self.hidden_size, self.hidden_size, bias=True, dtype=trainable_dtype,
 		)
-		nn.init.zeros_(self.vis_bridge.weight)
+		nn.init.eye_(self.vis_bridge.weight)
 		nn.init.zeros_(self.vis_bridge.bias)
-		nn.init.zeros_(self.txt_bridge.weight)
+		nn.init.eye_(self.txt_bridge.weight)
 		nn.init.zeros_(self.txt_bridge.bias)
 
 		if gradient_checkpointing:
@@ -390,8 +390,15 @@ class QwenBrain(nn.Module):
 				return_dict=True,
 			).pooler_output
 		bridge_dtype = self.vis_bridge.weight.dtype
-		image_features = image_features.to(bridge_dtype)
-		image_features = image_features + self.vis_bridge(image_features)
+		if isinstance(image_features, tuple):
+			feature_lengths = [features.size(0) for features in image_features]
+			if feature_lengths:
+				flat_features = torch.cat(image_features, dim=0).to(bridge_dtype)
+				flat_features = self.vis_bridge(flat_features)
+				image_features = torch.split(flat_features, feature_lengths)
+		else:
+			image_features = image_features.to(bridge_dtype)
+			image_features = self.vis_bridge(image_features)
 
 		vis_groups: list[list[Tensor]] = []
 		vis_grids: list[list[tuple[int, int, int]]] = []
@@ -577,7 +584,7 @@ class QwenBrain(nn.Module):
 		txt_embeddings = self.language_model.embed_tokens(
 			txt_input_ids.to(device=device, non_blocking=True)
 		)
-		txt_embeddings = txt_embeddings + self.txt_bridge(txt_embeddings)
+		txt_embeddings = self.txt_bridge(txt_embeddings)
 		txt_attention_mask = txt_attention_mask.to(device, non_blocking=True).bool()
 		batch_size = txt_input_ids.size(0)
 
