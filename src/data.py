@@ -1,6 +1,5 @@
 import glob
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,7 +7,7 @@ from typing import Any
 import torch
 import webdataset as wds
 from torch import Tensor
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from src.config import DatasetConfig
 from src.utils.compat import get_world_size
@@ -22,6 +21,34 @@ from src.utils.video import (
 	resize_image,
 	sample_reference_images,
 )
+
+
+def partition_count(total: int, index: int, partitions: int) -> int:
+	"""Return the item count assigned to one deterministic partition.
+
+	The first `total % partitions` partitions receive one extra item. This keeps
+	the global sample cap exact while preserving a stable assignment for a fixed
+	world-size and dataloader-worker configuration.
+
+	Args:
+		total: Total number of items to divide.
+		index: Zero-based partition index.
+		partitions: Number of partitions.
+
+	Returns:
+		The item count assigned to `index`.
+	"""
+
+	if total <= 0:
+		return 0
+	if partitions <= 0:
+		raise ValueError(f"`partitions` must be positive, got {partitions}.")
+	if index < 0 or index >= partitions:
+		raise ValueError(f"`index` must be in [0, {partitions}), got {index}.")
+
+	base = total // partitions
+	remainder = total % partitions
+	return base + int(index < remainder)
 
 
 def resolve_geo_image_size(dataset_config: DatasetConfig, patch_size: int) -> int:
@@ -93,6 +120,8 @@ class ManifestWorldModelDataset(Dataset):
 
 		self.config = config
 		self.records = self._load_manifest(config.manifest_path)
+		if config.num_samples > 0:
+			self.records = self.records[: config.num_samples]
 
 	def _load_manifest(self, manifest_path: str) -> list[dict[str, Any]]:
 		"""Read the JSONL manifest into memory.
@@ -119,7 +148,7 @@ class ManifestWorldModelDataset(Dataset):
 		return records
 
 	def __len__(self) -> int:
-		"""Return the number of manifest rows."""
+		"""Return the active manifest subset size."""
 
 		return len(self.records)
 
@@ -179,9 +208,37 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 		self.shard_paths = self._resolve_shard_paths(config.webdataset_urls)
 
 	def __len__(self) -> int:
-		"""Return the approximate sample count seen by one distributed process."""
+		"""Return the exact capped sample count seen by one distributed process."""
 
-		return math.ceil(self.config.num_samples / get_world_size())
+		return self._rank_sample_limit()
+
+	def _rank_sample_limit(self) -> int:
+		"""Return this process's deterministic share of the global sample cap.
+
+		WebDataset is sharded inside the dataset rather than by Accelerate's
+		dataloader wrapper, so every distributed rank must consume the same number
+		of samples to avoid uneven collective calls during training.
+		"""
+
+		world_size = get_world_size()
+		if self.config.num_samples % world_size != 0:
+			raise ValueError(
+				"`dataset.num_samples` must be divisible by the distributed world size when "
+				f"`dataset_source=webdataset`; got num_samples={self.config.num_samples}, world_size={world_size}."
+			)
+		return self.config.num_samples // world_size
+
+	def _worker_sample_limit(self) -> int:
+		"""Return this dataloader worker's deterministic share of the rank cap."""
+
+		worker_info = get_worker_info()
+		if worker_info is None:
+			return self._rank_sample_limit()
+		return partition_count(
+			self._rank_sample_limit(),
+			worker_info.id,
+			worker_info.num_workers,
+		)
 
 	def _resolve_shard_paths(self, urls: list[str] | str) -> list[str]:
 		"""Resolve the configured shard globs into a stable path list.
@@ -254,16 +311,23 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 		)
 
 	def __iter__(self):
-		"""Iterate over grouped `.mp4` + `.json` tar samples."""
+		"""Iterate over a deterministic capped subset of grouped tar samples."""
 
+		sample_limit = self._worker_sample_limit()
+		if sample_limit <= 0:
+			return
 		dataset = wds.WebDataset(
 			self.shard_paths,
 			shardshuffle=100 if self.config.shuffle else False,
 			nodesplitter=wds.split_by_node,
 			workersplitter=wds.split_by_worker,
 		)
+		num_emitted = 0
 		for sample in dataset:
+			if num_emitted >= sample_limit:
+				break
 			yield self._build_sample(sample)
+			num_emitted += 1
 
 
 def build_dataset(config: DatasetConfig) -> Dataset | IterableDataset:

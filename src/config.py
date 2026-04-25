@@ -27,7 +27,7 @@ class DatasetConfig:
 		dataset_source: Dataset backend, either `manifest` or `webdataset`.
 		manifest_path: JSONL manifest describing the training set.
 		webdataset_urls: Absolute local tar-shard paths or brace-expand patterns for WebDataset loading.
-		num_samples: Total sample count used for iterable WebDataset length estimation.
+		num_samples: Optional deterministic per-epoch sample cap. For manifest datasets, `0` means all records. For WebDataset, this must be positive and divisible by distributed world size because it defines both the stream cap and reported length.
 		num_reference_images: Maximum number of reference images to load per sample.
 		video_num_frames: Target number of frames to sample from each GT video.
 		video_frame_stride: Temporal stride used when sampling frames from the GT clip.

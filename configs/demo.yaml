@@ -2,7 +2,7 @@ dataset:
   dataset_source: webdataset
   manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/custom/train-*.tar
   webdataset_urls: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/FMVC/train-*.tar
-  num_samples: 1000
+  num_samples: 800
   num_reference_images: 3
   video_num_frames: 81
   video_frame_stride: 1
@@ -11,7 +11,7 @@ dataset:
   vis_image_size: 448
   geo_image_size: 448
   max_text_length: 512
-  shuffle: true
+  shuffle: false
   num_workers: 1
   prefetch_factor: 1
   pin_memory: true
@@ -28,11 +28,11 @@ optimizer:
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
   seed: 42
-  num_epochs: 10
+  num_epochs: 50
   per_device_batch_size: 1
-  gradient_accumulation_steps: 1
-  log_every: 10
-  save_every: 1000
+  gradient_accumulation_steps: 5
+  log_every: 5
+  save_every: 500
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
