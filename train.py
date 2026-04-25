@@ -290,6 +290,7 @@ def main() -> None:
 		os.fsync(metrics_log.fileno())
 	log_parameter_summary(accelerator, model)
 	
+	model.to(accelerator.device) # NOTE: do not remove it at the moment
 	optimizer = AdamW(
 		[p for p in model.parameters() if p.requires_grad],
 		lr=config.optimizer.learning_rate,
@@ -346,24 +347,28 @@ def main() -> None:
 	progress_bar.set_postfix(step=0, epoch=0, loss="n/a")
 	
 	global_step = 0
+	accumulated_losses: list[torch.Tensor] = []
 	for epoch in range(config.training.num_epochs):
 		model.train()
 		for batch in dataloader:
 			with accelerator.accumulate(model):
 				with accelerator.autocast():
 					loss = model(batch)["loss"]
+				accumulated_losses.append(loss.detach().float())
 				accelerator.backward(loss)
 				if accelerator.sync_gradients:
 					accelerator.clip_grad_norm_(grad_clip_parameters, config.optimizer.max_grad_norm)
 				optimizer.step()
-				lr_scheduler.step()
 				optimizer.zero_grad(set_to_none=True)
 
 				if accelerator.sync_gradients:
+					lr_scheduler.step()
 					global_step += 1
-					loss_value = accelerator.gather(loss.detach().float()).mean().item()
+					macro_loss = torch.stack(accumulated_losses).mean()
+					accumulated_losses.clear()
+					loss_value = accelerator.gather(macro_loss).mean().item()
 					progress_bar.update(1)
-					progress_bar.set_postfix(step=global_step - 1, epoch=epoch + 1, loss=f"{loss_value:.4f}")
+					progress_bar.set_postfix(step=global_step, epoch=epoch + 1, loss=f"{loss_value:.4f}")
 					should_log = config.training.log_every > 0 and (
 						global_step == 1 or global_step % config.training.log_every == 0
 					)

@@ -2,7 +2,7 @@ dataset:
   dataset_source: webdataset
   manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/custom/train-*.tar
   webdataset_urls: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/FMVC/train-*.tar
-  num_samples: 800
+  num_samples: 64
   num_reference_images: 3
   video_num_frames: 81
   video_frame_stride: 1
@@ -23,16 +23,16 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1.0e-8
   max_grad_norm: 1.0
-  warmup_steps: 500
+  warmup_steps: 100
 
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
   seed: 42
-  num_epochs: 50
+  num_epochs: 500
   per_device_batch_size: 1
-  gradient_accumulation_steps: 5
-  log_every: 5
-  save_every: 500
+  gradient_accumulation_steps: 4
+  log_every: 1
+  save_every: 200
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
@@ -42,13 +42,13 @@ qwen_brain:
   transformer_dtype: bfloat16
   vggt_checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/VGGT-1B
   vggt_dtype: null
-  lora_rank: 32
-  lora_alpha: 64
+  lora_rank: 64
+  lora_alpha: null
   lora_dropout: 0.05
   lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
   routed_ffn_mode: lora
-  routed_ffn_lora_rank: 32
-  routed_ffn_lora_alpha: 64
+  routed_ffn_lora_rank: 256
+  routed_ffn_lora_alpha: null
   routed_ffn_lora_dropout: 0.05
 
 wan_renderer:
