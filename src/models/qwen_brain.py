@@ -318,6 +318,18 @@ class QwenBrain(nn.Module):
 			dropout=qwen_config.lora_dropout,
 		)
 
+		trainable_dtype = next(self.language_model.parameters()).dtype
+		self.vis_bridge = nn.Linear(
+			self.hidden_size, self.hidden_size, bias=True, dtype=trainable_dtype,
+		)
+		self.txt_bridge = nn.Linear(
+			self.hidden_size, self.hidden_size, bias=True, dtype=trainable_dtype,
+		)
+		nn.init.zeros_(self.vis_bridge.weight)
+		nn.init.zeros_(self.vis_bridge.bias)
+		nn.init.zeros_(self.txt_bridge.weight)
+		nn.init.zeros_(self.txt_bridge.bias)
+
 		if gradient_checkpointing:
 			kwargs = {"use_reentrant": False}
 			self.language_model.gradient_checkpointing_enable(kwargs)
@@ -333,7 +345,6 @@ class QwenBrain(nn.Module):
 			self.geometry_encoder.to(dtype=vggt_dtype)
 		self.geometry_encoder.requires_grad_(False)
 
-		trainable_dtype = next(self.language_model.parameters()).dtype
 		self.geo_patch_size = self.geometry_encoder.aggregator.patch_size
 		geo_hidden_size = self.geometry_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
 		self.geo_bridge = nn.Sequential(
@@ -378,6 +389,9 @@ class QwenBrain(nn.Module):
 				image_grid_thw=image_grid_thw.to(device, non_blocking=True),
 				return_dict=True,
 			).pooler_output
+		bridge_dtype = self.vis_bridge.weight.dtype
+		image_features = image_features.to(bridge_dtype)
+		image_features = image_features + self.vis_bridge(image_features)
 
 		vis_groups: list[list[Tensor]] = []
 		vis_grids: list[list[tuple[int, int, int]]] = []
@@ -563,6 +577,7 @@ class QwenBrain(nn.Module):
 		txt_embeddings = self.language_model.embed_tokens(
 			txt_input_ids.to(device=device, non_blocking=True)
 		)
+		txt_embeddings = txt_embeddings + self.txt_bridge(txt_embeddings)
 		txt_attention_mask = txt_attention_mask.to(device, non_blocking=True).bool()
 		batch_size = txt_input_ids.size(0)
 

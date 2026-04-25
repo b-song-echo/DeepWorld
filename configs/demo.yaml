@@ -23,16 +23,16 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1.0e-8
   max_grad_norm: 1.0
-  warmup_steps: 100
+  warmup_steps: 20
 
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
   seed: 42
-  num_epochs: 500
+  num_epochs: 400
   per_device_batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 2
   log_every: 1
-  save_every: 200
+  save_every: 400
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
