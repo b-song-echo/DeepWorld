@@ -68,19 +68,28 @@ class OptimizerConfig:
 
 	Attributes:
 		learning_rate: Base learning rate used by AdamW.
+		lr_schedule: Learning-rate schedule after warmup, either `cosine` or `constant`.
 		weight_decay: Weight decay coefficient.
 		betas: Adam beta coefficients.
 		eps: Adam epsilon.
 		max_grad_norm: Gradient clipping threshold applied after accumulation.
-		warmup_steps: Number of warmup steps before cosine decay.
+		warmup_steps: Number of warmup steps before the requested post-warmup schedule.
 	"""
 
 	learning_rate: float = 2e-5
+	lr_schedule: str = "cosine"
 	weight_decay: float = 1e-2
 	betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
 	eps: float = 1e-8
 	max_grad_norm: float = 1.0
 	warmup_steps: int = 500
+
+	def __post_init__(self) -> None:
+		"""Validate optimizer schedule settings."""
+
+		self.lr_schedule = self.lr_schedule.lower()
+		if self.lr_schedule not in {"cosine", "constant"}:
+			raise ValueError(f"`optimizer.lr_schedule` must be either `cosine` or `constant`, got {self.lr_schedule!r}.")
 
 
 @dataclass
@@ -95,6 +104,7 @@ class TrainingConfig:
 		gradient_accumulation_steps: Number of steps to accumulate before optimizer update.
 		log_every: Logging interval in optimizer steps.
 		save_every: Checkpoint interval in optimizer steps.
+		eval_num_samples: Number of training-set samples to generate before each checkpoint save. `0` disables evaluation generation.
 		mixed_precision: Accelerate precision mode such as `bf16`.
 		use_fsdp: Whether multi-process training should use FSDP instead of DDP.
 		gradient_checkpointing: Whether model submodules enable checkpointing when supported.
@@ -107,9 +117,16 @@ class TrainingConfig:
 	gradient_accumulation_steps: int = 1
 	log_every: int = 10
 	save_every: int = 1000
+	eval_num_samples: int = 0
 	mixed_precision: str = "bf16"
 	use_fsdp: bool = True
 	gradient_checkpointing: bool = True
+
+	def __post_init__(self) -> None:
+		"""Validate training-loop settings that control checkpoint evaluation."""
+
+		if self.eval_num_samples < 0:
+			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
 
 
 @dataclass
@@ -159,6 +176,7 @@ class WanRendererConfig:
 		vae_dtype: Optional Wan VAE load dtype. If omitted, the checkpoint default is used.
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
+		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
 			inferred from the checkpoint scheduler config when available.
 		inference_steps: Default number of denoising steps during sampling.
@@ -169,6 +187,7 @@ class WanRendererConfig:
 	vae_dtype: str | None = None
 	vae_enable_slicing: bool = False
 	vae_enable_tiling: bool = False
+	vae_sample_posterior: bool = False
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
 

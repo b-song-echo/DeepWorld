@@ -19,6 +19,7 @@ dataset:
 
 optimizer:
   learning_rate: 2.0e-5
+  lr_schedule: constant
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -28,11 +29,12 @@ optimizer:
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
   seed: 42
-  num_epochs: 400
+  num_epochs: 300
   per_device_batch_size: 1
   gradient_accumulation_steps: 2
   log_every: 1
   save_every: 400
+  eval_num_samples: 8
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
@@ -57,5 +59,6 @@ wan_renderer:
   vae_dtype: null
   vae_enable_slicing: true
   vae_enable_tiling: true
+  vae_sample_posterior: false
   train_scheduler_steps: 1000
   inference_steps: 30

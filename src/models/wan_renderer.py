@@ -87,12 +87,12 @@ class WanRenderer(nn.Module):
 		if hasattr(condition_embedder, "image_embedder"):
 			condition_embedder.image_embedder = None
 
-	def encode_videos(self, videos: Tensor, sample_posterior: bool = True) -> Tensor:
+	def encode_videos(self, videos: Tensor, sample_posterior: bool = False) -> Tensor:
 		"""Encode GT videos into normalized Wan latent space.
 
 		Args:
 			videos: Input video tensor with shape `(B, 3, T, H, W)` in Wan pixel space.
-			sample_posterior: Whether to sample from the VAE posterior instead of using its mode.
+			sample_posterior: Whether to sample from the VAE posterior instead of using its deterministic mode.
 
 		Returns:
 			Normalized latent tensor using the Wan transformer's dtype.

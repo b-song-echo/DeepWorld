@@ -2,20 +2,22 @@ import os
 import argparse
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import ProjectConfiguration, set_seed
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, Subset
 from tqdm.auto import tqdm
-from transformers import AutoProcessor, get_cosine_schedule_with_warmup
+from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
 from src.utils.compat import get_world_size
+from src.utils.video import save_video_tensor
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,24 +215,265 @@ def log_runtime_setup(accelerator: Accelerator, model: torch.nn.Module) -> None:
 	)
 
 
-def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, step: int, output_dir: Path) -> None:
+def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_training_steps: int):
+	"""Create the configured warmup learning-rate scheduler.
+
+	Args:
+		optimizer: Optimizer whose learning rate should be scheduled.
+		config: Root training configuration.
+		total_training_steps: Total number of optimizer steps in this run.
+
+	Returns:
+		A Transformers scheduler with warmup and the requested post-warmup behavior.
+	"""
+
+	if config.optimizer.lr_schedule == "constant":
+		return get_constant_schedule_with_warmup(
+			optimizer,
+			num_warmup_steps=config.optimizer.warmup_steps,
+		)
+	if config.optimizer.lr_schedule == "cosine":
+		return get_cosine_schedule_with_warmup(
+			optimizer,
+			num_warmup_steps=config.optimizer.warmup_steps,
+			num_training_steps=total_training_steps,
+		)
+	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
+
+
+def create_world_dataloader(
+	dataset,
+	dataset_config,
+	batch_size: int,
+	collator: WorldModelBatchCollator,
+	shuffle: bool,
+) -> DataLoader:
+	"""Build a DataLoader while respecting PyTorch worker argument constraints.
+
+	Args:
+		dataset: Dataset object to iterate.
+		dataset_config: Dataset configuration that controls worker and memory settings.
+		batch_size: Number of samples per dataloader batch.
+		collator: Collation function for raw world-model samples.
+		shuffle: Whether the map-style dataset should be shuffled.
+
+	Returns:
+		A configured PyTorch dataloader.
+	"""
+
+	loader_kwargs = {
+		"dataset": dataset,
+		"batch_size": batch_size,
+		"shuffle": shuffle,
+		"num_workers": dataset_config.num_workers,
+		"pin_memory": dataset_config.pin_memory and torch.cuda.is_available(),
+		"persistent_workers": dataset_config.persistent_workers and dataset_config.num_workers > 0,
+		"collate_fn": collator,
+	}
+	if dataset_config.num_workers > 0 and dataset_config.prefetch_factor is not None:
+		loader_kwargs["prefetch_factor"] = dataset_config.prefetch_factor
+	return DataLoader(**loader_kwargs)
+
+
+def build_eval_dataloader(
+	config: WorldModelConfig,
+	collator: WorldModelBatchCollator,
+	accelerator: Accelerator,
+) -> DataLoader | None:
+	"""Build a deterministic per-rank evaluation loader over a training-data prefix.
+
+	Args:
+		config: Root training configuration.
+		collator: Batch collator shared with training.
+		accelerator: Active Accelerate runtime used for rank partitioning.
+
+	Returns:
+		A rank-local eval dataloader, or `None` when eval generation is disabled.
+	"""
+
+	eval_num_samples = config.training.eval_num_samples
+	if eval_num_samples == 0:
+		return None
+	if eval_num_samples % accelerator.num_processes != 0:
+		raise ValueError(
+			"`training.eval_num_samples` must be divisible by the distributed world size; "
+			f"got eval_num_samples={eval_num_samples}, world_size={accelerator.num_processes}."
+		)
+	if eval_num_samples < accelerator.num_processes:
+		raise ValueError(
+			"`training.eval_num_samples` must be either 0 or at least the distributed world size; "
+			f"got eval_num_samples={eval_num_samples}, world_size={accelerator.num_processes}."
+		)
+	if config.dataset.num_samples > 0 and eval_num_samples > config.dataset.num_samples:
+		raise ValueError(
+			"`training.eval_num_samples` must not exceed `dataset.num_samples` when the training set is capped; "
+			f"got eval_num_samples={eval_num_samples}, dataset.num_samples={config.dataset.num_samples}."
+		)
+
+	eval_dataset_config = replace(config.dataset, num_samples=eval_num_samples, shuffle=False)
+	eval_dataset = build_dataset(eval_dataset_config)
+	if isinstance(eval_dataset, IterableDataset):
+		eval_source = eval_dataset
+	else:
+		if len(eval_dataset) < eval_num_samples:
+			raise ValueError(
+				"`training.eval_num_samples` exceeds the available evaluation dataset size; "
+				f"got eval_num_samples={eval_num_samples}, available={len(eval_dataset)}."
+			)
+		rank_indices = list(range(accelerator.process_index, eval_num_samples, accelerator.num_processes))
+		eval_source = Subset(eval_dataset, rank_indices)
+
+	return create_world_dataloader(
+		dataset=eval_source,
+		dataset_config=eval_dataset_config,
+		batch_size=1,
+		collator=collator,
+		shuffle=False,
+	)
+
+
+def create_checkpoint_dir(accelerator: Accelerator, step: int, output_dir: Path) -> Path:
+	"""Create and synchronize one checkpoint directory before all ranks use it.
+
+	Args:
+		accelerator: Active Accelerate runtime.
+		step: Global optimizer step used in the checkpoint name.
+		output_dir: Root directory where checkpoints should be written.
+
+	Returns:
+		The synchronized checkpoint directory path.
+	"""
+
+	checkpoint_dir = output_dir / f"checkpoint-{step}"
+	if accelerator.is_main_process:
+		checkpoint_dir.mkdir(parents=True, exist_ok=True)
+	accelerator.wait_for_everyone()
+	return checkpoint_dir
+
+
+def make_eval_generator(device: torch.device, seed: int) -> torch.Generator:
+	"""Create a deterministic random generator on the active model device.
+
+	Args:
+		device: Device where random latents will be sampled.
+		seed: Deterministic seed for the sample.
+
+	Returns:
+		A seeded torch random generator.
+	"""
+
+	generator = torch.Generator(device=device)
+	generator.manual_seed(seed)
+	return generator
+
+
+def generate_checkpoint_samples(
+	accelerator: Accelerator,
+	model: torch.nn.Module,
+	eval_dataloader: DataLoader | None,
+	config: WorldModelConfig,
+	step: int,
+	checkpoint_dir: Path,
+) -> None:
+	"""Generate and save rank-local evaluation videos before checkpoint serialization.
+
+	Args:
+		accelerator: Active Accelerate runtime.
+		model: Prepared model used for generation.
+		eval_dataloader: Rank-local dataloader over the eval subset, or `None`.
+		config: Root training configuration.
+		step: Global optimizer step used for deterministic sample seeds.
+		checkpoint_dir: Directory where generated videos should be saved.
+	"""
+
+	if eval_dataloader is None:
+		return
+
+	per_process_samples = config.training.eval_num_samples // accelerator.num_processes
+	was_training = model.training
+	model.eval()
+	num_saved = 0
+	try:
+		for batch in eval_dataloader:
+			if num_saved >= per_process_samples:
+				break
+
+			global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
+			generator = make_eval_generator(
+				accelerator.device,
+				config.training.seed + step * 1000003 + global_eval_index,
+			)
+			with torch.no_grad():
+				with accelerator.autocast():
+					outputs = model(batch, generate_samples=True, generator=generator)
+
+			videos = outputs["videos"].detach().cpu()
+			for batch_index in range(videos.size(0)):
+				if num_saved >= per_process_samples:
+					break
+				global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
+				save_video_tensor(
+					videos[batch_index],
+					checkpoint_dir / f"eval_sample_{global_eval_index:04d}.mp4",
+				)
+				num_saved += 1
+
+		if num_saved != per_process_samples:
+			raise RuntimeError(
+				"Evaluation dataloader ended before this rank generated its requested samples; "
+				f"rank={accelerator.process_index}, saved={num_saved}, expected={per_process_samples}."
+			)
+	finally:
+		if was_training:
+			model.train()
+
+	accelerator.wait_for_everyone()
+	if accelerator.is_main_process:
+		accelerator.print(
+			f"Saved {config.training.eval_num_samples} evaluation videos to {checkpoint_dir}."
+		)
+
+
+def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, checkpoint_dir: Path) -> None:
 	"""Save one model checkpoint on the main process.
 
 	Args:
 		accelerator: Active Accelerate runtime.
-		model: Unwrapped model instance to serialize.
-		step: Global optimizer step used in the checkpoint name.
-		output_dir: Root directory where checkpoints should be written.
+		model: Prepared model instance to serialize.
+		checkpoint_dir: Directory where `model.pt` should be written.
 	"""
 
 	# NOTE: accelerator.get_state_dict must be called on every processes, or the program will hang because the main process is indefinitely waiting for others.
 	accelerator.wait_for_everyone()
 	state_dict = accelerator.get_state_dict(model)
 	if accelerator.is_main_process:
-		checkpoint_dir = output_dir / f"checkpoint-{step}"
 		checkpoint_dir.mkdir(parents=True, exist_ok=True)
 		torch.save(state_dict, checkpoint_dir / "model.pt")
 	accelerator.wait_for_everyone()
+
+
+def save_checkpoint_with_evaluation(
+	accelerator: Accelerator,
+	model: torch.nn.Module,
+	eval_dataloader: DataLoader | None,
+	config: WorldModelConfig,
+	step: int,
+	output_dir: Path,
+) -> None:
+	"""Generate evaluation videos and then save model weights in the same directory.
+
+	Args:
+		accelerator: Active Accelerate runtime.
+		model: Prepared model instance to serialize.
+		eval_dataloader: Rank-local eval dataloader, or `None`.
+		config: Root training configuration.
+		step: Global optimizer step used in the checkpoint name.
+		output_dir: Root directory where checkpoints should be written.
+	"""
+
+	checkpoint_dir = create_checkpoint_dir(accelerator, step, output_dir)
+	generate_checkpoint_samples(accelerator, model, eval_dataloader, config, step, checkpoint_dir)
+	save_checkpoint(accelerator, model, checkpoint_dir)
 
 
 def set_preliminaries() -> None:
@@ -258,8 +501,8 @@ def main() -> None:
 	"""Run the distributed training loop.
 
 	The function performs config loading, dataloader construction, model setup,
-	optimizer/scheduler creation, Accelerate preparation, logging, and periodic
-	checkpoint saving.
+	optimizer/scheduler creation, Accelerate preparation, logging, periodic
+	evaluation generation, and checkpoint saving.
 	"""
 
 	set_preliminaries()
@@ -313,16 +556,14 @@ def main() -> None:
 			f"to match patch size {collator.geo_patch_size}."
 		)
 	
-	dataloader = DataLoader(
+	dataloader = create_world_dataloader(
 		dataset=dataset,
 		batch_size=config.training.per_device_batch_size,
 		shuffle=(not isinstance(dataset, IterableDataset)) and config.dataset.shuffle,
-		num_workers=config.dataset.num_workers,
-		pin_memory=config.dataset.pin_memory and torch.cuda.is_available(),
-		persistent_workers=config.dataset.persistent_workers and config.dataset.num_workers > 0,
-		prefetch_factor=config.dataset.prefetch_factor,
-		collate_fn=collator
+		dataset_config=config.dataset,
+		collator=collator,
 	)
+	eval_dataloader = build_eval_dataloader(config, collator, accelerator)
 
 	if isinstance(dataset, IterableDataset):
 		model, optimizer = accelerator.prepare(model, optimizer)
@@ -333,11 +574,7 @@ def main() -> None:
 
 	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
 	total_training_steps = steps_per_epoch * config.training.num_epochs
-	lr_scheduler = get_cosine_schedule_with_warmup(
-		optimizer,
-		num_warmup_steps=config.optimizer.warmup_steps,
-		num_training_steps=total_training_steps,
-	)
+	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)
 	progress_bar = tqdm(
 		total=total_training_steps,
 		desc="Training",
@@ -384,12 +621,10 @@ def main() -> None:
 							metrics_log.flush()
 							os.fsync(metrics_log.fileno())
 					if config.training.save_every > 0 and global_step % config.training.save_every == 0:
-						accelerator.wait_for_everyone()
-						save_checkpoint(accelerator, model, global_step, output_dir)
+						save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
 
 	progress_bar.close()
-	accelerator.wait_for_everyone()
-	save_checkpoint(accelerator, model, global_step, output_dir)
+	save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
 	if metrics_log is not None:
 		metrics_log.close()
 	accelerator.end_training()

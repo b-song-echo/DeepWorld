@@ -99,19 +99,30 @@ class DeepWorld(nn.Module):
 
 		return latent_mask, token_mask
 
-	def forward(self, batch: dict[str, Tensor], return_auxiliary: bool = False) -> dict[str, Tensor]:
+	def forward(
+		self,
+		batch: dict[str, Tensor],
+		return_auxiliary: bool = False,
+		generate_samples: bool = False,
+		generator: torch.Generator | None = None,
+	) -> dict[str, Tensor]:
 		"""Run one training forward pass and return latent-space denoising loss.
 
 		Args:
 			batch: Collated training batch produced by the dataset pipeline.
 			return_auxiliary: Whether to include non-loss tensors in the return payload.
+			generate_samples: Whether to run the inference path instead of training loss computation.
+			generator: Optional random generator used by the inference path.
 
 		Returns:
-			A dictionary containing the scalar loss and, optionally, auxiliary tensors.
+			A dictionary containing the scalar loss, generated videos, or optional auxiliary tensors.
 		"""
 
+		if generate_samples:
+			return {"videos": self.generate(batch, generator=generator)}
+
 		videos = batch["videos"].to(device=next(self.parameters()).device, non_blocking=True)
-		latents = self.renderer.encode_videos(videos, sample_posterior=True)
+		latents = self.renderer.encode_videos(videos, sample_posterior=self.config.wan_renderer.vae_sample_posterior)
 		latent_mask, token_mask = self._build_loss_masks(batch["video_frame_counts"], latents)
 		latent_patch_grids = self.renderer.latent_patch_grids(latents)
 
@@ -133,7 +144,8 @@ class DeepWorld(nn.Module):
 		)["sample"]
 
 		loss = (model_output.float() - target.float()).pow(2)
-		loss = (loss * latent_mask.float()).sum() / latent_mask.float().sum().clamp_min(1.0)
+		loss_mask = latent_mask.float()
+		loss = (loss * loss_mask).sum() / (loss_mask.sum() * loss.size(1)).clamp_min(1.0)
 
 		if not return_auxiliary:
 			return {"loss": loss}

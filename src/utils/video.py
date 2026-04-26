@@ -301,3 +301,42 @@ def resize_tensor_image(image: Tensor, height: int, width: int) -> Tensor:
 	"""
 
 	return F.interpolate(image.unsqueeze(0), size=(height, width), mode="bicubic", align_corners=False).squeeze(0)
+
+
+def video_tensor_to_uint8(video: Tensor) -> np.ndarray:
+	"""Convert one generated video tensor into uint8 frames for serialization.
+
+	Args:
+		video: Tensor with shape `(3, T, H, W)` or `(T, 3, H, W)` in `[-1, 1]`.
+
+	Returns:
+		A NumPy array with shape `(T, H, W, 3)` and dtype `uint8`.
+	"""
+
+	if video.ndim != 4:
+		raise ValueError(f"Expected a 4D video tensor, got shape {tuple(video.shape)}.")
+
+	video = video.detach().float().cpu().clamp(-1.0, 1.0)
+	if video.size(0) == 3:
+		frames = video.permute(1, 2, 3, 0)
+	elif video.size(1) == 3:
+		frames = video.permute(0, 2, 3, 1)
+	else:
+		raise ValueError(f"Expected RGB channels in dimension 0 or 1, got shape {tuple(video.shape)}.")
+
+	frames = ((frames + 1.0) * 127.5).round().to(torch.uint8)
+	return frames.contiguous().numpy()
+
+
+def save_video_tensor(video: Tensor, path: str | Path, fps: int = 16) -> None:
+	"""Write one generated video tensor to an MP4 file.
+
+	Args:
+		video: Tensor with shape `(3, T, H, W)` or `(T, 3, H, W)` in `[-1, 1]`.
+		path: Destination `.mp4` path.
+		fps: Output video frame rate.
+	"""
+
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	iio.imwrite(path, video_tensor_to_uint8(video), fps=fps)
