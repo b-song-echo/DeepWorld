@@ -433,7 +433,7 @@ class WorldModelBatchCollator:
 
 		return videos, frame_counts
 
-	def __call__(self, samples: list[WorldModelSample]) -> dict[str, Tensor]:
+	def __call__(self, samples: list[WorldModelSample]) -> dict[str, Tensor | list[str]]:
 		"""Collate a list of raw samples into one training batch.
 
 		Args:
@@ -460,6 +460,8 @@ class WorldModelBatchCollator:
 		videos, frame_counts = self._pad_videos(samples)
 
 		return {
+			"sample_ids": [sample.sample_id for sample in samples],
+			"prompts": prompts,
 			"txt_input_ids": txt_inputs["input_ids"],
 			"txt_attention_mask": txt_inputs["attention_mask"],
 			"qwen_vis_pixel_values": vis_inputs["pixel_values"],

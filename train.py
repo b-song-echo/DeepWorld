@@ -17,7 +17,7 @@ from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
 from src.utils.compat import get_world_size
-from src.utils.video import save_video_tensor
+from src.utils.video import save_image_tensor, save_video_tensor
 
 
 def parse_args() -> argparse.Namespace:
@@ -367,6 +367,47 @@ def make_eval_generator(device: torch.device, seed: int) -> torch.Generator:
 	return generator
 
 
+def save_eval_sample_bundle(
+	batch: dict,
+	generated_video: torch.Tensor,
+	batch_index: int,
+	global_eval_index: int,
+	checkpoint_dir: Path,
+) -> None:
+	"""Save one generated sample with its text and training inputs.
+
+	Args:
+		batch: Collated evaluation batch containing prompts, references, and GT video.
+		generated_video: Generated video tensor with shape `(3, T, H, W)`.
+		batch_index: Index of the sample inside the current dataloader batch.
+		global_eval_index: Stable global eval-sample index across ranks.
+		checkpoint_dir: Checkpoint directory where sample folders should be written.
+	"""
+
+	sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
+	sample_dir.mkdir(parents=True, exist_ok=True)
+	save_video_tensor(generated_video, sample_dir / "generated.mp4")
+	save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4")
+
+	prompt = batch["prompts"][batch_index]
+	sample_id = batch["sample_ids"][batch_index]
+	metadata = {
+		"global_eval_index": global_eval_index,
+		"sample_id": sample_id,
+		"prompt": prompt,
+	}
+	(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+	(sample_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+	reference_dir = sample_dir / "references"
+	reference_mask = batch["reference_mask"][batch_index]
+	reference_images = batch["geo_images"][batch_index]
+	for ref_index, is_valid in enumerate(reference_mask.tolist()):
+		if not is_valid:
+			continue
+		save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
+
+
 def generate_checkpoint_samples(
 	accelerator: Accelerator,
 	model: torch.nn.Module,
@@ -412,9 +453,12 @@ def generate_checkpoint_samples(
 				if num_saved >= per_process_samples:
 					break
 				global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
-				save_video_tensor(
-					videos[batch_index],
-					checkpoint_dir / f"eval_sample_{global_eval_index:04d}.mp4",
+				save_eval_sample_bundle(
+					batch=batch,
+					generated_video=videos[batch_index],
+					batch_index=batch_index,
+					global_eval_index=global_eval_index,
+					checkpoint_dir=checkpoint_dir,
 				)
 				num_saved += 1
 

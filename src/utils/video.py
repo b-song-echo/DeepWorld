@@ -328,6 +328,41 @@ def video_tensor_to_uint8(video: Tensor) -> np.ndarray:
 	return frames.contiguous().numpy()
 
 
+def image_tensor_to_uint8(image: Tensor) -> np.ndarray:
+	"""Convert one image tensor into an RGB uint8 array.
+
+	Args:
+		image: Tensor with shape `(3, H, W)` in either `[0, 1]` or `[-1, 1]`.
+
+	Returns:
+		A NumPy array with shape `(H, W, 3)` and dtype `uint8`.
+	"""
+
+	if image.ndim != 3 or image.size(0) != 3:
+		raise ValueError(f"Expected a CHW RGB image tensor, got shape {tuple(image.shape)}.")
+
+	image = image.detach().float().cpu()
+	if image.min().item() < 0.0:
+		image = image.clamp(-1.0, 1.0).add(1.0).mul(0.5)
+	else:
+		image = image.clamp(0.0, 1.0)
+	image = image.permute(1, 2, 0).mul(255.0).round().to(torch.uint8)
+	return image.contiguous().numpy()
+
+
+def save_image_tensor(image: Tensor, path: str | Path) -> None:
+	"""Write one RGB image tensor to disk.
+
+	Args:
+		image: Tensor with shape `(3, H, W)` in either `[0, 1]` or `[-1, 1]`.
+		path: Destination image path.
+	"""
+
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	iio.imwrite(path, image_tensor_to_uint8(image))
+
+
 def save_video_tensor(video: Tensor, path: str | Path, fps: int = 16) -> None:
 	"""Write one generated video tensor to an MP4 file.
 
