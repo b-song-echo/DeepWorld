@@ -1,6 +1,5 @@
 import os
 import argparse
-import json
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -22,11 +21,11 @@ from src.utils.video import save_image_tensor, save_video_tensor
 
 def parse_args() -> argparse.Namespace:
 	"""Parse command-line arguments for training.
-	
+
 	Returns:
 		Namespace containing the required config path.
 	"""
-	
+
 	parser = argparse.ArgumentParser()
 	parser.add_argument(
 		"--config", type=str, required=True,
@@ -121,13 +120,13 @@ def create_accelerator(
 		sync_module_states=True,
 		cpu_offload=False
 	) if fsdp_enabled else None
-	
+
 	return Accelerator(
 		gradient_accumulation_steps=grad_acc_steps,
 		mixed_precision=mixed_precision,
 		log_with="tensorboard",
 		project_config=ProjectConfiguration(
-			project_dir=output_dir,
+			output_dir=output_dir,
 			logging_dir=str(Path(output_dir) / "logs"),
 		),
 		fsdp_plugin=fsdp_plugin,
@@ -390,14 +389,7 @@ def save_eval_sample_bundle(
 	save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4")
 
 	prompt = batch["prompts"][batch_index]
-	sample_id = batch["sample_ids"][batch_index]
-	metadata = {
-		"global_eval_index": global_eval_index,
-		"sample_id": sample_id,
-		"prompt": prompt,
-	}
 	(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
-	(sample_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 	reference_dir = sample_dir / "references"
 	reference_mask = batch["reference_mask"][batch_index]
@@ -529,7 +521,7 @@ def set_preliminaries() -> None:
 
 	import warnings
 	warnings.filterwarnings("ignore")
-	
+
 	from diffusers.utils import logging
 	logging.set_verbosity_error()
 
@@ -555,7 +547,7 @@ def main() -> None:
 	set_seed(config.training.seed)
 	output_dir = Path(config.training.output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
-	
+
 	model = DeepWorld(config)
 	accelerator = create_accelerator(
 		model=model,
@@ -565,18 +557,12 @@ def main() -> None:
 		use_fsdp=config.training.use_fsdp,
 	)
 	accelerator.init_trackers(
-		"DeepWorld",
+		project_name="",
 		config=vars(config.training),
-		init_kwargs={"tensorboard": {"flush_secs": 10, "max_queue": 1}},
+		init_kwargs={"tensorboard": {"max_queue": 1}},
 	)
-	metrics_log = None
-	if accelerator.is_main_process:
-		metrics_log = (output_dir / "metrics.jsonl").open("a", encoding="utf-8", buffering=1)
-		metrics_log.write(json.dumps({"event": "start", "step": 0}, sort_keys=True) + "\n")
-		metrics_log.flush()
-		os.fsync(metrics_log.fileno())
 	log_parameter_summary(accelerator, model)
-	
+
 	model.to(accelerator.device) # NOTE: do not remove it at the moment
 	optimizer = AdamW(
 		[p for p in model.parameters() if p.requires_grad],
@@ -599,7 +585,7 @@ def main() -> None:
 			f"Adjusted VGGT geometry image size from {config.dataset.vis_image_size} to {collator.geo_image_size} "
 			f"to match patch size {collator.geo_patch_size}."
 		)
-	
+
 	dataloader = create_world_dataloader(
 		dataset=dataset,
 		batch_size=config.training.per_device_batch_size,
@@ -626,7 +612,7 @@ def main() -> None:
 		dynamic_ncols=True,
 	)
 	progress_bar.set_postfix(step=0, epoch=0, loss="n/a")
-	
+
 	global_step = 0
 	accumulated_losses: list[torch.Tensor] = []
 	for epoch in range(config.training.num_epochs):
@@ -655,22 +641,16 @@ def main() -> None:
 					)
 					if should_log:
 						metrics = {
-							"train/loss": loss_value,
-							"train/lr": lr_scheduler.get_last_lr()[0],
-							"train/epoch": epoch + 1,
+							"loss": loss_value,
+							"lr": lr_scheduler.get_last_lr()[0],
+							"epoch": epoch + 1,
 						}
 						accelerator.log(metrics, step=global_step)
-						if metrics_log is not None:
-							metrics_log.write(json.dumps({"step": global_step, **metrics}, sort_keys=True) + "\n")
-							metrics_log.flush()
-							os.fsync(metrics_log.fileno())
 					if config.training.save_every > 0 and global_step % config.training.save_every == 0:
 						save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
 
 	progress_bar.close()
 	save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
-	if metrics_log is not None:
-		metrics_log.close()
 	accelerator.end_training()
 
 

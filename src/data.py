@@ -293,15 +293,15 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 		reference_images = sample_reference_images(
 			raw_frames,
 			num_reference_images=self.config.num_reference_images,
-			random_selection=self.config.shuffle,
+			random_selection=True,
+			preserve_order=False,
 		)
 		video = load_video_frames_from_raw_frames(
 			raw_frames,
 			num_frames=self.config.video_num_frames,
-			stride=self.config.video_frame_stride,
 			height=self.config.video_height,
 			width=self.config.video_width,
-			random_clip=self.config.shuffle,
+			frame_sampling="uniform",
 		)
 		return WorldModelSample(
 			sample_id=str(sample.get("__key__", metadata.get("id", ""))),

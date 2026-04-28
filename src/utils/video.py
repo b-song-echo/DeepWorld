@@ -149,6 +149,7 @@ def sample_reference_images(
 	raw_frames: list[Image.Image],
 	num_reference_images: int,
 	random_selection: bool = True,
+	preserve_order: bool = True,
 ) -> list[Image.Image]:
 	"""Sample reference images from decoded video frames.
 
@@ -156,6 +157,7 @@ def sample_reference_images(
 		raw_frames: Decoded RGB frames from the source video.
 		num_reference_images: Maximum number of reference frames to select.
 		random_selection: Whether to sample frames randomly instead of uniformly.
+		preserve_order: Whether selected frames should keep their temporal order.
 
 	Returns:
 		A list of RGB reference images.
@@ -166,7 +168,9 @@ def sample_reference_images(
 
 	selection_count = min(num_reference_images, len(raw_frames))
 	if random_selection:
-		indices = sorted(random.sample(range(len(raw_frames)), k=selection_count))
+		indices = random.sample(range(len(raw_frames)), k=selection_count)
+		if preserve_order:
+			indices = sorted(indices)
 	else:
 		if selection_count == 1:
 			indices = [len(raw_frames) // 2]
@@ -217,6 +221,13 @@ def _sample_clip_indices(num_frames: int, clip_frames: int, stride: int, random_
 		A list of source-frame indices.
 	"""
 
+	if num_frames <= 0:
+		raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
+	if clip_frames <= 0:
+		raise ValueError(f"`clip_frames` must be positive, got {clip_frames}.")
+	if stride <= 0:
+		raise ValueError(f"`stride` must be positive, got {stride}.")
+
 	span = clip_frames * stride
 	if num_frames <= span:
 		return list(range(0, num_frames, stride))
@@ -226,30 +237,98 @@ def _sample_clip_indices(num_frames: int, clip_frames: int, stride: int, random_
 	return list(range(start, min(start + span, num_frames), stride))
 
 
+def _sample_uniform_indices(num_frames: int, clip_frames: int) -> list[int]:
+	"""Choose frame indices evenly across the whole source video.
+
+	Args:
+		num_frames: Number of frames available in the source video.
+		clip_frames: Requested number of output frames before final alignment.
+
+	Returns:
+		A list of source-frame indices covering the full temporal extent.
+	"""
+
+	if num_frames <= 0:
+		raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
+	if clip_frames <= 0:
+		raise ValueError(f"`clip_frames` must be positive, got {clip_frames}.")
+	if num_frames <= clip_frames:
+		return list(range(num_frames))
+	if clip_frames == 1:
+		return [num_frames // 2]
+	return [round(index * (num_frames - 1) / (clip_frames - 1)) for index in range(clip_frames)]
+
+
+def sample_video_frame_indices(
+	num_source_frames: int,
+	num_output_frames: int,
+	stride: int | None = None,
+	random_clip: bool | None = None,
+	frame_sampling: str = "clip",
+) -> list[int]:
+	"""Choose source-video frame indices according to the requested strategy.
+
+	Args:
+		num_source_frames: Number of decoded frames available in the source video.
+		num_output_frames: Requested number of output frames before final alignment.
+		stride: Optional temporal stride used by the `clip` strategy. Defaults to `1`.
+		random_clip: Optional `clip` strategy flag controlling whether to randomize the window start. Defaults to `True`.
+		frame_sampling: Sampling strategy, either `clip` or `uniform`.
+
+	Returns:
+		A list of source-frame indices.
+
+	Raises:
+		ValueError: If `frame_sampling` is unsupported.
+	"""
+
+	if frame_sampling == "clip":
+		clip_stride = 1 if stride is None else stride
+		clip_random = True if random_clip is None else random_clip
+		return _sample_clip_indices(
+			num_source_frames,
+			num_output_frames,
+			clip_stride,
+			random_clip=clip_random,
+		)
+	if frame_sampling == "uniform":
+		return _sample_uniform_indices(num_source_frames, num_output_frames)
+	raise ValueError(f"Unsupported frame sampling strategy: {frame_sampling!r}.")
+
+
 def load_video_frames(
 	path: str | Path,
 	num_frames: int,
-	stride: int,
 	height: int,
 	width: int,
-	random_clip: bool = True,
+	*,
+	stride: int | None = None,
+	random_clip: bool | None = None,
+	frame_sampling: str = "clip",
 ) -> Tensor:
 	"""Load a video clip, sample frames, and convert it into a training tensor.
 
 	Args:
 		path: Video file path.
 		num_frames: Requested number of output frames before alignment.
-		stride: Temporal sampling stride.
 		height: Output frame height.
 		width: Output frame width.
-		random_clip: Whether to sample a random temporal window.
+		stride: Optional temporal stride used by the `clip` strategy. Defaults to `1`.
+		random_clip: Optional `clip` strategy flag controlling whether to randomize the window start. Defaults to `True`.
+		frame_sampling: Sampling strategy, either `clip` or `uniform`.
 
 	Returns:
 		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
 	"""
 
 	raw_frames = decode_video_frames(path)
-	indices = _sample_clip_indices(len(raw_frames), num_frames, stride, random_clip=random_clip)
+	indices = sample_video_frame_indices(
+		len(raw_frames),
+		num_frames,
+		stride=stride,
+		random_clip=random_clip,
+		frame_sampling=frame_sampling,
+	)
 	frames = [raw_frames[index] for index in indices]
 	frames = align_frame_count(frames)
 	frame_tensors = [prepare_image_tensor(frame, height, width, normalize_to_neg_one=True) for frame in frames]
@@ -259,20 +338,23 @@ def load_video_frames(
 def load_video_frames_from_raw_frames(
 	raw_frames: list[Image.Image],
 	num_frames: int,
-	stride: int,
 	height: int,
 	width: int,
-	random_clip: bool = True,
+	*,
+	stride: int | None = None,
+	random_clip: bool | None = None,
+	frame_sampling: str = "clip",
 ) -> Tensor:
 	"""Convert decoded frames into a training clip tensor.
 
 	Args:
 		raw_frames: Decoded RGB frames from the source video.
 		num_frames: Requested number of output frames before alignment.
-		stride: Temporal sampling stride.
 		height: Output frame height.
 		width: Output frame width.
-		random_clip: Whether to sample a random temporal window.
+		stride: Optional temporal stride used by the `clip` strategy. Defaults to `1`.
+		random_clip: Optional `clip` strategy flag controlling whether to randomize the window start. Defaults to `True`.
+		frame_sampling: Sampling strategy, either `clip` or `uniform`.
 
 	Returns:
 		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
@@ -281,7 +363,13 @@ def load_video_frames_from_raw_frames(
 	if len(raw_frames) == 0:
 		raise ValueError("Cannot build a training clip from an empty frame list.")
 
-	indices = _sample_clip_indices(len(raw_frames), num_frames, stride, random_clip=random_clip)
+	indices = sample_video_frame_indices(
+		len(raw_frames),
+		num_frames,
+		stride=stride,
+		random_clip=random_clip,
+		frame_sampling=frame_sampling,
+	)
 	frames = [raw_frames[index] for index in indices]
 	frames = align_frame_count(frames)
 	frame_tensors = [prepare_image_tensor(frame, height, width, normalize_to_neg_one=True) for frame in frames]

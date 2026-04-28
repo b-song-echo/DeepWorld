@@ -35,7 +35,7 @@ class LoraLinear(nn.Module):
 		super().__init__()
 		self.base_layer = base_layer
 		self.base_layer.requires_grad_(False)
-		
+
 		self.rank = rank
 		self.scaling = alpha / rank
 		self.dropout = nn.Dropout(dropout)
@@ -168,7 +168,7 @@ class MoFfn(nn.Module):
 		lora_rank: int, lora_alpha: int, lora_dropout: float,
 	) -> nn.Module:
 		"""Instantiate one modality-specific FFN expert."""
-		
+
 		if mode == "full":
 			new_expert = deepcopy(txt_expert)
 			new_expert.requires_grad_(True)
@@ -309,7 +309,7 @@ class QwenBrain(nn.Module):
 			moffn_lora_dropout=qwen_config.routed_ffn_lora_dropout,
 		) for layer in self.language_model.layers]
 		self.language_model.layers = nn.ModuleList(replaced_layers)
-		
+
 		inject_lora_layers(
 			self.language_model,
 			target_names=qwen_config.lora_target_modules,
@@ -600,15 +600,10 @@ class QwenBrain(nn.Module):
 			cursor = 0
 
 			cursor = self._append_segment_token(
-				"vis",
-				VIS_MODALITY,
-				parts,
-				part_positions,
-				part_modalities,
-				cursor,
-				device,
-				txt_embeddings.dtype,
+				"vis", VIS_MODALITY, parts, part_positions,
+				part_modalities, cursor, device, txt_embeddings.dtype,
 			)
+
 			for features, grid in zip(vis_groups[batch_index], vis_grids[batch_index]):
 				features = features.to(device)
 				positions, cursor = self._make_grid_positions(grid, cursor, device)
@@ -714,7 +709,7 @@ class QwenBrain(nn.Module):
 			txt_attention_mask=batch["txt_attention_mask"],
 			latent_patch_grids=latent_patch_grids,
 		)
-		
+
 		language_outputs = self.language_model(
 			input_ids=None,
 			inputs_embeds=language_inputs["inputs_embeds"],
