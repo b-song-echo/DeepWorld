@@ -19,10 +19,10 @@ dataset:
 
 optimizer:
   learning_rate: 1.0e-5
-  qwen_language_learning_rate: 1.0e-5
-  qwen_other_learning_rate: null
-  wan_transformer_learning_rate: 1.0e-5
-  wan_other_learning_rate: null
+  brain_language_model_learning_rate: 1.0e-5
+  brain_others_learning_rate: null
+  renderer_transformer_learning_rate: 1.0e-5
+  renderer_others_learning_rate: null
   lr_schedule: constant
   weight_decay: 0.01
   betas: [0.9, 0.98]

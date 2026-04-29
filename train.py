@@ -338,7 +338,7 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 
 	def train_params_except(
 		module: torch.nn.Module,
-		excluded_params: list[torch.nn.Module]
+		excluded_params: list[torch.nn.Parameter]
 	) -> list[torch.nn.Parameter]:
 		excluded_ids = {id(p) for p in excluded_params}
 		return [p for p in train_params(module) if id(p) not in excluded_ids]
@@ -358,39 +358,38 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 		})
 
 	brain_language_model_params = train_params(model.brain.language_model)
-	brain_other_params = train_params_except(model.brain, brain_language_model_params)
+	brain_others_params = train_params_except(model.brain, brain_language_model_params)
 
 	renderer_transformer_params = train_params(model.renderer.transformer)
-	wan_other_params = train_params_except(model.renderer, renderer_transformer_params)
+	renderer_others_params = train_params_except(model.renderer, renderer_transformer_params)
 
 	_validate_optimizer_groups(model, grouped_parameters=(
 		brain_language_model_params
-		+ brain_other_params
+		+ brain_others_params
 		+ renderer_transformer_params
-		+ wan_other_params
+		+ renderer_others_params
 	))
 
-	# TODO: update the config name (dataclass and yaml), and param group name, match the name used above, such as brain_language_model, brain_others, renderer_transformer, renderer_others.
 	parameter_groups: list[dict] = []
 	add_optimizer_group(
-		parameter_groups, "qwen_language_model",
+		parameter_groups, "brain_language_model",
 		brain_language_model_params,
-		config.optimizer.qwen_language_learning_rate,
+		config.optimizer.brain_language_model_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "qwen_other",
-		brain_other_params,
-		config.optimizer.qwen_other_learning_rate,
+		parameter_groups, "brain_others",
+		brain_others_params,
+		config.optimizer.brain_others_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "wan_transformer",
+		parameter_groups, "renderer_transformer",
 		renderer_transformer_params,
-		config.optimizer.wan_transformer_learning_rate,
+		config.optimizer.renderer_transformer_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "wan_other",
-		wan_other_params,
-		config.optimizer.wan_other_learning_rate,
+		parameter_groups, "renderer_others",
+		renderer_others_params,
+		config.optimizer.renderer_others_learning_rate,
 	)
 	if len(parameter_groups) == 0:
 		raise RuntimeError("No trainable parameters were found for optimizer construction.")

@@ -68,10 +68,10 @@ class OptimizerConfig:
 
 	Attributes:
 		learning_rate: Base learning rate used by AdamW.
-		qwen_language_learning_rate: Learning rate for trainable Qwen language-model parameters. If omitted, defaults to `learning_rate`.
-		qwen_other_learning_rate: Learning rate for other trainable Qwen brain parameters. If omitted, defaults to `qwen_language_learning_rate`.
-		wan_transformer_learning_rate: Learning rate for trainable Wan transformer parameters. If omitted, defaults to `learning_rate`.
-		wan_other_learning_rate: Learning rate for other trainable Wan renderer parameters. If omitted, defaults to `wan_transformer_learning_rate`.
+		brain_language_model_learning_rate: Learning rate for trainable Qwen language-model parameters. If omitted, defaults to `learning_rate`.
+		brain_others_learning_rate: Learning rate for other trainable brain parameters. If omitted, defaults to `brain_language_model_learning_rate`.
+		renderer_transformer_learning_rate: Learning rate for trainable Wan transformer parameters. If omitted, defaults to `learning_rate`.
+		renderer_others_learning_rate: Learning rate for other trainable renderer parameters. If omitted, defaults to `renderer_transformer_learning_rate`.
 		lr_schedule: Learning-rate schedule after warmup, either `cosine` or `constant`.
 		weight_decay: Weight decay coefficient.
 		betas: Adam beta coefficients.
@@ -81,10 +81,10 @@ class OptimizerConfig:
 	"""
 
 	learning_rate: float = 2e-5
-	qwen_language_learning_rate: float | None = None
-	qwen_other_learning_rate: float | None = None
-	wan_transformer_learning_rate: float | None = None
-	wan_other_learning_rate: float | None = None
+	brain_language_model_learning_rate: float | None = None
+	brain_others_learning_rate: float | None = None
+	renderer_transformer_learning_rate: float | None = None
+	renderer_others_learning_rate: float | None = None
 	lr_schedule: str = "cosine"
 	weight_decay: float = 1e-2
 	betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
@@ -95,21 +95,21 @@ class OptimizerConfig:
 	def __post_init__(self) -> None:
 		"""Validate optimizer schedule settings."""
 
-		if self.qwen_language_learning_rate is None:
-			self.qwen_language_learning_rate = self.learning_rate
-		if self.qwen_other_learning_rate is None:
-			self.qwen_other_learning_rate = self.qwen_language_learning_rate
-		if self.wan_transformer_learning_rate is None:
-			self.wan_transformer_learning_rate = self.learning_rate
-		if self.wan_other_learning_rate is None:
-			self.wan_other_learning_rate = self.wan_transformer_learning_rate
+		if self.brain_language_model_learning_rate is None:
+			self.brain_language_model_learning_rate = self.learning_rate
+		if self.brain_others_learning_rate is None:
+			self.brain_others_learning_rate = self.brain_language_model_learning_rate
+		if self.renderer_transformer_learning_rate is None:
+			self.renderer_transformer_learning_rate = self.learning_rate
+		if self.renderer_others_learning_rate is None:
+			self.renderer_others_learning_rate = self.renderer_transformer_learning_rate
 
 		for name in (
 			"learning_rate",
-			"qwen_language_learning_rate",
-			"qwen_other_learning_rate",
-			"wan_transformer_learning_rate",
-			"wan_other_learning_rate",
+			"brain_language_model_learning_rate",
+			"brain_others_learning_rate",
+			"renderer_transformer_learning_rate",
+			"renderer_others_learning_rate",
 		):
 			value = getattr(self, name)
 			if value <= 0:
