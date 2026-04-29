@@ -211,8 +211,8 @@ class WanRendererConfig:
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
 		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
-		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero` or `small_random`.
-		condition_proj_init_std: Standard deviation used when `condition_proj_init=small_random`.
+		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero`, `normal`, or `default`.
+		condition_proj_init_std: Optional standard deviation used when `condition_proj_init=normal`. If omitted, defaults to `1e-3`.
 		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
 			inferred from the checkpoint scheduler config when available.
@@ -226,7 +226,7 @@ class WanRendererConfig:
 	vae_enable_tiling: bool = False
 	vae_sample_posterior: bool = False
 	condition_proj_init: str = "zero"
-	condition_proj_init_std: float = 1e-3 # TODO: this should be an optional, only used when the init is normal
+	condition_proj_init_std: float | None = None
 	condition_dropout_prob: float = 0.1
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
@@ -235,12 +235,14 @@ class WanRendererConfig:
 		"""Validate Wan renderer training and initialization settings."""
 
 		self.condition_proj_init = self.condition_proj_init.lower()
-		if self.condition_proj_init not in {"zero", "small_random"}:
+		if self.condition_proj_init not in {"zero", "normal", "default"}:
 			raise ValueError(
-				"`wan_renderer.condition_proj_init` must be either `zero` or `small_random`, "
+				"`wan_renderer.condition_proj_init` must be `zero`, `normal`, or `default`, "
 				f"got {self.condition_proj_init!r}."
 			)
-		if self.condition_proj_init_std <= 0:
+		if self.condition_proj_init == "normal" and self.condition_proj_init_std is None:
+			self.condition_proj_init_std = 1e-3
+		if self.condition_proj_init_std is not None and self.condition_proj_init_std <= 0:
 			raise ValueError(
 				"`wan_renderer.condition_proj_init_std` must be positive, "
 				f"got {self.condition_proj_init_std}."

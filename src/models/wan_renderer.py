@@ -74,8 +74,9 @@ class WanRenderer(nn.Module):
 		"""Initialize Qwen-to-Wan conditioning projection according to config.
 
 		Zero initialization starts training from the original Wan transformer
-		behavior. Small-random initialization exposes the renderer to Qwen signals
-		immediately while keeping the injected residual near zero.
+		behavior. Normal initialization exposes the renderer to Qwen signals
+		immediately while keeping the injected residual near zero. Default
+		initialization preserves the `nn.Linear` constructor's parameters.
 
 		Args:
 			wan_config: Wan renderer configuration containing the init strategy.
@@ -83,13 +84,16 @@ class WanRenderer(nn.Module):
 
 		if wan_config.condition_proj_init == "zero":
 			nn.init.zeros_(self.condition_proj.weight)
-		elif wan_config.condition_proj_init == "small_random":
-			# TODO: call this normal rather than small_random 
+			nn.init.zeros_(self.condition_proj.bias)
+		elif wan_config.condition_proj_init == "normal":
+			if wan_config.condition_proj_init_std is None:
+				raise ValueError("`wan_renderer.condition_proj_init_std` must be set when using normal init.")
 			nn.init.normal_(self.condition_proj.weight, std=wan_config.condition_proj_init_std)
+			nn.init.zeros_(self.condition_proj.bias)
+		elif wan_config.condition_proj_init == "default":
+			return
 		else:
-			# TOOO: apart from zero and normal, there should also be the default nn.Linear initialization method.
 			raise ValueError(f"Unsupported condition projection init: {wan_config.condition_proj_init!r}.")
-		nn.init.zeros_(self.condition_proj.bias)
 
 	def _remove_text_conditioning_modules(self) -> None:
 		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""

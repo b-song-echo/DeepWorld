@@ -289,52 +289,49 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
-# TODO: Simplify the process of creating optimizer. In particular, why do I need to care about the names of parameters as long as the parameters themselves are passed to the correct groups.
-def _named_trainable_parameters(module: torch.nn.Module, prefix: str) -> list[tuple[str, torch.nn.Parameter]]:
-	"""Collect trainable parameters from a module with a stable display prefix.
+# TODO: Don't put this in a function... It is only a single line of code, why do you have to put everything in a function...
+
+def _trainable_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]:
+	"""Collect trainable parameters from one module tree.
 
 	Args:
 		module: Module whose parameters should be inspected.
-		prefix: Prefix added to each parameter name.
 
 	Returns:
-		A list of `(name, parameter)` pairs for parameters requiring gradients.
+		A list of parameters requiring gradients.
 	"""
 
-	return [
-		(f"{prefix}.{name}", parameter)
-		for name, parameter in module.named_parameters()
-		if parameter.requires_grad
-	]
+	return [parameter for parameter in module.parameters() if parameter.requires_grad]
 
 
+# TODO: make this a helper nested function inside build_optimizer, no need to document
 def _other_trainable_parameters(
 	module: torch.nn.Module,
-	prefix: str,
 	excluded_parameter_ids: set[int],
-) -> list[tuple[str, torch.nn.Parameter]]:
+) -> list[torch.nn.Parameter]:
 	"""Collect trainable parameters outside an already-owned parameter set.
 
 	Args:
 		module: Module whose parameters should be inspected.
-		prefix: Prefix added to each parameter name.
 		excluded_parameter_ids: Parameter identities that already belong to a more specific group.
 
 	Returns:
-		A list of trainable `(name, parameter)` pairs not present in `excluded_parameter_ids`.
+		A list of trainable parameters not present in `excluded_parameter_ids`.
 	"""
 
 	return [
-		(f"{prefix}.{name}", parameter)
-		for name, parameter in module.named_parameters()
+		parameter
+		for parameter in module.parameters()
 		if parameter.requires_grad and id(parameter) not in excluded_parameter_ids
 	]
 
 
+# TODO: make this a helper nested function inside build_optimizer, no need to document
+
 def _add_optimizer_group(
 	parameter_groups: list[dict],
 	group_name: str,
-	named_parameters: list[tuple[str, torch.nn.Parameter]],
+	parameters: list[torch.nn.Parameter],
 	learning_rate: float,
 ) -> None:
 	"""Append one non-empty AdamW parameter group.
@@ -342,32 +339,32 @@ def _add_optimizer_group(
 	Args:
 		parameter_groups: Mutable optimizer group list.
 		group_name: Human-readable group name stored in the optimizer state.
-		named_parameters: Parameters assigned to this group.
+		parameters: Parameters assigned to this group.
 		learning_rate: Learning rate for this group.
 	"""
 
-	if len(named_parameters) == 0:
+	if len(parameters) == 0:
 		return
 	parameter_groups.append({
 		"name": group_name,
-		"params": [parameter for _, parameter in named_parameters],
+		"params": parameters,
 		"lr": learning_rate,
 	})
 
 
-def _validate_optimizer_groups(model: DeepWorld, grouped_parameters: list[tuple[str, torch.nn.Parameter]]) -> None:
+def _validate_optimizer_groups(model: DeepWorld, grouped_parameters: list[torch.nn.Parameter]) -> None:
 	"""Ensure optimizer grouping covers each trainable parameter exactly once.
 
 	Args:
 		model: Unprepared model whose trainable parameters should be optimized.
-		grouped_parameters: Flattened `(name, parameter)` pairs assigned to optimizer groups.
+		grouped_parameters: Flattened parameter list assigned to optimizer groups.
 
 	Raises:
 		RuntimeError: If any trainable parameter is missing or assigned more than once.
 	"""
 
 	trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
-	grouped_ids = [id(parameter) for _, parameter in grouped_parameters]
+	grouped_ids = [id(parameter) for parameter in grouped_parameters]
 	grouped_id_set = set(grouped_ids)
 	if len(grouped_ids) != len(grouped_id_set):
 		raise RuntimeError("Optimizer parameter groups contain duplicate trainable parameters.")
@@ -397,25 +394,17 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 		An AdamW optimizer with one parameter group per non-empty branch group.
 	"""
 
-	qwen_language_parameters = _named_trainable_parameters(
-		model.brain.language_model,
-		"brain.language_model",
-	)
-	qwen_language_ids = {id(parameter) for _, parameter in qwen_language_parameters}
+	qwen_language_parameters = _trainable_parameters(model.brain.language_model)
+	qwen_language_ids = {id(parameter) for parameter in qwen_language_parameters}
 	qwen_other_parameters = _other_trainable_parameters(
 		model.brain,
-		"brain",
 		qwen_language_ids,
 	)
 
-	wan_transformer_parameters = _named_trainable_parameters(
-		model.renderer.transformer,
-		"renderer.transformer",
-	)
-	wan_transformer_ids = {id(parameter) for _, parameter in wan_transformer_parameters}
+	wan_transformer_parameters = _trainable_parameters(model.renderer.transformer)
+	wan_transformer_ids = {id(parameter) for parameter in wan_transformer_parameters}
 	wan_other_parameters = _other_trainable_parameters(
 		model.renderer,
-		"renderer",
 		wan_transformer_ids,
 	)
 

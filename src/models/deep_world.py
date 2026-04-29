@@ -206,9 +206,8 @@ class DeepWorld(nn.Module):
 
 		loss = (model_output.float() - target.float()).pow(2)
 		loss_mask = latent_mask.float()
-		# TODO: rather than using sum(dim=(1, 2, 3, 4)), this improves readability, check for other places where flatten/unflatten can improve readability
 		loss_per_sample = (loss * loss_mask).flatten(1).sum(1)
-		valid_per_sample = (loss_mask.flatten(1).sum(1) * loss.size(1))
+		valid_per_sample = loss_mask.flatten(1).sum(1) * loss.size(1)
 		loss = (loss_per_sample / valid_per_sample.clamp_min(1.0)).mean()
 
 		if not return_auxiliary:
