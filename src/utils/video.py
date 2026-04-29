@@ -6,9 +6,9 @@ from pathlib import Path
 import imageio.v3 as iio
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
+from torch.nn import functional as F
 
 
 def load_image(path: str | Path) -> Image.Image:

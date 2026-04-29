@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import TextIO
 
 import torch
+import torch.nn as nn
 import yaml
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import set_seed
+from torch import Tensor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset, Subset
 from tqdm.auto import tqdm
@@ -52,31 +54,31 @@ def align_fsdp_managed_dtypes(model: DeepWorld) -> None:
 	"""
 
 	target_dtype = next(model.brain.language_model.parameters()).dtype
-	managed_modules = (
+	managed_mods = (
 		model.brain.language_model,
 		model.brain.geo_bridge,
 		model.brain.segment_tokens,
 		model.renderer.transformer,
 		model.renderer.condition_proj,
 	)
-	managed_parameters = (
+	managed_params = (
 		model.brain.gen_slot_token,
 		model.renderer.null_cond,
 	)
 	managed_dtypes = {
-		parameter.dtype
-		for module in managed_modules
-		for parameter in module.parameters(recurse=True)
+		param.dtype
+		for mod in managed_mods
+		for param in mod.parameters(recurse=True)
 	}
-	managed_dtypes.update(parameter.dtype for parameter in managed_parameters)
+	managed_dtypes.update(param.dtype for param in managed_params)
 	if managed_dtypes <= {target_dtype}:
 		return
 
-	for module in managed_modules:
-		module.to(dtype=target_dtype)
-	for parameter in managed_parameters:
+	for mod in managed_mods:
+		mod.to(dtype=target_dtype)
+	for param in managed_params:
 		with torch.no_grad():
-			parameter.data = parameter.data.to(dtype=target_dtype)
+			param.data = param.data.to(dtype=target_dtype)
 
 
 def create_accelerator(
@@ -135,17 +137,17 @@ def create_accelerator(
 	)
 
 
-def _count_parameters(module: torch.nn.Module, trainable_only: bool = False) -> tuple[int, int]:
+def _count_params(mod: nn.Module, trainable_only: bool = False) -> tuple[int, int]:
 	"""Return parameter count and byte size for one module tree."""
 
-	num_parameters = 0
+	num_params = 0
 	num_bytes = 0
-	for parameter in module.parameters():
-		if trainable_only and not parameter.requires_grad:
+	for param in mod.parameters():
+		if trainable_only and not param.requires_grad:
 			continue
-		num_parameters += parameter.numel()
-		num_bytes += parameter.numel() * parameter.element_size()
-	return num_parameters, num_bytes
+		num_params += param.numel()
+		num_bytes += param.numel() * param.element_size()
+	return num_params, num_bytes
 
 
 def _format_count(value: int) -> str:
@@ -168,32 +170,32 @@ def _format_bytes(value: int) -> str:
 	return f"{value:.2f}TB"
 
 
-def log_parameter_summary(accelerator: Accelerator, model: DeepWorld) -> None:
+def log_param_summary(accelerator: Accelerator, model: DeepWorld) -> None:
 	"""Print a compact parameter and static-weight summary for memory debugging."""
 
-	total_parameters, total_bytes = _count_parameters(model)
-	trainable_parameters, trainable_bytes = _count_parameters(model, trainable_only=True)
+	total_params, total_bytes = _count_params(model)
+	trainable_params, trainable_bytes = _count_params(model, trainable_only=True)
 	accelerator.print(
 		"Model parameters: "
-		f"total={_format_count(total_parameters)} ({_format_bytes(total_bytes)}), "
-		f"trainable={_format_count(trainable_parameters)} ({_format_bytes(trainable_bytes)})."
+		f"total={_format_count(total_params)} ({_format_bytes(total_bytes)}), "
+		f"trainable={_format_count(trainable_params)} ({_format_bytes(trainable_bytes)})."
 	)
-	for name, module in (
+	for name, mod in (
 		("brain.language_model", model.brain.language_model),
 		("brain.vision_encoder", model.brain.vision_encoder),
 		("brain.geometry_encoder", model.brain.geometry_encoder),
 		("renderer.transformer", model.renderer.transformer),
 		("renderer.vae", model.renderer.vae),
 	):
-		module_parameters, module_bytes = _count_parameters(module)
-		module_trainable, _ = _count_parameters(module, trainable_only=True)
+		mod_params, mod_bytes = _count_params(mod)
+		mod_trainable, _ = _count_params(mod, trainable_only=True)
 		accelerator.print(
-			f"  {name}: {_format_count(module_parameters)} params, {_format_bytes(module_bytes)}, "
-			f"trainable={_format_count(module_trainable)}"
+			f"  {name}: {_format_count(mod_params)} params, {_format_bytes(mod_bytes)}, "
+			f"trainable={_format_count(mod_trainable)}"
 		)
 
 
-def log_runtime_setup(accelerator: Accelerator, model: torch.nn.Module) -> None:
+def log_runtime_setup(accelerator: Accelerator, model: nn.Module) -> None:
 	"""Log the prepared distributed runtime and whether FSDP wrapping is active."""
 
 	distributed_type = getattr(accelerator.distributed_type, "name", str(accelerator.distributed_type))
@@ -289,19 +291,19 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
-def _validate_optimizer_groups(model: DeepWorld, grouped_parameters: list[torch.nn.Parameter]) -> None:
+def _validate_optimizer_groups(model: DeepWorld, grouped_params: list[nn.Parameter]) -> None:
 	"""Ensure optimizer grouping covers each trainable parameter exactly once.
 
 	Args:
 		model: Unprepared model whose trainable parameters should be optimized.
-		grouped_parameters: Flattened parameter list assigned to optimizer groups.
+		grouped_params: Flattened parameter list assigned to optimizer groups.
 
 	Raises:
 		RuntimeError: If any trainable parameter is missing or assigned more than once.
 	"""
 
-	trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
-	grouped_ids = [id(parameter) for parameter in grouped_parameters]
+	trainable_ids = {id(param) for param in model.parameters() if param.requires_grad}
+	grouped_ids = [id(param) for param in grouped_params]
 	grouped_id_set = set(grouped_ids)
 	if len(grouped_ids) != len(grouped_id_set):
 		raise RuntimeError("Optimizer parameter groups contain duplicate trainable parameters.")
@@ -331,30 +333,28 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 		An AdamW optimizer with one parameter group per non-empty branch group.
 	"""
 
-	def train_params(
-		module: torch.nn.Module
-	) -> list[torch.nn.Parameter]:
-		return [p for p in module.parameters() if p.requires_grad]
+	def train_params(mod: nn.Module) -> list[nn.Parameter]:
+		return [p for p in mod.parameters() if p.requires_grad]
 
 	def train_params_except(
-		module: torch.nn.Module,
-		excluded_params: list[torch.nn.Parameter]
-	) -> list[torch.nn.Parameter]:
+		mod: nn.Module,
+		excluded_params: list[nn.Parameter]
+	) -> list[nn.Parameter]:
 		excluded_ids = {id(p) for p in excluded_params}
-		return [p for p in train_params(module) if id(p) not in excluded_ids]
+		return [p for p in train_params(mod) if id(p) not in excluded_ids]
 
 	def add_optimizer_group(
-		parameter_groups: list[dict],
+		param_groups: list[dict],
 		group_name: str,
-		parameters: list[torch.nn.Parameter],
-		learning_rate: float,
+		params: list[nn.Parameter],
+		lr: float,
 	) -> None:
-		if len(parameters) == 0:
+		if len(params) == 0:
 			return
-		parameter_groups.append({
+		param_groups.append({
 			"name": group_name,
-			"params": parameters,
-			"lr": learning_rate,
+			"params": params,
+			"lr": lr,
 		})
 
 	brain_language_model_params = train_params(model.brain.language_model)
@@ -363,39 +363,39 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 	renderer_transformer_params = train_params(model.renderer.transformer)
 	renderer_others_params = train_params_except(model.renderer, renderer_transformer_params)
 
-	_validate_optimizer_groups(model, grouped_parameters=(
+	_validate_optimizer_groups(model, grouped_params=(
 		brain_language_model_params
 		+ brain_others_params
 		+ renderer_transformer_params
 		+ renderer_others_params
 	))
 
-	parameter_groups: list[dict] = []
+	param_groups: list[dict] = []
 	add_optimizer_group(
-		parameter_groups, "brain_language_model",
+		param_groups, "brain_language_model",
 		brain_language_model_params,
 		config.optimizer.brain_language_model_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "brain_others",
+		param_groups, "brain_others",
 		brain_others_params,
 		config.optimizer.brain_others_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "renderer_transformer",
+		param_groups, "renderer_transformer",
 		renderer_transformer_params,
 		config.optimizer.renderer_transformer_learning_rate,
 	)
 	add_optimizer_group(
-		parameter_groups, "renderer_others",
+		param_groups, "renderer_others",
 		renderer_others_params,
 		config.optimizer.renderer_others_learning_rate,
 	)
-	if len(parameter_groups) == 0:
+	if len(param_groups) == 0:
 		raise RuntimeError("No trainable parameters were found for optimizer construction.")
 
 	return AdamW(
-		parameter_groups,
+		param_groups,
 		weight_decay=config.optimizer.weight_decay,
 		betas=tuple(config.optimizer.betas),
 		eps=config.optimizer.eps,
@@ -530,7 +530,7 @@ def make_eval_generator(device: torch.device, seed: int) -> torch.Generator:
 
 def save_eval_sample_bundle(
 	batch: dict,
-	generated_video: torch.Tensor,
+	generated_video: Tensor,
 	batch_index: int,
 	global_eval_index: int,
 	checkpoint_dir: Path,
@@ -564,7 +564,7 @@ def save_eval_sample_bundle(
 
 def generate_checkpoint_samples(
 	accelerator: Accelerator,
-	model: torch.nn.Module,
+	model: nn.Module,
 	eval_dataloader: DataLoader | None,
 	config: WorldModelConfig,
 	step: int,
@@ -632,7 +632,7 @@ def generate_checkpoint_samples(
 		)
 
 
-def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, checkpoint_dir: Path) -> None:
+def save_checkpoint(accelerator: Accelerator, model: nn.Module, checkpoint_dir: Path) -> None:
 	"""Save one model checkpoint on the main process.
 
 	Args:
@@ -652,7 +652,7 @@ def save_checkpoint(accelerator: Accelerator, model: torch.nn.Module, checkpoint
 
 def save_checkpoint_with_evaluation(
 	accelerator: Accelerator,
-	model: torch.nn.Module,
+	model: nn.Module,
 	eval_dataloader: DataLoader | None,
 	config: WorldModelConfig,
 	step: int,
@@ -721,7 +721,7 @@ def main() -> None:
 	save_config_snapshot(config, output_dir, accelerator)
 	metrics_log = open_jsonl_log(output_dir, accelerator)
 	write_jsonl_log(metrics_log, {"event": "start"})
-	log_parameter_summary(accelerator, model)
+	log_param_summary(accelerator, model)
 
 	model.to(accelerator.device) # NOTE: do not remove it at the moment
 	optimizer = build_optimizer(model, config)
@@ -754,7 +754,7 @@ def main() -> None:
 	else:
 		model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 	log_runtime_setup(accelerator, model)
-	grad_clip_parameters = tuple(parameter for group in optimizer.param_groups for parameter in group["params"])
+	grad_clip_params = tuple(p for group in optimizer.param_groups for p in group["params"])
 
 	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
 	total_training_steps = steps_per_epoch * config.training.num_epochs
@@ -768,7 +768,7 @@ def main() -> None:
 	progress_bar.set_postfix(step=0, epoch=0, loss="n/a")
 
 	global_step = 0
-	accumulated_losses: list[torch.Tensor] = []
+	accumulated_losses: list[Tensor] = []
 	for epoch in range(config.training.num_epochs):
 		model.train()
 		for batch in dataloader:
@@ -778,7 +778,7 @@ def main() -> None:
 				accumulated_losses.append(loss.detach().float())
 				accelerator.backward(loss)
 				if accelerator.sync_gradients:
-					accelerator.clip_grad_norm_(grad_clip_parameters, config.optimizer.max_grad_norm)
+					accelerator.clip_grad_norm_(grad_clip_params, config.optimizer.max_grad_norm)
 				optimizer.step()
 				optimizer.zero_grad(set_to_none=True)
 

@@ -122,8 +122,8 @@ class WanRenderer(nn.Module):
 			Normalized latent tensor using the Wan transformer's dtype.
 		"""
 
-		vae_parameter = next(self.vae.parameters())
-		videos = videos.to(device=vae_parameter.device, dtype=vae_parameter.dtype, non_blocking=True)
+		vae_param = next(self.vae.parameters())
+		videos = videos.to(device=vae_param.device, dtype=vae_param.dtype, non_blocking=True)
 		with torch.no_grad():
 			posterior = self.vae.encode(videos).latent_dist
 			latents = posterior.sample() if sample_posterior else posterior.mode()
@@ -140,9 +140,9 @@ class WanRenderer(nn.Module):
 			Decoded video tensor in Wan output pixel range.
 		"""
 
-		vae_parameter = next(self.vae.parameters())
+		vae_param = next(self.vae.parameters())
 		latents = latents / self.latents_recip_std.to(latents.device) + self.latents_mean.to(latents.device)
-		latents = latents.to(device=vae_parameter.device, dtype=vae_parameter.dtype)
+		latents = latents.to(device=vae_param.device, dtype=vae_param.dtype)
 		with torch.no_grad():
 			return self.vae.decode(latents, return_dict=False)[0]
 
