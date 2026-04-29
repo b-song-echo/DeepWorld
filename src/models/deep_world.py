@@ -99,6 +99,63 @@ class DeepWorld(nn.Module):
 
 		return latent_mask, token_mask
 
+	def _expand_renderer_training_batch(
+		self,
+		latents: Tensor,
+		latent_mask: Tensor,
+		token_mask: Tensor,
+		condition_hidden_states: Tensor,
+	) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+		"""Duplicate renderer-side inputs for independent diffusion timestep training.
+
+		The Qwen brain runs once per real sample. The lightweight Wan renderer can
+		then see multiple noisy versions of each encoded latent by repeating the
+		clean latents and conditioning states along the batch dimension.
+
+		Args:
+			latents: Clean Wan latents with shape `(B, C, T, H, W)`.
+			latent_mask: Latent loss mask aligned with `latents`.
+			token_mask: Wan patch-token validity mask aligned with `latents`.
+			condition_hidden_states: Qwen generation states aligned with Wan tokens.
+
+		Returns:
+			The repeated latents, latent masks, token masks, and conditioning states.
+		"""
+
+		multiplier = self.config.training.renderer_batch_multiplier
+		if multiplier == 1:
+			return latents, latent_mask, token_mask, condition_hidden_states
+
+		return (
+			latents.repeat_interleave(multiplier, dim=0),
+			latent_mask.repeat_interleave(multiplier, dim=0),
+			token_mask.repeat_interleave(multiplier, dim=0),
+			condition_hidden_states.repeat_interleave(multiplier, dim=0),
+		)
+
+	def _apply_condition_dropout(self, token_mask: Tensor) -> Tensor:
+		"""Randomly replace full renderer samples with the learned null condition.
+
+		The Wan renderer already interprets `False` token-mask entries as null
+		conditioning slots. Clearing an entire row therefore drops all Qwen
+		conditioning for that renderer-side sample while preserving tensor shapes.
+
+		Args:
+			token_mask: Boolean conditioning validity mask with shape `(B, N)`.
+
+		Returns:
+			A mask with some complete rows cleared during training.
+		"""
+
+		dropout_prob = self.config.wan_renderer.condition_dropout_prob
+		if not self.training or dropout_prob <= 0.0:
+			return token_mask
+		if dropout_prob >= 1.0:
+			return torch.zeros_like(token_mask)
+
+		keep_condition = torch.rand(token_mask.size(0), device=token_mask.device) >= dropout_prob
+		return token_mask & keep_condition.unsqueeze(1)
+
 	def forward(
 		self,
 		batch: dict[str, Tensor],
@@ -127,26 +184,32 @@ class DeepWorld(nn.Module):
 		latent_patch_grids = self.renderer.latent_patch_grids(latents)
 
 		brain_outputs = self.brain(batch, latent_patch_grids=latent_patch_grids)
+		condition_hidden_states = brain_outputs["gen_hidden_states"]
 
-		# TODO: Suppose the per_device_batch_size is b, so there are b condition_hidden_states and b clean latents. Here I wish to augment the input to b * renderer_batch_multiplier (newly added config, defaults to 1). To be more concrete, suppose renderer_batch_multiplier is 2, then for each sample in the batch, we create 2 independent timesteps (conventionally, only 1 random timestep is assigned to each sample), yielding 2 augmented samples whose final losses are averaged. As a result, the noisy latents input to the renderer actually contain 2 * b items are derived from b clean latents, while they condition on augmented condition hidden states with 2 * b items that are expanded from b condition hidden states. There are two reason for doing this: 1) the majority of DeepWorld is in QwenBrain while WanRenderer is tiny in comparison, therefore it makes sense to increase the batch size at the renderer side by simply augmenting diffusion timesteps, so that the brain gets more information from the renderer without literally doubling the computation; 2) the augmentation is easy to implement because changing timestep does not alter tensor shapes. Additionally, the WanRenderer has a null_condition inside, here we will randomly drop condition by replacing with the learned null condition, maybe this can be achieved by manupulating token_mask.
+		latents, latent_mask, token_mask, condition_hidden_states = self._expand_renderer_training_batch(
+			latents, latent_mask, token_mask, condition_hidden_states,
+		)
+
 		noise = torch.randn_like(latents)
 		sigmas = torch.rand(latents.size(0), device=latents.device, dtype=latents.dtype)
 		sigma_view = sigmas.view(-1, 1, 1, 1, 1)
 		noisy_latents = sigma_view * noise + (1.0 - sigma_view) * latents
 		target = noise - latents
-		timesteps = sigmas * self.scheduler.config.num_train_timesteps
 
 		model_output = self.renderer(
 			hidden_states=noisy_latents,
-			timestep=timesteps,
-			condition_hidden_states=brain_outputs["gen_hidden_states"],
-			token_mask=token_mask,
+			timestep=sigmas * self.scheduler.config.num_train_timesteps,
+			condition_hidden_states=condition_hidden_states,
+			token_mask=self._apply_condition_dropout(token_mask),
 			return_dict=True,
 		)["sample"]
 
 		loss = (model_output.float() - target.float()).pow(2)
 		loss_mask = latent_mask.float()
-		loss = (loss * loss_mask).sum() / (loss_mask.sum() * loss.size(1)).clamp_min(1.0)
+		# TODO: rather than using sum(dim=(1, 2, 3, 4)), this improves readability, check for other places where flatten/unflatten can improve readability
+		loss_per_sample = (loss * loss_mask).flatten(1).sum(1)
+		valid_per_sample = (loss_mask.flatten(1).sum(1) * loss.size(1))
+		loss = (loss_per_sample / valid_per_sample.clamp_min(1.0)).mean()
 
 		if not return_auxiliary:
 			return {"loss": loss}

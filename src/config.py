@@ -68,6 +68,10 @@ class OptimizerConfig:
 
 	Attributes:
 		learning_rate: Base learning rate used by AdamW.
+		qwen_language_learning_rate: Learning rate for trainable Qwen language-model parameters. If omitted, defaults to `learning_rate`.
+		qwen_other_learning_rate: Learning rate for other trainable Qwen brain parameters. If omitted, defaults to `qwen_language_learning_rate`.
+		wan_transformer_learning_rate: Learning rate for trainable Wan transformer parameters. If omitted, defaults to `learning_rate`.
+		wan_other_learning_rate: Learning rate for other trainable Wan renderer parameters. If omitted, defaults to `wan_transformer_learning_rate`.
 		lr_schedule: Learning-rate schedule after warmup, either `cosine` or `constant`.
 		weight_decay: Weight decay coefficient.
 		betas: Adam beta coefficients.
@@ -77,6 +81,10 @@ class OptimizerConfig:
 	"""
 
 	learning_rate: float = 2e-5
+	qwen_language_learning_rate: float | None = None
+	qwen_other_learning_rate: float | None = None
+	wan_transformer_learning_rate: float | None = None
+	wan_other_learning_rate: float | None = None
 	lr_schedule: str = "cosine"
 	weight_decay: float = 1e-2
 	betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
@@ -86,6 +94,26 @@ class OptimizerConfig:
 
 	def __post_init__(self) -> None:
 		"""Validate optimizer schedule settings."""
+
+		if self.qwen_language_learning_rate is None:
+			self.qwen_language_learning_rate = self.learning_rate
+		if self.qwen_other_learning_rate is None:
+			self.qwen_other_learning_rate = self.qwen_language_learning_rate
+		if self.wan_transformer_learning_rate is None:
+			self.wan_transformer_learning_rate = self.learning_rate
+		if self.wan_other_learning_rate is None:
+			self.wan_other_learning_rate = self.wan_transformer_learning_rate
+
+		for name in (
+			"learning_rate",
+			"qwen_language_learning_rate",
+			"qwen_other_learning_rate",
+			"wan_transformer_learning_rate",
+			"wan_other_learning_rate",
+		):
+			value = getattr(self, name)
+			if value <= 0:
+				raise ValueError(f"`optimizer.{name}` must be positive, got {value}.")
 
 		self.lr_schedule = self.lr_schedule.lower()
 		if self.lr_schedule not in {"cosine", "constant"}:
@@ -101,6 +129,7 @@ class TrainingConfig:
 		seed: Global random seed.
 		num_epochs: Number of training epochs.
 		per_device_batch_size: Batch size on each process/GPU.
+		renderer_batch_multiplier: Number of independent diffusion timesteps to train per encoded video.
 		gradient_accumulation_steps: Number of steps to accumulate before optimizer update.
 		log_every: Logging interval in optimizer steps.
 		save_every: Checkpoint interval in optimizer steps.
@@ -114,6 +143,7 @@ class TrainingConfig:
 	seed: int = 42
 	num_epochs: int = 10
 	per_device_batch_size: int = 1
+	renderer_batch_multiplier: int = 1
 	gradient_accumulation_steps: int = 1
 	log_every: int = 10
 	save_every: int = 1000
@@ -125,6 +155,10 @@ class TrainingConfig:
 	def __post_init__(self) -> None:
 		"""Validate training-loop settings that control checkpoint evaluation."""
 
+		if self.renderer_batch_multiplier < 1:
+			raise ValueError(
+				f"`training.renderer_batch_multiplier` must be at least 1, got {self.renderer_batch_multiplier}."
+			)
 		if self.eval_num_samples < 0:
 			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
 
@@ -177,6 +211,9 @@ class WanRendererConfig:
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
 		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
+		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero` or `small_random`.
+		condition_proj_init_std: Standard deviation used when `condition_proj_init=small_random`.
+		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
 			inferred from the checkpoint scheduler config when available.
 		inference_steps: Default number of denoising steps during sampling.
@@ -188,8 +225,31 @@ class WanRendererConfig:
 	vae_enable_slicing: bool = False
 	vae_enable_tiling: bool = False
 	vae_sample_posterior: bool = False
+	condition_proj_init: str = "zero"
+	condition_proj_init_std: float = 1e-3 # TODO: this should be an optional, only used when the init is normal
+	condition_dropout_prob: float = 0.1
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
+
+	def __post_init__(self) -> None:
+		"""Validate Wan renderer training and initialization settings."""
+
+		self.condition_proj_init = self.condition_proj_init.lower()
+		if self.condition_proj_init not in {"zero", "small_random"}:
+			raise ValueError(
+				"`wan_renderer.condition_proj_init` must be either `zero` or `small_random`, "
+				f"got {self.condition_proj_init!r}."
+			)
+		if self.condition_proj_init_std <= 0:
+			raise ValueError(
+				"`wan_renderer.condition_proj_init_std` must be positive, "
+				f"got {self.condition_proj_init_std}."
+			)
+		if not 0.0 <= self.condition_dropout_prob <= 1.0:
+			raise ValueError(
+				"`wan_renderer.condition_dropout_prob` must be in [0, 1], "
+				f"got {self.condition_dropout_prob}."
+			)
 
 
 @dataclass

@@ -56,9 +56,7 @@ class WanRenderer(nn.Module):
 		trainable_dtype = self.transformer.patch_embedding.weight.dtype
 		self.condition_proj = nn.Linear(condition_dim, self.inner_dim, dtype=trainable_dtype)
 		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim, dtype=trainable_dtype))
-		# TODO: Like you said, this projection layer is crucial, and its initialization can have a huge impact on convergence. Therefore, add a knob that controls how it is initialized, it can be zero init or a small-random init.
-		nn.init.zeros_(self.condition_proj.weight)
-		nn.init.zeros_(self.condition_proj.bias)
+		self._initialize_conditioning_parameters(wan_config)
 		nn.init.normal_(self.null_cond, std=0.02)
 
 		latents_mean = torch.tensor(
@@ -71,6 +69,27 @@ class WanRenderer(nn.Module):
 		).view(1, self.vae.config.z_dim, 1, 1, 1)
 		self.latents_mean = nn.Buffer(latents_mean, persistent=False)
 		self.latents_recip_std = nn.Buffer(latents_recip_std, persistent=False)
+
+	def _initialize_conditioning_parameters(self, wan_config: WanRendererConfig) -> None:
+		"""Initialize Qwen-to-Wan conditioning projection according to config.
+
+		Zero initialization starts training from the original Wan transformer
+		behavior. Small-random initialization exposes the renderer to Qwen signals
+		immediately while keeping the injected residual near zero.
+
+		Args:
+			wan_config: Wan renderer configuration containing the init strategy.
+		"""
+
+		if wan_config.condition_proj_init == "zero":
+			nn.init.zeros_(self.condition_proj.weight)
+		elif wan_config.condition_proj_init == "small_random":
+			# TODO: call this normal rather than small_random 
+			nn.init.normal_(self.condition_proj.weight, std=wan_config.condition_proj_init_std)
+		else:
+			# TOOO: apart from zero and normal, there should also be the default nn.Linear initialization method.
+			raise ValueError(f"Unsupported condition projection init: {wan_config.condition_proj_init!r}.")
+		nn.init.zeros_(self.condition_proj.bias)
 
 	def _remove_text_conditioning_modules(self) -> None:
 		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""

@@ -289,6 +289,180 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
+# TODO: Simplify the process of creating optimizer. In particular, why do I need to care about the names of parameters as long as the parameters themselves are passed to the correct groups.
+def _named_trainable_parameters(module: torch.nn.Module, prefix: str) -> list[tuple[str, torch.nn.Parameter]]:
+	"""Collect trainable parameters from a module with a stable display prefix.
+
+	Args:
+		module: Module whose parameters should be inspected.
+		prefix: Prefix added to each parameter name.
+
+	Returns:
+		A list of `(name, parameter)` pairs for parameters requiring gradients.
+	"""
+
+	return [
+		(f"{prefix}.{name}", parameter)
+		for name, parameter in module.named_parameters()
+		if parameter.requires_grad
+	]
+
+
+def _other_trainable_parameters(
+	module: torch.nn.Module,
+	prefix: str,
+	excluded_parameter_ids: set[int],
+) -> list[tuple[str, torch.nn.Parameter]]:
+	"""Collect trainable parameters outside an already-owned parameter set.
+
+	Args:
+		module: Module whose parameters should be inspected.
+		prefix: Prefix added to each parameter name.
+		excluded_parameter_ids: Parameter identities that already belong to a more specific group.
+
+	Returns:
+		A list of trainable `(name, parameter)` pairs not present in `excluded_parameter_ids`.
+	"""
+
+	return [
+		(f"{prefix}.{name}", parameter)
+		for name, parameter in module.named_parameters()
+		if parameter.requires_grad and id(parameter) not in excluded_parameter_ids
+	]
+
+
+def _add_optimizer_group(
+	parameter_groups: list[dict],
+	group_name: str,
+	named_parameters: list[tuple[str, torch.nn.Parameter]],
+	learning_rate: float,
+) -> None:
+	"""Append one non-empty AdamW parameter group.
+
+	Args:
+		parameter_groups: Mutable optimizer group list.
+		group_name: Human-readable group name stored in the optimizer state.
+		named_parameters: Parameters assigned to this group.
+		learning_rate: Learning rate for this group.
+	"""
+
+	if len(named_parameters) == 0:
+		return
+	parameter_groups.append({
+		"name": group_name,
+		"params": [parameter for _, parameter in named_parameters],
+		"lr": learning_rate,
+	})
+
+
+def _validate_optimizer_groups(model: DeepWorld, grouped_parameters: list[tuple[str, torch.nn.Parameter]]) -> None:
+	"""Ensure optimizer grouping covers each trainable parameter exactly once.
+
+	Args:
+		model: Unprepared model whose trainable parameters should be optimized.
+		grouped_parameters: Flattened `(name, parameter)` pairs assigned to optimizer groups.
+
+	Raises:
+		RuntimeError: If any trainable parameter is missing or assigned more than once.
+	"""
+
+	trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+	grouped_ids = [id(parameter) for _, parameter in grouped_parameters]
+	grouped_id_set = set(grouped_ids)
+	if len(grouped_ids) != len(grouped_id_set):
+		raise RuntimeError("Optimizer parameter groups contain duplicate trainable parameters.")
+	if trainable_ids != grouped_id_set:
+		missing_count = len(trainable_ids - grouped_id_set)
+		extra_count = len(grouped_id_set - trainable_ids)
+		raise RuntimeError(
+			"Optimizer parameter groups do not match the model's trainable parameters: "
+			f"missing={missing_count}, extra={extra_count}."
+		)
+
+
+def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
+	"""Build AdamW with branch-specific learning-rate groups.
+
+	The four requested groups are:
+	- trainable parameters in `model.brain.language_model`,
+	- other trainable parameters in `model.brain`,
+	- trainable parameters in `model.renderer.transformer`,
+	- other trainable parameters in `model.renderer`.
+
+	Args:
+		model: Unprepared model whose trainable parameters should be optimized.
+		config: Root config containing optimizer hyperparameters and group LRs.
+
+	Returns:
+		An AdamW optimizer with one parameter group per non-empty branch group.
+	"""
+
+	qwen_language_parameters = _named_trainable_parameters(
+		model.brain.language_model,
+		"brain.language_model",
+	)
+	qwen_language_ids = {id(parameter) for _, parameter in qwen_language_parameters}
+	qwen_other_parameters = _other_trainable_parameters(
+		model.brain,
+		"brain",
+		qwen_language_ids,
+	)
+
+	wan_transformer_parameters = _named_trainable_parameters(
+		model.renderer.transformer,
+		"renderer.transformer",
+	)
+	wan_transformer_ids = {id(parameter) for _, parameter in wan_transformer_parameters}
+	wan_other_parameters = _other_trainable_parameters(
+		model.renderer,
+		"renderer",
+		wan_transformer_ids,
+	)
+
+	grouped_parameters = (
+		qwen_language_parameters
+		+ qwen_other_parameters
+		+ wan_transformer_parameters
+		+ wan_other_parameters
+	)
+	_validate_optimizer_groups(model, grouped_parameters)
+
+	parameter_groups: list[dict] = []
+	_add_optimizer_group(
+		parameter_groups,
+		"qwen_language_model",
+		qwen_language_parameters,
+		config.optimizer.qwen_language_learning_rate,
+	)
+	_add_optimizer_group(
+		parameter_groups,
+		"qwen_other",
+		qwen_other_parameters,
+		config.optimizer.qwen_other_learning_rate,
+	)
+	_add_optimizer_group(
+		parameter_groups,
+		"wan_transformer",
+		wan_transformer_parameters,
+		config.optimizer.wan_transformer_learning_rate,
+	)
+	_add_optimizer_group(
+		parameter_groups,
+		"wan_other",
+		wan_other_parameters,
+		config.optimizer.wan_other_learning_rate,
+	)
+	if len(parameter_groups) == 0:
+		raise RuntimeError("No trainable parameters were found for optimizer construction.")
+
+	return AdamW(
+		parameter_groups,
+		weight_decay=config.optimizer.weight_decay,
+		betas=tuple(config.optimizer.betas),
+		eps=config.optimizer.eps,
+	)
+
+
 def create_world_dataloader(
 	dataset,
 	dataset_config,
@@ -611,14 +785,7 @@ def main() -> None:
 	log_parameter_summary(accelerator, model)
 
 	model.to(accelerator.device) # NOTE: do not remove it at the moment
-	# TODO: Use four parameter groups with four learning rates: a) trainable params in model.qwen_brain.language_model are one group; b) any other trainable params in model.qwen_brain that are not in group a are one group; c) trainable params in model.wan_renderer are one group; d) any other trainable params in model.wan_renderer that are not in group c are one group. Make sure you update the corresponding the config dataclasses and yaml file. Note that the lr config for group b and d are optional, if not specified, they defaults to a and c respectively.
-	optimizer = AdamW(
-		[p for p in model.parameters() if p.requires_grad],
-		lr=config.optimizer.learning_rate,
-		weight_decay=config.optimizer.weight_decay,
-		betas=tuple(config.optimizer.betas),
-		eps=config.optimizer.eps,
-	)
+	optimizer = build_optimizer(model, config)
 
 	dataset = build_dataset(config.dataset)
 	processor = AutoProcessor.from_pretrained(config.qwen_brain.checkpoint_path, local_files_only=True)

@@ -67,27 +67,36 @@ def metric_series(
 	return steps, values
 
 
+def plot_metric(entries: list[dict], metric_name: str) -> None:
+	"""Create one standalone figure for a single logged metric.
+
+	Args:
+		entries: Decoded JSONL log entries.
+		metric_name: Metric key to plot.
+	"""
+
+	fig, axis = plt.subplots(1, 1, figsize=FIGURE_SIZE)
+	steps, values = metric_series(entries, metric_name, include_entry)
+	if len(steps) == 0:
+		axis.set_title(f"{metric_name}: no matching entries")
+	else:
+		axis.plot(steps, values, linewidth=1.5)
+		axis.set_title(metric_name)
+	axis.set_xlabel("step")
+	axis.set_ylabel(metric_name)
+	axis.grid(True, alpha=0.3)
+	fig.tight_layout()
+
+
 def main() -> None:
 	"""Plot hardcoded metrics from the hardcoded JSONL log path."""
 
-	# TODO: each metric is a standalone figure and is shown separately, figsize applies to each individual figrue.
 	if not LOG_PATH.exists():
 		raise FileNotFoundError(f"Log file does not exist: {LOG_PATH}")
 
 	entries = load_entries(LOG_PATH)
-	fig, axes = plt.subplots(len(METRIC_NAMES), 1, figsize=FIGURE_SIZE, squeeze=False)
-	for axis, metric_name in zip(axes[:, 0], METRIC_NAMES):
-		steps, values = metric_series(entries, metric_name, include_entry)
-		if len(steps) == 0:
-			axis.set_title(f"{metric_name}: no matching entries")
-			continue
-		axis.plot(steps, values, linewidth=1.5)
-		axis.set_title(metric_name)
-		axis.set_xlabel("step")
-		axis.set_ylabel(metric_name)
-		axis.grid(True, alpha=0.3)
-
-	fig.tight_layout()
+	for metric_name in METRIC_NAMES:
+		plot_metric(entries, metric_name)
 	plt.show()
 
 
