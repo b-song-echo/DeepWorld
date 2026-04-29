@@ -289,69 +289,6 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
-# TODO: Don't put this in a function... It is only a single line of code, why do you have to put everything in a function...
-
-def _trainable_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]:
-	"""Collect trainable parameters from one module tree.
-
-	Args:
-		module: Module whose parameters should be inspected.
-
-	Returns:
-		A list of parameters requiring gradients.
-	"""
-
-	return [parameter for parameter in module.parameters() if parameter.requires_grad]
-
-
-# TODO: make this a helper nested function inside build_optimizer, no need to document
-def _other_trainable_parameters(
-	module: torch.nn.Module,
-	excluded_parameter_ids: set[int],
-) -> list[torch.nn.Parameter]:
-	"""Collect trainable parameters outside an already-owned parameter set.
-
-	Args:
-		module: Module whose parameters should be inspected.
-		excluded_parameter_ids: Parameter identities that already belong to a more specific group.
-
-	Returns:
-		A list of trainable parameters not present in `excluded_parameter_ids`.
-	"""
-
-	return [
-		parameter
-		for parameter in module.parameters()
-		if parameter.requires_grad and id(parameter) not in excluded_parameter_ids
-	]
-
-
-# TODO: make this a helper nested function inside build_optimizer, no need to document
-
-def _add_optimizer_group(
-	parameter_groups: list[dict],
-	group_name: str,
-	parameters: list[torch.nn.Parameter],
-	learning_rate: float,
-) -> None:
-	"""Append one non-empty AdamW parameter group.
-
-	Args:
-		parameter_groups: Mutable optimizer group list.
-		group_name: Human-readable group name stored in the optimizer state.
-		parameters: Parameters assigned to this group.
-		learning_rate: Learning rate for this group.
-	"""
-
-	if len(parameters) == 0:
-		return
-	parameter_groups.append({
-		"name": group_name,
-		"params": parameters,
-		"lr": learning_rate,
-	})
-
-
 def _validate_optimizer_groups(model: DeepWorld, grouped_parameters: list[torch.nn.Parameter]) -> None:
 	"""Ensure optimizer grouping covers each trainable parameter exactly once.
 
@@ -394,51 +331,65 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 		An AdamW optimizer with one parameter group per non-empty branch group.
 	"""
 
-	qwen_language_parameters = _trainable_parameters(model.brain.language_model)
-	qwen_language_ids = {id(parameter) for parameter in qwen_language_parameters}
-	qwen_other_parameters = _other_trainable_parameters(
-		model.brain,
-		qwen_language_ids,
-	)
+	def train_params(
+		module: torch.nn.Module
+	) -> list[torch.nn.Parameter]:
+		return [p for p in module.parameters() if p.requires_grad]
 
-	wan_transformer_parameters = _trainable_parameters(model.renderer.transformer)
-	wan_transformer_ids = {id(parameter) for parameter in wan_transformer_parameters}
-	wan_other_parameters = _other_trainable_parameters(
-		model.renderer,
-		wan_transformer_ids,
-	)
+	def train_params_except(
+		module: torch.nn.Module,
+		excluded_params: list[torch.nn.Module]
+	) -> list[torch.nn.Parameter]:
+		excluded_ids = {id(p) for p in excluded_params}
+		return [p for p in train_params(module) if id(p) not in excluded_ids]
 
-	grouped_parameters = (
-		qwen_language_parameters
-		+ qwen_other_parameters
-		+ wan_transformer_parameters
-		+ wan_other_parameters
-	)
-	_validate_optimizer_groups(model, grouped_parameters)
+	def add_optimizer_group(
+		parameter_groups: list[dict],
+		group_name: str,
+		parameters: list[torch.nn.Parameter],
+		learning_rate: float,
+	) -> None:
+		if len(parameters) == 0:
+			return
+		parameter_groups.append({
+			"name": group_name,
+			"params": parameters,
+			"lr": learning_rate,
+		})
 
+	brain_language_model_params = train_params(model.brain.language_model)
+	brain_other_params = train_params_except(model.brain, brain_language_model_params)
+
+	renderer_transformer_params = train_params(model.renderer.transformer)
+	wan_other_params = train_params_except(model.renderer, renderer_transformer_params)
+
+	_validate_optimizer_groups(model, grouped_parameters=(
+		brain_language_model_params
+		+ brain_other_params
+		+ renderer_transformer_params
+		+ wan_other_params
+	))
+
+	# TODO: update the config name (dataclass and yaml), and param group name, match the name used above, such as brain_language_model, brain_others, renderer_transformer, renderer_others.
 	parameter_groups: list[dict] = []
-	_add_optimizer_group(
-		parameter_groups,
-		"qwen_language_model",
-		qwen_language_parameters,
+	add_optimizer_group(
+		parameter_groups, "qwen_language_model",
+		brain_language_model_params,
 		config.optimizer.qwen_language_learning_rate,
 	)
-	_add_optimizer_group(
-		parameter_groups,
-		"qwen_other",
-		qwen_other_parameters,
+	add_optimizer_group(
+		parameter_groups, "qwen_other",
+		brain_other_params,
 		config.optimizer.qwen_other_learning_rate,
 	)
-	_add_optimizer_group(
-		parameter_groups,
-		"wan_transformer",
-		wan_transformer_parameters,
+	add_optimizer_group(
+		parameter_groups, "wan_transformer",
+		renderer_transformer_params,
 		config.optimizer.wan_transformer_learning_rate,
 	)
-	_add_optimizer_group(
-		parameter_groups,
-		"wan_other",
-		wan_other_parameters,
+	add_optimizer_group(
+		parameter_groups, "wan_other",
+		wan_other_params,
 		config.optimizer.wan_other_learning_rate,
 	)
 	if len(parameter_groups) == 0:
