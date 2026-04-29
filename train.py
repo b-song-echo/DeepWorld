@@ -1,12 +1,15 @@
 import os
 import argparse
+import json
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
+from typing import TextIO
 
 import torch
+import yaml
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import set_seed
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset, Subset
 from tqdm.auto import tqdm
@@ -17,6 +20,9 @@ from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
 from src.utils.compat import get_world_size
 from src.utils.video import save_image_tensor, save_video_tensor
+
+
+VIDEO_DURATION_SECONDS = 10.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,11 +130,7 @@ def create_accelerator(
 	return Accelerator(
 		gradient_accumulation_steps=grad_acc_steps,
 		mixed_precision=mixed_precision,
-		log_with="tensorboard",
-		project_config=ProjectConfiguration(
-			output_dir=output_dir,
-			logging_dir=str(Path(output_dir) / "logs"),
-		),
+		project_dir=output_dir,
 		fsdp_plugin=fsdp_plugin,
 	)
 
@@ -212,6 +214,53 @@ def log_runtime_setup(accelerator: Accelerator, model: torch.nn.Module) -> None:
 		f"FSDP active={is_fsdp_wrapped}. Ignored branches: "
 		"`renderer.vae`, `brain.geometry_encoder`, `brain.vision_encoder`."
 	)
+
+
+def save_config_snapshot(config: WorldModelConfig, output_dir: Path, accelerator: Accelerator) -> None:
+	"""Write the resolved training config beside logs and checkpoints.
+
+	Args:
+		config: Fully resolved root configuration object.
+		output_dir: Directory where the config snapshot should be written.
+		accelerator: Active Accelerate runtime used to restrict writing to rank 0.
+	"""
+
+	if accelerator.is_main_process:
+		config_path = output_dir / "configs.yaml"
+		with config_path.open("w", encoding="utf-8") as handle:
+			yaml.safe_dump(asdict(config), handle, sort_keys=False)
+	accelerator.wait_for_everyone()
+
+
+def open_jsonl_log(output_dir: Path, accelerator: Accelerator) -> TextIO | None:
+	"""Open the rank-0 JSONL metrics log.
+
+	Args:
+		output_dir: Training output directory.
+		accelerator: Active Accelerate runtime used to restrict logging to rank 0.
+
+	Returns:
+		An open text handle for rank 0, otherwise `None`.
+	"""
+
+	if not accelerator.is_main_process:
+		return None
+	return (output_dir / "logs.jsonl").open("a", encoding="utf-8", buffering=1)
+
+
+def write_jsonl_log(handle: TextIO | None, payload: dict) -> None:
+	"""Append one JSONL entry and force it to disk.
+
+	Args:
+		handle: Optional rank-0 log handle.
+		payload: JSON-serializable log entry.
+	"""
+
+	if handle is None:
+		return
+	handle.write(json.dumps(payload, sort_keys=True) + "\n")
+	handle.flush()
+	os.fsync(handle.fileno())
 
 
 def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_training_steps: int):
@@ -385,8 +434,8 @@ def save_eval_sample_bundle(
 
 	sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
 	sample_dir.mkdir(parents=True, exist_ok=True)
-	save_video_tensor(generated_video, sample_dir / "generated.mp4")
-	save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4")
+	save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
+	save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
 
 	prompt = batch["prompts"][batch_index]
 	(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
@@ -556,14 +605,13 @@ def main() -> None:
 		mixed_precision=config.training.mixed_precision,
 		use_fsdp=config.training.use_fsdp,
 	)
-	accelerator.init_trackers(
-		project_name="",
-		config=vars(config.training),
-		init_kwargs={"tensorboard": {"max_queue": 1}},
-	)
+	save_config_snapshot(config, output_dir, accelerator)
+	metrics_log = open_jsonl_log(output_dir, accelerator)
+	write_jsonl_log(metrics_log, {"event": "start"})
 	log_parameter_summary(accelerator, model)
 
 	model.to(accelerator.device) # NOTE: do not remove it at the moment
+	# TODO: Use four parameter groups with four learning rates: a) trainable params in model.qwen_brain.language_model are one group; b) any other trainable params in model.qwen_brain that are not in group a are one group; c) trainable params in model.wan_renderer are one group; d) any other trainable params in model.wan_renderer that are not in group c are one group. Make sure you update the corresponding the config dataclasses and yaml file. Note that the lr config for group b and d are optional, if not specified, they defaults to a and c respectively.
 	optimizer = AdamW(
 		[p for p in model.parameters() if p.requires_grad],
 		lr=config.optimizer.learning_rate,
@@ -634,23 +682,30 @@ def main() -> None:
 					macro_loss = torch.stack(accumulated_losses).mean()
 					accumulated_losses.clear()
 					loss_value = accelerator.gather(macro_loss).mean().item()
+					
 					progress_bar.update(1)
 					progress_bar.set_postfix(step=global_step, epoch=epoch + 1, loss=f"{loss_value:.4f}")
-					should_log = config.training.log_every > 0 and (
-						global_step == 1 or global_step % config.training.log_every == 0
-					)
-					if should_log:
-						metrics = {
-							"loss": loss_value,
+					
+					if config.training.log_every > 0 and global_step % config.training.log_every == 0:
+						write_jsonl_log(metrics_log, {
+							"event": "train", "step": global_step,
+							"epoch": epoch + 1, "loss": loss_value,
 							"lr": lr_scheduler.get_last_lr()[0],
-							"epoch": epoch + 1,
-						}
-						accelerator.log(metrics, step=global_step)
-					if config.training.save_every > 0 and global_step % config.training.save_every == 0:
-						save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
+						})
+					
+					if (global_step == total_training_steps) or (config.training.save_every > 0 and global_step % config.training.save_every == 0):
+						save_checkpoint_with_evaluation(
+							accelerator, model, eval_dataloader,
+							config, global_step, output_dir
+						)
+						write_jsonl_log(metrics_log, {
+							"event": "eval", "step": global_step
+						})
 
 	progress_bar.close()
-	save_checkpoint_with_evaluation(accelerator, model, eval_dataloader, config, global_step, output_dir)
+	write_jsonl_log(metrics_log, {"event": "end"})
+	if metrics_log is not None:
+		metrics_log.close()
 	accelerator.end_training()
 
 

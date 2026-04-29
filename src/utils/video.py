@@ -451,15 +451,33 @@ def save_image_tensor(image: Tensor, path: str | Path) -> None:
 	iio.imwrite(path, image_tensor_to_uint8(image))
 
 
-def save_video_tensor(video: Tensor, path: str | Path, fps: int = 16) -> None:
+def save_video_tensor(
+	video: Tensor,
+	path: str | Path,
+	fps: float | None = None,
+	duration_seconds: float | None = None,
+) -> None:
 	"""Write one generated video tensor to an MP4 file.
 
 	Args:
 		video: Tensor with shape `(3, T, H, W)` or `(T, 3, H, W)` in `[-1, 1]`.
 		path: Destination `.mp4` path.
-		fps: Output video frame rate.
+		fps: Optional output frame rate. Defaults to `16` when `duration_seconds` is omitted.
+		duration_seconds: Optional target playback duration used to derive FPS from the frame count.
 	"""
 
 	path = Path(path)
 	path.parent.mkdir(parents=True, exist_ok=True)
-	iio.imwrite(path, video_tensor_to_uint8(video), fps=fps)
+	frames = video_tensor_to_uint8(video)
+	
+	if fps is not None and duration_seconds is not None:
+		raise ValueError("Only one of `fps` or `duration_seconds` may be provided.")
+	if duration_seconds is not None:
+		if duration_seconds <= 0:
+			raise ValueError(f"`duration_seconds` must be positive, got {duration_seconds}.")
+		fps = frames.shape[0] / duration_seconds
+	if fps is None:
+		fps = 16
+	if fps <= 0:
+		raise ValueError(f"`fps` must be positive, got {fps}.")
+	iio.imwrite(path, frames, fps=fps)

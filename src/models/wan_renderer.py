@@ -56,6 +56,7 @@ class WanRenderer(nn.Module):
 		trainable_dtype = self.transformer.patch_embedding.weight.dtype
 		self.condition_proj = nn.Linear(condition_dim, self.inner_dim, dtype=trainable_dtype)
 		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim, dtype=trainable_dtype))
+		# TODO: Like you said, this projection layer is crucial, and its initialization can have a huge impact on convergence. Therefore, add a knob that controls how it is initialized, it can be zero init or a small-random init.
 		nn.init.zeros_(self.condition_proj.weight)
 		nn.init.zeros_(self.condition_proj.bias)
 		nn.init.normal_(self.null_cond, std=0.02)

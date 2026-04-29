@@ -322,6 +322,8 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 			nodesplitter=wds.split_by_node,
 			workersplitter=wds.split_by_worker,
 		)
+		if self.config.shuffle:
+			dataset = dataset.shuffle(1000)
 		num_emitted = 0
 		for sample in dataset:
 			if num_emitted >= sample_limit:
