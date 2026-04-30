@@ -50,7 +50,7 @@ class DatasetConfig:
 	num_reference_images: int = 4
 	video_num_frames: int = 81
 	video_frame_stride: int = 1
-	video_height: int = 480
+	video_height: int = 480 
 	video_width: int = 832
 	vis_image_size: int = 560
 	geo_image_size: int | None = None
