@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import yaml
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
-from accelerate.utils import set_seed
+from accelerate.utils import enable_fsdp_ram_efficient_loading, set_seed
 from torch import Tensor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset, Subset
@@ -82,7 +82,6 @@ def align_fsdp_managed_dtypes(model: DeepWorld) -> None:
 
 
 def create_accelerator(
-	model: DeepWorld,
 	output_dir: str,
 	grad_acc_steps: int,
 	mixed_precision: str,
@@ -91,7 +90,6 @@ def create_accelerator(
 	"""Create the Accelerate runtime and optional in-code FSDP plugin.
 
 	Args:
-		model: Unprepared world-model instance.
 		output_dir: Directory used for tracker output.
 		grad_acc_steps: Gradient accumulation steps.
 		mixed_precision: Mixed precision mode such as `bf16`.
@@ -103,14 +101,7 @@ def create_accelerator(
 
 	world_size = get_world_size()
 	fsdp_enabled = use_fsdp and world_size > 1
-	if fsdp_enabled:
-		align_fsdp_managed_dtypes(model)
-
-	ignored_modules = [
-		model.renderer.vae,
-		model.brain.geometry_encoder,
-		model.brain.vision_encoder,
-	]
+	enable_fsdp_ram_efficient_loading()
 
 	fsdp_plugin = FullyShardedDataParallelPlugin(
 		fsdp_version=1,
@@ -121,7 +112,7 @@ def create_accelerator(
 		backward_prefetch="BACKWARD_PRE",
 		forward_prefetch=False,
 		activation_checkpointing=False,
-		ignored_modules=ignored_modules,
+		ignored_modules=None,
 		use_orig_params=True,
 		limit_all_gathers=True,
 		cpu_ram_efficient_loading=True,
@@ -135,6 +126,54 @@ def create_accelerator(
 		project_dir=output_dir,
 		fsdp_plugin=fsdp_plugin,
 	)
+
+
+def configure_fsdp_model(accelerator: Accelerator, model: DeepWorld) -> None:
+	"""Attach model-specific FSDP settings after RAM-efficient construction.
+
+	Accelerate must be created before Hugging Face `from_pretrained` calls so
+	only rank 0 materializes checkpoint tensors. The ignored-module list depends
+	on the constructed model, so it is filled in afterward before `prepare`.
+
+	Args:
+		accelerator: Active Accelerate runtime.
+		model: Unprepared world-model instance.
+	"""
+
+	fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+	if fsdp_plugin is None:
+		return
+
+	align_fsdp_managed_dtypes(model)
+	fsdp_plugin.ignored_modules = [
+		model.renderer.vae,
+		model.brain.geometry_encoder,
+		model.brain.vision_encoder,
+	]
+
+
+def load_pretrained_model_state(
+	model: DeepWorld,
+	pretrained_model_path: str | None,
+	accelerator: Accelerator,
+) -> None:
+	"""Load an optional full-model state dict without multiplying CPU RAM use.
+
+	Only the main process reads `model.pt`; distributed wrappers then broadcast
+	rank 0's module state during `accelerator.prepare`.
+
+	Args:
+		model: Unprepared world-model instance.
+		pretrained_model_path: Optional path to a saved full-model state dict.
+		accelerator: Active Accelerate runtime.
+	"""
+
+	if pretrained_model_path is not None and accelerator.is_main_process:
+		model.load_state_dict(torch.load(
+			Path(pretrained_model_path),
+			map_location="cpu", weights_only=True, mmap=True,
+		))
+	accelerator.wait_for_everyone()
 
 
 def _count_params(mod: nn.Module, trainable_only: bool = False) -> tuple[int, int]:
@@ -710,20 +749,16 @@ def main() -> None:
 	output_dir = Path(config.training.output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
 
-	model = DeepWorld(config)
-	if config.training.pretrained_model_path is not None:
-		model.load_state_dict(torch.load(
-			Path(config.training.pretrained_model_path),
-			map_location="cpu", weights_only=True
-		))
-
 	accelerator = create_accelerator(
-		model=model,
 		output_dir=config.training.output_dir,
 		grad_acc_steps=config.training.gradient_accumulation_steps,
 		mixed_precision=config.training.mixed_precision,
 		use_fsdp=config.training.use_fsdp,
 	)
+	model = DeepWorld(config)
+	load_pretrained_model_state(model, config.training.pretrained_model_path, accelerator)
+	configure_fsdp_model(accelerator, model)
+
 	save_config_snapshot(config, output_dir, accelerator)
 	metrics_log = open_jsonl_log(output_dir, accelerator)
 	write_jsonl_log(metrics_log, {"event": "start"})
