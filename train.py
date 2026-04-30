@@ -711,6 +711,12 @@ def main() -> None:
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	model = DeepWorld(config)
+	if config.training.pretrained_model_path is not None:
+		model.load_state_dict(torch.load(
+			Path(config.training.pretrained_model_path),
+			map_location="cpu", weights_only=True
+		))
+
 	accelerator = create_accelerator(
 		model=model,
 		output_dir=config.training.output_dir,

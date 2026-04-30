@@ -137,6 +137,7 @@ class TrainingConfig:
 		mixed_precision: Accelerate precision mode such as `bf16`.
 		use_fsdp: Whether multi-process training should use FSDP instead of DDP.
 		gradient_checkpointing: Whether model submodules enable checkpointing when supported.
+		pretrained_model_path: Optional path to a saved `model.pt` state dict to load before training.
 	"""
 
 	output_dir: str = "outputs/world_model"
@@ -151,6 +152,7 @@ class TrainingConfig:
 	mixed_precision: str = "bf16"
 	use_fsdp: bool = True
 	gradient_checkpointing: bool = True
+	pretrained_model_path: str | None = None
 
 	def __post_init__(self) -> None:
 		"""Validate training-loop settings that control checkpoint evaluation."""

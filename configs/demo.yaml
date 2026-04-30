@@ -43,6 +43,7 @@ training:
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
+  pretrained_model_path: null
 
 qwen_brain:
   checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
