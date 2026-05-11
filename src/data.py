@@ -1,5 +1,6 @@
 import glob
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,6 @@ from torch import Tensor
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from src.config import DatasetConfig
-from src.utils.compat import get_world_size
 from src.utils.video import (
 	center_crop_to_aspect,
 	decode_video_frames,
@@ -22,6 +22,15 @@ from src.utils.video import (
 	sample_video_frames_from_raw_frames,
 	video_frames_to_tensor,
 )
+
+
+# TODO: Move this function to utils/__init__.py, it doesn't make sense to classify it as data utility.
+def get_world_size() -> int:
+	"""Return the active distributed world size for dataset partitioning."""
+
+	if torch.distributed.is_available() and torch.distributed.is_initialized():
+		return max(int(torch.distributed.get_world_size()), 1)
+	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
 def partition_count(total: int, index: int, partitions: int) -> int:

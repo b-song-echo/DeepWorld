@@ -9,7 +9,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import GradientCheckpointing
 
 from vggt.models.vggt import VGGT
 from src.config import QwenBrainConfig
-from src.utils.compat import resolve_torch_dtype
+from src.utils import resolve_torch_dtype
 
 
 VIS_MODALITY = 0

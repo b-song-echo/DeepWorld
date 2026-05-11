@@ -5,7 +5,7 @@ from torch import Tensor
 from src.config import WorldModelConfig
 from src.models.qwen_brain import QwenBrain
 from src.models.wan_renderer import WanRenderer
-from src.utils.compat import load_diffusers_classes
+from src.utils import load_diffusers_classes
 
 
 def build_wan_scheduler(config: WorldModelConfig, scheduler_cls):

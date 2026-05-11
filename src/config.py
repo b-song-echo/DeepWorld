@@ -234,7 +234,7 @@ class WanRendererConfig:
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
 		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
-		condition_injection_mode: How Qwen states condition Wan, either `residual` or `cross_attention`.
+		condition_injection_mode: How Qwen states condition Wan, either `input_addition` or `cross_attention`.
 		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero`, `normal`, or `default`.
 		condition_proj_init_std: Optional standard deviation used when `condition_proj_init=normal`. If omitted, defaults to `1e-3`.
 		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
@@ -250,8 +250,7 @@ class WanRendererConfig:
 	vae_enable_slicing: bool = False
 	vae_enable_tiling: bool = False
 	vae_sample_posterior: bool = False
-	# TODO: Change name "residual" to "input_addition"
-	condition_injection_mode: str = "residual"
+	condition_injection_mode: str = "input_addition"
 	condition_proj_init: str = "zero"
 	condition_proj_init_std: float | None = None
 	condition_dropout_prob: float = 0.1
@@ -265,9 +264,9 @@ class WanRendererConfig:
 		self.condition_injection_mode = self.condition_injection_mode.lower().replace("-", "_")
 		if self.condition_injection_mode == "cross_attn":
 			self.condition_injection_mode = "cross_attention"
-		if self.condition_injection_mode not in {"residual", "cross_attention"}:
+		if self.condition_injection_mode not in {"input_addition", "cross_attention"}:
 			raise ValueError(
-				"`wan_renderer.condition_injection_mode` must be `residual` or `cross_attention`, "
+				"`wan_renderer.condition_injection_mode` must be `input_addition` or `cross_attention`, "
 				f"got {self.condition_injection_mode!r}."
 			)
 		self.condition_proj_init = self.condition_proj_init.lower()

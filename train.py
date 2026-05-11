@@ -20,11 +20,19 @@ from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_c
 from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
-from src.utils.compat import get_world_size
 from src.utils.video import save_image_tensor, save_video_tensor
 
 
 VIDEO_DURATION_SECONDS = 10.0
+
+
+# TODO: This function should belong to utils/__init__.py, and used across the entire implementation.
+def get_world_size() -> int:
+	"""Return the active distributed world size for runtime setup."""
+
+	if torch.distributed.is_available() and torch.distributed.is_initialized():
+		return max(int(torch.distributed.get_world_size()), 1)
+	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,36 +336,6 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 			num_training_steps=total_training_steps,
 		)
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
-
-
-# TODO: haven't you already checked values in the config dataclass? why do you have to do these all over again? there is no need for this function. the same goes for other config values, if you have already checked in the dataclass, there is no need check it other places, it only makes the code less readable.
-def resolve_total_training_steps(dataloader: DataLoader, config: WorldModelConfig) -> tuple[int, int]:
-	"""Resolve bounded optimizer-step count from epoch and step limits.
-
-	`max_total_epochs` is converted to optimizer steps from the dataloader
-	length and gradient-accumulation setting. When both epoch and step limits are
-	configured, the smaller value wins so training exceeds neither bound.
-
-	Args:
-		dataloader: Training dataloader with a known per-rank length.
-		config: Root training configuration.
-
-	Returns:
-		A tuple of `(total_training_steps, steps_per_epoch)`.
-	"""
-
-	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
-	if steps_per_epoch <= 0:
-		raise ValueError("The training dataloader must contain at least one optimizer step per epoch.")
-
-	candidate_steps: list[int] = []
-	if config.training.max_total_epochs is not None:
-		candidate_steps.append(steps_per_epoch * config.training.max_total_epochs)
-	if config.training.max_total_steps is not None:
-		candidate_steps.append(config.training.max_total_steps)
-	if len(candidate_steps) == 0:
-		raise ValueError("At least one training limit must be configured.")
-	return min(candidate_steps), steps_per_epoch
 
 
 def _validate_optimizer_groups(model: DeepWorld, grouped_params: list[nn.Parameter]) -> None:
@@ -827,7 +805,17 @@ def main() -> None:
 	log_runtime_setup(accelerator, model)
 	grad_clip_params = tuple(p for group in optimizer.param_groups for p in group["params"])
 
-	total_training_steps, steps_per_epoch = resolve_total_training_steps(dataloader, config)
+	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
+	max_epoch_steps = (
+		steps_per_epoch * config.training.max_total_epochs
+		if config.training.max_total_epochs is not None else config.training.max_total_steps
+	)
+	# TODO: This can simply be written as `config.training.max_total_steps or max_epoch_steps`, which improves readability significantly. Check the entire implementation for similar cases that evaluate an optional value with a default, change them to this python `or` expression. Besides, this name `max_step_steps` is weird.
+	max_step_steps = (
+		config.training.max_total_steps
+		if config.training.max_total_steps is not None else max_epoch_steps
+	)
+	total_training_steps = min(max_epoch_steps, max_step_steps)
 	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)
 	progress_bar = tqdm(
 		total=total_training_steps,
@@ -841,14 +829,8 @@ def main() -> None:
 	epoch_index = 0
 	accumulated_losses: list[Tensor] = []
 	while global_step < total_training_steps:
-		# TODO: is this check really necessary? total_training_steps already satisfies this condition, doesn't it?
-		if config.training.max_total_epochs is not None and epoch_index >= config.training.max_total_epochs:
-			break
 		model.train()
 		for batch in dataloader:
-			# TODO: shouldn't you put this check at the end of the loop?
-			if global_step >= total_training_steps:
-				break
 			with accelerator.accumulate(model):
 				with accelerator.autocast():
 					loss = model(batch)["loss"]
@@ -884,16 +866,11 @@ def main() -> None:
 						write_jsonl_log(metrics_log, {
 							"event": "eval", "step": global_step
 						})
+					if global_step >= total_training_steps:
+						break
 		epoch_index += 1
 
 	progress_bar.close()
-	# TODO: why would this happen? there is really no need for this unnecessary check...
-	if global_step < total_training_steps:
-		raise RuntimeError(
-			"Training ended before reaching the resolved step budget; "
-			f"completed={global_step}, expected={total_training_steps}, epochs={epoch_index}, "
-			f"steps_per_epoch={steps_per_epoch}."
-		)
 	write_jsonl_log(metrics_log, {"event": "end"})
 	if metrics_log is not None:
 		metrics_log.close()

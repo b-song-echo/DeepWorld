@@ -67,7 +67,7 @@ wan_renderer:
   vae_enable_slicing: true
   vae_enable_tiling: true
   vae_sample_posterior: false
-  condition_injection_mode: residual
+  condition_injection_mode: input_addition
   condition_proj_init: normal
   condition_proj_init_std: null
   condition_dropout_prob: 0.1

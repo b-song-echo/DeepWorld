@@ -8,10 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.nn import functional as F
 
-
-# TODO: Currently, these data loading utilities are a bit messy, please refactor them, make the code cleaner and clearer, remove redundant logic and unused functions. If necessary, update their references as well.
 
 def load_image(path: str | Path) -> Image.Image:
 	"""Load an RGB image from disk.
@@ -148,7 +145,7 @@ def decode_video_frames(source: str | Path | bytes) -> list[Image.Image]:
 
 
 def sample_reference_images(
-	raw_frames: list[Image.Image],
+	frames: list[Image.Image],
 	num_reference_images: int,
 	random_selection: bool = True,
 	preserve_order: bool = True,
@@ -156,7 +153,7 @@ def sample_reference_images(
 	"""Sample reference images from decoded video frames.
 
 	Args:
-		raw_frames: Decoded RGB frames from the source video.
+		frames: Candidate RGB frames.
 		num_reference_images: Maximum number of reference frames to select.
 		random_selection: Whether to sample frames randomly instead of uniformly.
 		preserve_order: Whether selected frames should keep their temporal order.
@@ -165,20 +162,20 @@ def sample_reference_images(
 		A list of RGB reference images.
 	"""
 
-	if len(raw_frames) == 0:
+	if len(frames) == 0:
 		raise ValueError("Cannot sample reference images from an empty frame list.")
 
-	selection_count = min(num_reference_images, len(raw_frames))
+	selection_count = min(num_reference_images, len(frames))
 	if random_selection:
-		indices = random.sample(range(len(raw_frames)), k=selection_count)
+		indices = random.sample(range(len(frames)), k=selection_count)
 		if preserve_order:
 			indices = sorted(indices)
 	else:
 		if selection_count == 1:
-			indices = [len(raw_frames) // 2]
+			indices = [len(frames) // 2]
 		else:
-			indices = [round(index * (len(raw_frames) - 1) / (selection_count - 1)) for index in range(selection_count)]
-	return [raw_frames[index].copy() for index in indices]
+			indices = [round(index * (len(frames) - 1) / (selection_count - 1)) for index in range(selection_count)]
+	return [frames[index].copy() for index in indices]
 
 
 def align_frame_count(frames: list[Image.Image], temporal_factor: int = 4) -> list[Image.Image]:
@@ -387,56 +384,6 @@ def load_video_frames(
 	return video_frames_to_tensor(frames, height, width)
 
 
-def load_video_frames_from_raw_frames(
-	raw_frames: list[Image.Image],
-	num_frames: int,
-	height: int,
-	width: int,
-	*,
-	stride: int | None = None,
-	random_clip: bool | None = None,
-	frame_sampling: str = "clip",
-) -> Tensor:
-	"""Convert decoded frames into a training clip tensor.
-
-	Args:
-		raw_frames: Decoded RGB frames from the source video.
-		num_frames: Requested number of output frames before alignment.
-		height: Output frame height.
-		width: Output frame width.
-		stride: Optional temporal stride used by the `clip` strategy. Defaults to `1`.
-		random_clip: Optional `clip` strategy flag controlling whether to randomize the window start. Defaults to `True`.
-		frame_sampling: Sampling strategy, either `clip` or `uniform`.
-
-	Returns:
-		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
-	"""
-
-	frames = sample_video_frames_from_raw_frames(
-		raw_frames,
-		num_frames,
-		stride=stride,
-		random_clip=random_clip,
-		frame_sampling=frame_sampling,
-	)
-	return video_frames_to_tensor(frames, height, width)
-
-
-def resize_tensor_image(image: Tensor, height: int, width: int) -> Tensor:
-	"""Resize a CHW tensor image with bicubic interpolation.
-
-	Args:
-		image: Tensor with shape `(C, H, W)`.
-		height: Target height.
-		width: Target width.
-
-	Returns:
-		Resized image tensor with shape `(C, height, width)`.
-	"""
-
-	return F.interpolate(image.unsqueeze(0), size=(height, width), mode="bicubic", align_corners=False).squeeze(0)
-
-
 def video_tensor_to_uint8(video: Tensor) -> np.ndarray:
 	"""Convert one generated video tensor into uint8 frames for serialization.
 
@@ -447,8 +394,8 @@ def video_tensor_to_uint8(video: Tensor) -> np.ndarray:
 		A NumPy array with shape `(T, H, W, 3)` and dtype `uint8`.
 	"""
 
-	if video.ndim != 4:
-		raise ValueError(f"Expected a 4D video tensor, got shape {tuple(video.shape)}.")
+	if video.dim() != 4:
+		raise ValueError(f"Expected a 4D video tensor, got shape {tuple(video.size())}.")
 
 	video = video.detach().float().cpu().clamp(-1.0, 1.0)
 	if video.size(0) == 3:
@@ -456,7 +403,7 @@ def video_tensor_to_uint8(video: Tensor) -> np.ndarray:
 	elif video.size(1) == 3:
 		frames = video.permute(0, 2, 3, 1)
 	else:
-		raise ValueError(f"Expected RGB channels in dimension 0 or 1, got shape {tuple(video.shape)}.")
+		raise ValueError(f"Expected RGB channels in dimension 0 or 1, got shape {tuple(video.size())}.")
 
 	frames = ((frames + 1.0) * 127.5).round().to(torch.uint8)
 	return frames.contiguous().numpy()
@@ -472,8 +419,8 @@ def image_tensor_to_uint8(image: Tensor) -> np.ndarray:
 		A NumPy array with shape `(H, W, 3)` and dtype `uint8`.
 	"""
 
-	if image.ndim != 3 or image.size(0) != 3:
-		raise ValueError(f"Expected a CHW RGB image tensor, got shape {tuple(image.shape)}.")
+	if image.dim() != 3 or image.size(0) != 3:
+		raise ValueError(f"Expected a CHW RGB image tensor, got shape {tuple(image.size())}.")
 
 	image = image.detach().float().cpu()
 	if image.min().item() < 0.0:
@@ -521,7 +468,7 @@ def save_video_tensor(
 	if duration_seconds is not None:
 		if duration_seconds <= 0:
 			raise ValueError(f"`duration_seconds` must be positive, got {duration_seconds}.")
-		fps = frames.shape[0] / duration_seconds
+		fps = len(frames) / duration_seconds
 	if fps is None:
 		fps = 16
 	if fps <= 0:
