@@ -290,6 +290,7 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 
 		metadata = self._parse_metadata(sample["json"])
 		raw_frames = decode_video_frames(sample["mp4"])
+		# TODO: Reference images should be sampled from the sampled frames.
 		reference_images = sample_reference_images(
 			raw_frames,
 			num_reference_images=self.config.num_reference_images,

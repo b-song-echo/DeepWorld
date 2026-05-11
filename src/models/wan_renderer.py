@@ -7,6 +7,11 @@ from src.config import WanRendererConfig
 from src.utils.compat import load_diffusers_classes, resolve_torch_dtype
 
 
+# TODO: I want to make some big architectual changes to WanRenderer.
+# TODO: First, I will use Wan2.2-TI2V-5B as backbone. It comes with a high-compression VAE that downsamples by 4 * 16 * 16 rather than the standard 4 * 8 * 8, so make sure the current implementation can handle this change. Besides, the default video resolution should be 121 * 448 * 448, note that 448 is still divisible by 28 (required by VGGT) and 32 (required by VAE). Make sure you update the corresponding condig dataclasses and yaml file.
+# TODO: Second, I will add a second way of injecting the output from QwenBrain into the WanRenderer, and keep the current way, then add a config to choose so that I can easily experiment with these two approaches. The current way is to project the output from QwenBrain then add it to the original DiT input, because the two have the same dimension. In this case, there is no cross-conditioning so the cross-attention branch is removed completely. The new approach is as follows. The output from QwenBrain is injected via cross-attention, in other words, WanRenderer is adapted to condition on the output embeddings from QwenBrain instead of T5 text model. Similar to the current approach, condition projection is also needed. In this case, no modules are removed, but all modules except cross-attention should be frozen. This is kind of like the opposite of the current approach: the former only train cross-attn while freeze the rest; the latter removes cross-attn while train the rest. In both approaches, the condition projection is crucial, especially the way it is initialized because it gaurds the gradient-flow from WanRenderer to QwenBrain.
+
+
 class WanRenderer(nn.Module):
 	"""Wan VAE and transformer wrapper conditioned by Qwen generation states.
 
@@ -157,15 +162,9 @@ class WanRenderer(nn.Module):
 		"""
 
 		p_t, p_h, p_w = self.transformer.config.patch_size
-		grid = torch.tensor(
-			[
-				latents.size(2) // p_t,
-				latents.size(3) // p_h,
-				latents.size(4) // p_w,
-			],
-			device=latents.device,
-			dtype=torch.long,
-		)
+		latent_t, latent_h, latent_w = latents.size()[-3:]
+		grid_t, grid_h, grid_w = latent_t // p_t, latent_h // p_h, latent_w // p_w
+		grid = torch.tensor([grid_t, grid_h, grid_w,], device=latents.device, dtype=torch.long)
 		return grid.unsqueeze(0).expand(latents.size(0), -1)
 
 	def _compute_time_embeddings(

@@ -43,18 +43,18 @@ class DatasetConfig:
 		persistent_workers: Whether worker processes should stay alive across epochs.
 	"""
 
-	dataset_source: str = "manifest"
+	dataset_source: str = "webdataset"
 	manifest_path: str = ""
 	webdataset_urls: List[str] | str = field(default_factory=list)
 	num_samples: int = 0
 	num_reference_images: int = 4
 	video_num_frames: int = 81
 	video_frame_stride: int = 1
-	video_height: int = 480 
-	video_width: int = 832
-	vis_image_size: int = 560
+	video_height: int = 448 
+	video_width: int = 448
+	vis_image_size: int = 448
 	geo_image_size: int | None = None
-	max_text_length: int = 512
+	max_text_length: int = 1024
 	shuffle: bool = True
 	num_workers: int = 8
 	prefetch_factor: int | None = None
@@ -139,6 +139,8 @@ class TrainingConfig:
 		gradient_checkpointing: Whether model submodules enable checkpointing when supported.
 		pretrained_model_path: Optional path to a saved `model.pt` state dict to load before training.
 	"""
+
+	# TODO: Change `num_epochs` to `max_total_epochs`, then add a new config `max_total_steps`. Both are optional but at least one should be specified. The total steps corresponding to max_total_epochs is automatically inferred, then the actual total steps is the minimum of it and max_total_steps, so that the final training steps is no larger than both, and that's why they are have the prefix "max". Don't forget to update the yaml config file, whose `max_total_epochs` and `max_total_steps` are 30 and 1500 respectively.
 
 	output_dir: str = "outputs/world_model"
 	seed: int = 42
