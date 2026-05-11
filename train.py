@@ -330,6 +330,36 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
+# TODO: haven't you already checked values in the config dataclass? why do you have to do these all over again? there is no need for this function. the same goes for other config values, if you have already checked in the dataclass, there is no need check it other places, it only makes the code less readable.
+def resolve_total_training_steps(dataloader: DataLoader, config: WorldModelConfig) -> tuple[int, int]:
+	"""Resolve bounded optimizer-step count from epoch and step limits.
+
+	`max_total_epochs` is converted to optimizer steps from the dataloader
+	length and gradient-accumulation setting. When both epoch and step limits are
+	configured, the smaller value wins so training exceeds neither bound.
+
+	Args:
+		dataloader: Training dataloader with a known per-rank length.
+		config: Root training configuration.
+
+	Returns:
+		A tuple of `(total_training_steps, steps_per_epoch)`.
+	"""
+
+	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
+	if steps_per_epoch <= 0:
+		raise ValueError("The training dataloader must contain at least one optimizer step per epoch.")
+
+	candidate_steps: list[int] = []
+	if config.training.max_total_epochs is not None:
+		candidate_steps.append(steps_per_epoch * config.training.max_total_epochs)
+	if config.training.max_total_steps is not None:
+		candidate_steps.append(config.training.max_total_steps)
+	if len(candidate_steps) == 0:
+		raise ValueError("At least one training limit must be configured.")
+	return min(candidate_steps), steps_per_epoch
+
+
 def _validate_optimizer_groups(model: DeepWorld, grouped_params: list[nn.Parameter]) -> None:
 	"""Ensure optimizer grouping covers each trainable parameter exactly once.
 
@@ -797,8 +827,7 @@ def main() -> None:
 	log_runtime_setup(accelerator, model)
 	grad_clip_params = tuple(p for group in optimizer.param_groups for p in group["params"])
 
-	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)
-	total_training_steps = steps_per_epoch * config.training.num_epochs
+	total_training_steps, steps_per_epoch = resolve_total_training_steps(dataloader, config)
 	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)
 	progress_bar = tqdm(
 		total=total_training_steps,
@@ -809,10 +838,17 @@ def main() -> None:
 	progress_bar.set_postfix(step=0, epoch=0, loss="n/a")
 
 	global_step = 0
+	epoch_index = 0
 	accumulated_losses: list[Tensor] = []
-	for epoch in range(config.training.num_epochs):
+	while global_step < total_training_steps:
+		# TODO: is this check really necessary? total_training_steps already satisfies this condition, doesn't it?
+		if config.training.max_total_epochs is not None and epoch_index >= config.training.max_total_epochs:
+			break
 		model.train()
 		for batch in dataloader:
+			# TODO: shouldn't you put this check at the end of the loop?
+			if global_step >= total_training_steps:
+				break
 			with accelerator.accumulate(model):
 				with accelerator.autocast():
 					loss = model(batch)["loss"]
@@ -831,12 +867,12 @@ def main() -> None:
 					loss_value = accelerator.gather(macro_loss).mean().item()
 					
 					progress_bar.update(1)
-					progress_bar.set_postfix(step=global_step, epoch=epoch + 1, loss=f"{loss_value:.4f}")
+					progress_bar.set_postfix(step=global_step, epoch=epoch_index + 1, loss=f"{loss_value:.4f}")
 					
 					if config.training.log_every > 0 and global_step % config.training.log_every == 0:
 						write_jsonl_log(metrics_log, {
 							"event": "train", "step": global_step,
-							"epoch": epoch + 1, "loss": loss_value,
+							"epoch": epoch_index + 1, "loss": loss_value,
 							"lr": lr_scheduler.get_last_lr()[0],
 						})
 					
@@ -848,8 +884,16 @@ def main() -> None:
 						write_jsonl_log(metrics_log, {
 							"event": "eval", "step": global_step
 						})
+		epoch_index += 1
 
 	progress_bar.close()
+	# TODO: why would this happen? there is really no need for this unnecessary check...
+	if global_step < total_training_steps:
+		raise RuntimeError(
+			"Training ended before reaching the resolved step budget; "
+			f"completed={global_step}, expected={total_training_steps}, epochs={epoch_index}, "
+			f"steps_per_epoch={steps_per_epoch}."
+		)
 	write_jsonl_log(metrics_log, {"event": "end"})
 	if metrics_log is not None:
 		metrics_log.close()

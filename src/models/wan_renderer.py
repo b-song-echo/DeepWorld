@@ -7,17 +7,15 @@ from src.config import WanRendererConfig
 from src.utils.compat import load_diffusers_classes, resolve_torch_dtype
 
 
-# TODO: I want to make some big architectual changes to WanRenderer.
-# TODO: First, I will use Wan2.2-TI2V-5B as backbone. It comes with a high-compression VAE that downsamples by 4 * 16 * 16 rather than the standard 4 * 8 * 8, so make sure the current implementation can handle this change. Besides, the default video resolution should be 121 * 448 * 448, note that 448 is still divisible by 28 (required by VGGT) and 32 (required by VAE). Make sure you update the corresponding condig dataclasses and yaml file.
-# TODO: Second, I will add a second way of injecting the output from QwenBrain into the WanRenderer, and keep the current way, then add a config to choose so that I can easily experiment with these two approaches. The current way is to project the output from QwenBrain then add it to the original DiT input, because the two have the same dimension. In this case, there is no cross-conditioning so the cross-attention branch is removed completely. The new approach is as follows. The output from QwenBrain is injected via cross-attention, in other words, WanRenderer is adapted to condition on the output embeddings from QwenBrain instead of T5 text model. Similar to the current approach, condition projection is also needed. In this case, no modules are removed, but all modules except cross-attention should be frozen. This is kind of like the opposite of the current approach: the former only train cross-attn while freeze the rest; the latter removes cross-attn while train the rest. In both approaches, the condition projection is crucial, especially the way it is initialized because it gaurds the gradient-flow from WanRenderer to QwenBrain.
-
+# TODO: The handling of timesteps is a bit messy at the moment. I wonder whether this can make the code cleaner and more readable: if timesteps are per-sample, then they can be viewed or expanded to per-token, then the processing or timesteps can be achieved with the same logic (I guess, might not be right)? If some API requires per-sample, then they can be viewed back. I haven't read your implementation carefully, if this is achievable and can make the code much clearer and shorter, then please do it; if not, then you can ignore this suggestion :)
 
 class WanRenderer(nn.Module):
 	"""Wan VAE and transformer wrapper conditioned by Qwen generation states.
 
 	The renderer owns the paired Wan VAE and transformer. It handles latent
-	encoding/decoding, removes the transformer's text cross-attention branch, and
-	adds projected Qwen generation states to the Wan patch-token representation.
+	encoding/decoding and supports two conditioning modes:
+	- `residual`: remove Wan text cross-attention and add projected Qwen states to patch tokens.
+	- `cross_attention`: keep Wan cross-attention and replace T5 embeddings with projected Qwen states.
 
 	Args:
 		wan_config: Wan renderer branch configuration.
@@ -56,13 +54,22 @@ class WanRenderer(nn.Module):
 			self.vae.enable_tiling()
 		self.vae.requires_grad_(False)
 
-		self._remove_text_conditioning_modules()
+		self.condition_injection_mode = wan_config.condition_injection_mode
 		self.inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
 		trainable_dtype = self.transformer.patch_embedding.weight.dtype
-		self.condition_proj = nn.Linear(condition_dim, self.inner_dim, dtype=trainable_dtype)
-		self.null_cond = nn.Parameter(torch.zeros(1, 1, self.inner_dim, dtype=trainable_dtype))
+		condition_projection_dim = self._condition_projection_dim()
+		self.condition_proj = nn.Linear(condition_dim, condition_projection_dim, dtype=trainable_dtype)
+		self.null_cond = nn.Parameter(torch.zeros(1, 1, condition_projection_dim, dtype=trainable_dtype))
 		self._initialize_conditioning_parameters(wan_config)
 		nn.init.normal_(self.null_cond, std=0.02)
+		self.expand_timesteps = wan_config.expand_timesteps
+
+		if self.condition_injection_mode == "residual":
+			self._remove_text_conditioning_modules()
+		elif self.condition_injection_mode == "cross_attention":
+			self._freeze_transformer_except_cross_attention()
+		else:
+			raise ValueError(f"Unsupported Wan conditioning mode: {self.condition_injection_mode!r}.")
 
 		latents_mean = torch.tensor(
 			self.vae.config.latents_mean,
@@ -74,6 +81,21 @@ class WanRenderer(nn.Module):
 		).view(1, self.vae.config.z_dim, 1, 1, 1)
 		self.latents_mean = nn.Buffer(latents_mean, persistent=False)
 		self.latents_recip_std = nn.Buffer(latents_recip_std, persistent=False)
+
+	def _condition_projection_dim(self) -> int:
+		"""Return the projection output width required by the active conditioning mode.
+
+		Residual conditioning injects directly into Wan patch tokens, so Qwen states
+		must project to the transformer inner dimension. Cross-attention
+		conditioning feeds Wan's frozen text embedder, so Qwen states first project
+		to the checkpoint's configured text embedding dimension.
+		"""
+
+		if self.condition_injection_mode == "residual":
+			return self.inner_dim
+		if self.condition_injection_mode == "cross_attention":
+			return int(self.transformer.config.text_dim)
+		raise ValueError(f"Unsupported Wan conditioning mode: {self.condition_injection_mode!r}.")
 
 	def _initialize_conditioning_parameters(self, wan_config: WanRendererConfig) -> None:
 		"""Initialize Qwen-to-Wan conditioning projection according to config.
@@ -99,6 +121,19 @@ class WanRenderer(nn.Module):
 			return
 		else:
 			raise ValueError(f"Unsupported condition projection init: {wan_config.condition_proj_init!r}.")
+
+	def _freeze_transformer_except_cross_attention(self) -> None:
+		"""Freeze Wan weights except the cross-attention branch used for conditioning."""
+
+		self.transformer.requires_grad_(False)
+		for block in self.transformer.blocks:
+			if not hasattr(block, "attn2") or not hasattr(block, "norm2"):
+				raise RuntimeError("The loaded Wan block no longer exposes `attn2`/`norm2`; update freezing logic.")
+			if not isinstance(block.attn2, nn.Module):
+				raise RuntimeError("The loaded Wan cross-attention branch is not a module; update freezing logic.")
+			block.attn2.requires_grad_(True)
+			if isinstance(block.norm2, nn.Module):
+				block.norm2.requires_grad_(True)
 
 	def _remove_text_conditioning_modules(self) -> None:
 		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""
@@ -151,6 +186,18 @@ class WanRenderer(nn.Module):
 		with torch.no_grad():
 			return self.vae.decode(latents, return_dict=False)[0]
 
+	def _latent_patch_grid_tuple(self, latents: Tensor) -> tuple[int, int, int]:
+		"""Compute one latent tensor's patch grid and validate divisibility."""
+
+		p_t, p_h, p_w = self.transformer.config.patch_size
+		latent_t, latent_h, latent_w = latents.size()[-3:]
+		if latent_t % p_t != 0 or latent_h % p_h != 0 or latent_w % p_w != 0:
+			raise ValueError(
+				"Wan latent shape must be divisible by transformer patch size; "
+				f"latent={(latent_t, latent_h, latent_w)}, patch={(p_t, p_h, p_w)}."
+			)
+		return latent_t // p_t, latent_h // p_h, latent_w // p_w
+
 	def latent_patch_grids(self, latents: Tensor) -> Tensor:
 		"""Compute the Wan patch-token grid for a latent tensor.
 
@@ -161,10 +208,7 @@ class WanRenderer(nn.Module):
 			A tensor of shape `(B, 3)` containing `(t, h, w)` patch-grid sizes.
 		"""
 
-		p_t, p_h, p_w = self.transformer.config.patch_size
-		latent_t, latent_h, latent_w = latents.size()[-3:]
-		grid_t, grid_h, grid_w = latent_t // p_t, latent_h // p_h, latent_w // p_w
-		grid = torch.tensor([grid_t, grid_h, grid_w,], device=latents.device, dtype=torch.long)
+		grid = torch.tensor(self._latent_patch_grid_tuple(latents), device=latents.device, dtype=torch.long)
 		return grid.unsqueeze(0).expand(latents.size(0), -1)
 
 	def _compute_time_embeddings(
@@ -173,7 +217,7 @@ class WanRenderer(nn.Module):
 		dtype: torch.dtype,
 		device: torch.device,
 	) -> tuple[Tensor, Tensor]:
-		"""Compute Wan time embeddings from scalar or batched timesteps.
+		"""Compute Wan time embeddings from per-sample or per-token timesteps.
 
 		Args:
 			timestep: Current diffusion timestep for each sample.
@@ -183,40 +227,68 @@ class WanRenderer(nn.Module):
 		Returns:
 			A tuple of:
 			- `temb`, the base time embedding,
-			- `timestep_proj`, the AdaLN modulation parameters reshaped as `(B, 6, D)`.
+			- `timestep_proj`, the AdaLN modulation parameters reshaped as `(B, 6, D)` or `(B, N, 6, D)`.
 		"""
 
 		condition_embedder = self.transformer.condition_embedder
 		timestep = timestep.to(device=device)
-		timestep_features = condition_embedder.timesteps_proj(timestep)
+		# TODO: do not use ndim, use dim(), for the entire implementation.
+		if timestep.ndim == 2:
+			# TODO: do not use shape, use size(), for the entire implementation.
+			batch_size, timestep_seq_len = timestep.shape
+			timestep_features = condition_embedder.timesteps_proj(timestep.flatten())
+			timestep_features = timestep_features.unflatten(0, (batch_size, timestep_seq_len))
+		else:
+			timestep_features = condition_embedder.timesteps_proj(timestep)
+
+		time_embedder_dtype = next(condition_embedder.time_embedder.parameters()).dtype
+		if timestep_features.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
+			timestep_features = timestep_features.to(time_embedder_dtype)
 		timestep_features = timestep_features.to(device=device)
 		temb = condition_embedder.time_embedder(timestep_features).to(dtype=dtype)
 		timestep_proj = condition_embedder.time_proj(condition_embedder.act_fn(temb)).to(dtype=dtype)
-		timestep_proj = timestep_proj.unflatten(1, (6, -1))
+		if timestep.ndim == 2:
+			timestep_proj = timestep_proj.unflatten(2, (6, -1))
+		else:
+			timestep_proj = timestep_proj.unflatten(1, (6, -1))
 		return temb, timestep_proj
 
-	def _apply_conditioning(self, hidden_states: Tensor, condition_hidden_states: Tensor, token_mask: Tensor | None) -> Tensor:
-		"""Project Qwen states into Wan space and fill padded slots with a learned null token.
+	def _project_conditioning(
+		self,
+		condition_hidden_states: Tensor,
+		token_mask: Tensor | None,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> Tensor:
+		"""Project Qwen states into the active Wan conditioning space.
 
 		Args:
-			hidden_states: Wan patch-token hidden states with shape `(B, N, D)`.
 			condition_hidden_states: Qwen generation hidden states aligned with Wan tokens.
 			token_mask: Optional boolean mask identifying valid conditioning tokens.
+			device: Target device.
+			dtype: Target dtype.
 
 		Returns:
-			The condition tensor projected into Wan hidden space and aligned with `hidden_states`.
+			Projected condition tensor with padded slots replaced by a learned null token.
 		"""
 
+		proj_dtype = self.condition_proj.weight.dtype
 		condition_hidden_states = self.condition_proj(
-			condition_hidden_states.to(device=hidden_states.device, dtype=hidden_states.dtype)
-		)
+			condition_hidden_states.to(device=device, dtype=proj_dtype, non_blocking=True)
+		).to(dtype=dtype)
 		if token_mask is None:
 			return condition_hidden_states
 
-		null_cond = self.null_cond.to(device=hidden_states.device, dtype=hidden_states.dtype).expand_as(condition_hidden_states)
+		token_mask = token_mask.to(device=device, dtype=torch.bool, non_blocking=True)
+		if token_mask.shape != condition_hidden_states.shape[:2]:
+			raise ValueError(
+				"`token_mask` must align with projected conditioning tokens; "
+				f"got mask={tuple(token_mask.shape)}, condition={tuple(condition_hidden_states.shape[:2])}."
+			)
+		null_cond = self.null_cond.to(device=device, dtype=dtype).expand_as(condition_hidden_states)
 		return torch.where(token_mask.unsqueeze(-1), condition_hidden_states, null_cond)
 
-	def _forward_block(
+	def _forward_residual_block(
 		self,
 		block: nn.Module,
 		hidden_states: Tensor,
@@ -235,9 +307,20 @@ class WanRenderer(nn.Module):
 			Updated hidden states after self-attention and FFN.
 		"""
 
-		shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-			block.scale_shift_table + timestep_proj.float()
-		).chunk(6, dim=1)
+		if timestep_proj.ndim == 4:
+			shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+				block.scale_shift_table.unsqueeze(0) + timestep_proj.float()
+			).chunk(6, dim=2)
+			shift_msa = shift_msa.squeeze(2)
+			scale_msa = scale_msa.squeeze(2)
+			gate_msa = gate_msa.squeeze(2)
+			c_shift_msa = c_shift_msa.squeeze(2)
+			c_scale_msa = c_scale_msa.squeeze(2)
+			c_gate_msa = c_gate_msa.squeeze(2)
+		else:
+			shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+				block.scale_shift_table + timestep_proj.float()
+			).chunk(6, dim=1)
 		norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
 		attn_output = block.attn1(norm_hidden_states, None, None, rotary_emb)
 		hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
@@ -248,6 +331,117 @@ class WanRenderer(nn.Module):
 		ff_output = block.ffn(norm_hidden_states)
 		hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 		return hidden_states
+
+	def _prepare_timestep(
+		self,
+		timestep: Tensor,
+		batch_size: int,
+		num_tokens: int,
+		device: torch.device,
+	) -> Tensor:
+		"""Normalize timestep shape for Wan2.1 and Wan2.2-style execution.
+
+		Wan2.2 TI2V pipelines pass a timestep per latent patch token. For pure
+		video denoising those values are identical, but using the same shape keeps
+		the wrapper compatible with checkpoints that expect sequence-wise time
+		conditioning.
+		"""
+
+		timestep = timestep.to(device=device)
+		if timestep.ndim == 0:
+			timestep = timestep.expand(batch_size)
+		if timestep.ndim == 1 and self.expand_timesteps:
+			return timestep.unsqueeze(1).expand(batch_size, num_tokens)
+		return timestep
+
+	def _forward_cross_attention(
+		self,
+		hidden_states: Tensor,
+		timestep: Tensor,
+		condition_hidden_states: Tensor,
+		token_mask: Tensor | None,
+		return_dict: bool,
+	) -> dict[str, Tensor] | Tensor:
+		"""Run Wan's native cross-attention path with Qwen states as text embeddings."""
+
+		dtype = self.transformer.patch_embedding.weight.dtype
+		device = hidden_states.device
+		grid_t, grid_h, grid_w = self._latent_patch_grid_tuple(hidden_states)
+		num_tokens = grid_t * grid_h * grid_w
+		timestep = self._prepare_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		encoder_hidden_states = self._project_conditioning(
+			condition_hidden_states,
+			token_mask,
+			device=device,
+			dtype=dtype,
+		)
+		output = self.transformer(
+			hidden_states=hidden_states.to(dtype=dtype),
+			timestep=timestep,
+			encoder_hidden_states=encoder_hidden_states,
+			return_dict=False,
+		)[0]
+		if not return_dict:
+			return output
+		return {"sample": output}
+
+	def _forward_residual(
+		self,
+		hidden_states: Tensor,
+		timestep: Tensor,
+		condition_hidden_states: Tensor,
+		token_mask: Tensor | None,
+		return_dict: bool,
+	) -> dict[str, Tensor] | Tensor:
+		"""Run the residual Qwen-to-Wan conditioning path."""
+
+		p_t, p_h, p_w = self.transformer.config.patch_size
+		grid_t, grid_h, grid_w = self._latent_patch_grid_tuple(hidden_states)
+		num_tokens = grid_t * grid_h * grid_w
+		dtype = self.transformer.patch_embedding.weight.dtype
+		device = hidden_states.device
+
+		timestep = self._prepare_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		rotary_emb = self.transformer.rope(hidden_states)
+		hidden_states = self.transformer.patch_embedding(hidden_states.to(dtype=dtype))
+		hidden_states = hidden_states.flatten(2).transpose(1, 2)
+		condition_hidden_states = self._project_conditioning(
+			condition_hidden_states,
+			token_mask,
+			device=device,
+			dtype=hidden_states.dtype,
+		)
+		hidden_states = hidden_states + condition_hidden_states
+
+		temb, timestep_proj = self._compute_time_embeddings(timestep, dtype=hidden_states.dtype, device=device)
+
+		checkpoint_fn = getattr(self.transformer, "_gradient_checkpointing_func", None)
+		for block in self.transformer.blocks:
+			if torch.is_grad_enabled() and self.transformer.gradient_checkpointing and callable(checkpoint_fn):
+				hidden_states = checkpoint_fn(
+					self._forward_residual_block,
+					block, hidden_states, timestep_proj, rotary_emb,
+				)
+			else:
+				hidden_states = self._forward_residual_block(block, hidden_states, timestep_proj, rotary_emb)
+
+		if temb.ndim == 3:
+			shift, scale = (self.transformer.scale_shift_table.unsqueeze(0).to(device) + temb.unsqueeze(2)).chunk(2, dim=2)
+			shift = shift.squeeze(2)
+			scale = scale.squeeze(2)
+		else:
+			shift, scale = (self.transformer.scale_shift_table.to(device) + temb.unsqueeze(1)).chunk(2, dim=1)
+		hidden_states = (self.transformer.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+		hidden_states = self.transformer.proj_out(hidden_states)
+
+		output = rearrange(
+			hidden_states,
+			"b (t h w) (pt ph pw c) -> b c (t pt) (h ph) (w pw)",
+			t=grid_t, h=grid_h, w=grid_w, pt=p_t, ph=p_h, pw=p_w,
+		)
+		if not return_dict:
+			return output
+		return {"sample": output}
 
 	def forward(
 		self,
@@ -270,40 +464,18 @@ class WanRenderer(nn.Module):
 			Either the denoised latent prediction tensor or `{"sample": tensor}`.
 		"""
 
-		_, _, num_frames, height, width = hidden_states.size()
-		p_t, p_h, p_w = self.transformer.config.patch_size
-		grid_t, grid_h, grid_w = num_frames // p_t, height // p_h, width // p_w
-		dtype = self.transformer.patch_embedding.weight.dtype
-		device = hidden_states.device
-
-		rotary_emb = self.transformer.rope(hidden_states)
-		hidden_states = self.transformer.patch_embedding(hidden_states.to(dtype=dtype))
-		hidden_states = hidden_states.flatten(2).transpose(1, 2)
-		condition_hidden_states = self._apply_conditioning(hidden_states, condition_hidden_states, token_mask)
-		hidden_states = hidden_states + condition_hidden_states
-
-		temb, timestep_proj = self._compute_time_embeddings(timestep, dtype=hidden_states.dtype, device=device)
-
-		checkpoint_fn = getattr(self.transformer, "_gradient_checkpointing_func", None)
-		for block in self.transformer.blocks:
-			if torch.is_grad_enabled() and self.transformer.gradient_checkpointing and callable(checkpoint_fn):
-				hidden_states = checkpoint_fn(
-					self._forward_block,
-					block, hidden_states, timestep_proj, rotary_emb,
-				)
-			else:
-				hidden_states = self._forward_block(block, hidden_states, timestep_proj, rotary_emb)
-
-		shift, scale = (self.transformer.scale_shift_table.to(device) + temb.unsqueeze(1)).chunk(2, dim=1)
-		hidden_states = (self.transformer.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-		hidden_states = self.transformer.proj_out(hidden_states)
-
-		# Unpatchification: reconstruct the `(B, C, T, H, W)` latents.
-		output = rearrange(
-			hidden_states,
-			"b (t h w) (pt ph pw c) -> b c (t pt) (h ph) (w pw)",
-			t=grid_t, h=grid_h, w=grid_w, pt=p_t, ph=p_h, pw=p_w,
+		if self.condition_injection_mode == "cross_attention":
+			return self._forward_cross_attention(
+				hidden_states=hidden_states,
+				timestep=timestep,
+				condition_hidden_states=condition_hidden_states,
+				token_mask=token_mask,
+				return_dict=return_dict,
+			)
+		return self._forward_residual(
+			hidden_states=hidden_states,
+			timestep=timestep,
+			condition_hidden_states=condition_hidden_states,
+			token_mask=token_mask,
+			return_dict=return_dict,
 		)
-		if not return_dict:
-			return output
-		return {"sample": output}

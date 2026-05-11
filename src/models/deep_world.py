@@ -8,19 +8,16 @@ from src.models.wan_renderer import WanRenderer
 from src.utils.compat import load_diffusers_classes
 
 
-def resolve_train_scheduler_steps(config: WorldModelConfig, scheduler_cls) -> int:
-	"""Resolve the number of training diffusion timesteps for the Wan scheduler.
+def build_wan_scheduler(config: WorldModelConfig, scheduler_cls):
+	"""Load the Wan scheduler while preserving checkpoint-specific settings.
 
 	Args:
 		config: Root configuration object.
 		scheduler_cls: Imported diffusers scheduler class.
 
 	Returns:
-		The training-time number of diffusion timesteps.
+		A scheduler instance loaded from the Wan checkpoint when possible.
 	"""
-
-	if config.wan_renderer.train_scheduler_steps is not None:
-		return int(config.wan_renderer.train_scheduler_steps)
 
 	load_kwargs = {
 		"subfolder": "scheduler",
@@ -29,19 +26,28 @@ def resolve_train_scheduler_steps(config: WorldModelConfig, scheduler_cls) -> in
 	try:
 		if hasattr(scheduler_cls, "from_pretrained"):
 			scheduler = scheduler_cls.from_pretrained(config.wan_renderer.checkpoint_path, **load_kwargs)
-			return int(scheduler.config.num_train_timesteps)
-		if hasattr(scheduler_cls, "load_config"):
+		elif hasattr(scheduler_cls, "load_config"):
 			scheduler_config = scheduler_cls.load_config(config.wan_renderer.checkpoint_path, **load_kwargs)
-			return int(scheduler_config["num_train_timesteps"])
+			scheduler = scheduler_cls.from_config(scheduler_config)
+		else:
+			scheduler = scheduler_cls()
 	except Exception as error:
 		import warnings
 		warnings.warn(
-			f"Failed to infer Wan scheduler timesteps from {config.wan_renderer.checkpoint_path!r}: {error}. "
-			"Falling back to 1000 training steps.",
+			f"Failed to load Wan scheduler config from {config.wan_renderer.checkpoint_path!r}: {error}. "
+			"Falling back to the diffusers default scheduler.",
 			RuntimeWarning,
 		)
+		scheduler = scheduler_cls()
 
-	return 1000
+	if config.wan_renderer.train_scheduler_steps is None:
+		return scheduler
+
+	train_scheduler_steps = int(config.wan_renderer.train_scheduler_steps)
+	if int(scheduler.config.num_train_timesteps) == train_scheduler_steps:
+		return scheduler
+
+	return scheduler_cls.from_config(scheduler.config, num_train_timesteps=train_scheduler_steps)
 
 
 class DeepWorld(nn.Module):
@@ -64,8 +70,7 @@ class DeepWorld(nn.Module):
 			gradient_checkpointing=config.training.gradient_checkpointing,
 		)
 		_, FlowMatchEulerDiscreteScheduler, _ = load_diffusers_classes()
-		train_scheduler_steps = resolve_train_scheduler_steps(config, FlowMatchEulerDiscreteScheduler)
-		self.scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=train_scheduler_steps)
+		self.scheduler = build_wan_scheduler(config, FlowMatchEulerDiscreteScheduler)
 
 	def _build_loss_masks(self, frame_counts: Tensor, latents: Tensor) -> tuple[Tensor, Tensor]:
 		"""Create latent-space and token-space validity masks for padded batches.

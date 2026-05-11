@@ -48,9 +48,9 @@ class DatasetConfig:
 	webdataset_urls: List[str] | str = field(default_factory=list)
 	num_samples: int = 0
 	num_reference_images: int = 4
-	video_num_frames: int = 81
+	video_num_frames: int = 121
 	video_frame_stride: int = 1
-	video_height: int = 448 
+	video_height: int = 448
 	video_width: int = 448
 	vis_image_size: int = 448
 	geo_image_size: int | None = None
@@ -127,7 +127,8 @@ class TrainingConfig:
 	Attributes:
 		output_dir: Directory used for logs and checkpoints.
 		seed: Global random seed.
-		num_epochs: Number of training epochs.
+		max_total_epochs: Optional maximum number of epochs to train.
+		max_total_steps: Optional maximum number of optimizer steps to train.
 		per_device_batch_size: Batch size on each process/GPU.
 		renderer_batch_multiplier: Number of independent diffusion timesteps to train per encoded video.
 		gradient_accumulation_steps: Number of steps to accumulate before optimizer update.
@@ -140,11 +141,10 @@ class TrainingConfig:
 		pretrained_model_path: Optional path to a saved `model.pt` state dict to load before training.
 	"""
 
-	# TODO: Change `num_epochs` to `max_total_epochs`, then add a new config `max_total_steps`. Both are optional but at least one should be specified. The total steps corresponding to max_total_epochs is automatically inferred, then the actual total steps is the minimum of it and max_total_steps, so that the final training steps is no larger than both, and that's why they are have the prefix "max". Don't forget to update the yaml config file, whose `max_total_epochs` and `max_total_steps` are 30 and 1500 respectively.
-
 	output_dir: str = "outputs/world_model"
 	seed: int = 42
-	num_epochs: int = 10
+	max_total_epochs: int | None = 10
+	max_total_steps: int | None = None
 	per_device_batch_size: int = 1
 	renderer_batch_multiplier: int = 1
 	gradient_accumulation_steps: int = 1
@@ -157,11 +157,30 @@ class TrainingConfig:
 	pretrained_model_path: str | None = None
 
 	def __post_init__(self) -> None:
-		"""Validate training-loop settings that control checkpoint evaluation."""
+		"""Validate training-loop settings and bounded stopping criteria."""
 
+		if self.max_total_epochs is None and self.max_total_steps is None:
+			raise ValueError("At least one of `training.max_total_epochs` or `training.max_total_steps` must be set.")
+		if self.max_total_epochs is not None and self.max_total_epochs <= 0:
+			raise ValueError(
+				f"`training.max_total_epochs` must be positive when set, got {self.max_total_epochs}."
+			)
+		if self.max_total_steps is not None and self.max_total_steps <= 0:
+			raise ValueError(
+				f"`training.max_total_steps` must be positive when set, got {self.max_total_steps}."
+			)
+		if self.per_device_batch_size < 1:
+			raise ValueError(
+				f"`training.per_device_batch_size` must be at least 1, got {self.per_device_batch_size}."
+			)
 		if self.renderer_batch_multiplier < 1:
 			raise ValueError(
 				f"`training.renderer_batch_multiplier` must be at least 1, got {self.renderer_batch_multiplier}."
+			)
+		if self.gradient_accumulation_steps < 1:
+			raise ValueError(
+				"`training.gradient_accumulation_steps` must be at least 1, "
+				f"got {self.gradient_accumulation_steps}."
 			)
 		if self.eval_num_samples < 0:
 			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
@@ -215,29 +234,42 @@ class WanRendererConfig:
 		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
 		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
 		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
+		condition_injection_mode: How Qwen states condition Wan, either `residual` or `cross_attention`.
 		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero`, `normal`, or `default`.
 		condition_proj_init_std: Optional standard deviation used when `condition_proj_init=normal`. If omitted, defaults to `1e-3`.
 		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
+		expand_timesteps: Whether to provide per-token timesteps, matching Wan2.2 TI2V pipeline behavior.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
 			inferred from the checkpoint scheduler config when available.
 		inference_steps: Default number of denoising steps during sampling.
 	"""
 
-	checkpoint_path: str = "checkpoints/Wan2.1-T2V-1.3B-Diffusers"
+	checkpoint_path: str = "checkpoints/Wan2.2-TI2V-5B-Diffusers"
 	transformer_dtype: str | None = "bfloat16"
 	vae_dtype: str | None = None
 	vae_enable_slicing: bool = False
 	vae_enable_tiling: bool = False
 	vae_sample_posterior: bool = False
+	# TODO: Change name "residual" to "input_addition"
+	condition_injection_mode: str = "residual"
 	condition_proj_init: str = "zero"
 	condition_proj_init_std: float | None = None
 	condition_dropout_prob: float = 0.1
+	expand_timesteps: bool = True
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
 
 	def __post_init__(self) -> None:
 		"""Validate Wan renderer training and initialization settings."""
 
+		self.condition_injection_mode = self.condition_injection_mode.lower().replace("-", "_")
+		if self.condition_injection_mode == "cross_attn":
+			self.condition_injection_mode = "cross_attention"
+		if self.condition_injection_mode not in {"residual", "cross_attention"}:
+			raise ValueError(
+				"`wan_renderer.condition_injection_mode` must be `residual` or `cross_attention`, "
+				f"got {self.condition_injection_mode!r}."
+			)
 		self.condition_proj_init = self.condition_proj_init.lower()
 		if self.condition_proj_init not in {"zero", "normal", "default"}:
 			raise ValueError(

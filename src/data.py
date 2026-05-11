@@ -16,10 +16,11 @@ from src.utils.video import (
 	decode_video_frames,
 	load_image,
 	load_video_frames,
-	load_video_frames_from_raw_frames,
 	pil_to_tensor,
 	resize_image,
 	sample_reference_images,
+	sample_video_frames_from_raw_frames,
+	video_frames_to_tensor,
 )
 
 
@@ -290,19 +291,21 @@ class WebDatasetVideoCaptionDataset(IterableDataset):
 
 		metadata = self._parse_metadata(sample["json"])
 		raw_frames = decode_video_frames(sample["mp4"])
-		# TODO: Reference images should be sampled from the sampled frames.
-		reference_images = sample_reference_images(
+		sampled_frames = sample_video_frames_from_raw_frames(
 			raw_frames,
+			num_frames=self.config.video_num_frames,
+			frame_sampling="uniform",
+		)
+		reference_images = sample_reference_images(
+			sampled_frames,
 			num_reference_images=self.config.num_reference_images,
 			random_selection=True,
 			preserve_order=False,
 		)
-		video = load_video_frames_from_raw_frames(
-			raw_frames,
-			num_frames=self.config.video_num_frames,
+		video = video_frames_to_tensor(
+			sampled_frames,
 			height=self.config.video_height,
 			width=self.config.video_width,
-			frame_sampling="uniform",
 		)
 		return WorldModelSample(
 			sample_id=str(sample.get("__key__", metadata.get("id", ""))),

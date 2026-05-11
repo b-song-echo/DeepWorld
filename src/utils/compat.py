@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 
+# TODO: Put this function to utils/__init__.py because it is not a compatability related function
 def resolve_torch_dtype(name: str | None) -> torch.dtype | None:
 	"""Convert a user-facing dtype string into a `torch.dtype`.
 
@@ -36,6 +37,7 @@ def resolve_torch_dtype(name: str | None) -> torch.dtype | None:
 	return table[key]
 
 
+# TODO: Put this function directly in train.py
 def get_world_size() -> int:
 	"""Return the active distributed world size.
 
@@ -52,6 +54,7 @@ def get_world_size() -> int:
 	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
+# TODO: There is no need for this check. VGGT directory is always there is directly importable. Get rid of these function.
 def ensure_local_vggt_importable(repo_root: str | Path | None = None, local_source_dir: str = "vggt-main") -> None:
 	"""Add the local VGGT source tree to `sys.path` if it exists.
 
@@ -65,6 +68,7 @@ def ensure_local_vggt_importable(repo_root: str | Path | None = None, local_sour
 		sys.path.insert(0, str(source_dir))
 
 
+# TODO: Just get rid of this check, I won't run this program on this local Mac, instead, I will run it on a linux server with CUDA support.
 def _patch_legacy_urllib3_namespace() -> None:
 	"""Install a small runtime shim for older `urllib3.packages.*` imports.
 
@@ -101,6 +105,18 @@ def _patch_legacy_urllib3_namespace() -> None:
 			sys.modules[f"urllib3.packages.six.moves.{name}"] = target
 			setattr(moves_pkg, name, target)
 
+	urllib_pkg = getattr(six.moves, "urllib", None)
+	if urllib_pkg is not None:
+		sys.modules["urllib3.packages.six.moves.urllib"] = urllib_pkg
+		setattr(moves_pkg, "urllib", urllib_pkg)
+		for submodule_name in ["parse", "error", "request", "robotparser"]:
+			target = getattr(urllib_pkg, submodule_name, None)
+			if target is None:
+				target = getattr(six.moves, f"urllib_{submodule_name}", None)
+			if target is None:
+				continue
+			sys.modules[f"urllib3.packages.six.moves.urllib.{submodule_name}"] = target
+
 	try:
 		import ssl_match_hostname
 
@@ -109,6 +125,47 @@ def _patch_legacy_urllib3_namespace() -> None:
 		pass
 
 
+# TODO: Just get rid of this check, I won't run this program on this local Mac, instead, I will run it on a linux server with CUDA support.
+def _patch_transformers_hybrid_cache() -> None:
+	"""Expose a minimal `HybridCache` symbol for PEFT/diffusers version skew.
+
+	The local macOS environment can pair a PEFT build that imports
+	`transformers.HybridCache` with a Transformers build that no longer exports
+	that symbol. DeepWorld does not use PEFT prompt-tuning caches, but diffusers
+	imports PEFT mixins while loading Wan classes. Providing the symbol keeps that
+	import path usable without affecting the project's own cache behavior.
+	"""
+
+	try:
+		import transformers
+	except Exception:
+		return
+
+	if hasattr(transformers, "HybridCache") or not hasattr(transformers, "DynamicCache"):
+		return
+
+	class HybridCache(transformers.DynamicCache):
+		"""Compatibility cache shim used only when PEFT imports require the name."""
+
+		def __init__(
+			self,
+			config=None,
+			max_batch_size=None,
+			max_cache_len=None,
+			dtype=None,
+			device=None,
+			**kwargs,
+		):
+			super().__init__(config=config)
+			self.max_batch_size = max_batch_size
+			self.max_cache_len = max_cache_len
+			self.dtype = dtype
+			self.device = device
+
+	transformers.HybridCache = HybridCache
+
+
+# TODO: This is unnecessary, I'll run this program on a CUDA environment with diffusers or transformers properly installed and no compatability issues. Remove this check.
 def load_diffusers_classes():
 	"""Import the Wan diffusers classes used by the prototype.
 
@@ -127,17 +184,19 @@ def load_diffusers_classes():
 		return AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
 	except Exception as first_error:
 		_patch_legacy_urllib3_namespace()
+		_patch_transformers_hybrid_cache()
 		try:
 			from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
 
 			return AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
 		except Exception as second_error:
 			raise RuntimeError(
-				"Failed to import diffusers Wan classes. The current environment appears to have a broken "
-				"`requests`/`urllib3` stack. Fix the environment or install a clean diffusers runtime before training."
+				"Failed to import diffusers Wan classes after applying local compatibility shims. "
+				"Fix the Hugging Face package versions or install a clean diffusers runtime before training."
 			) from second_error
 
 
+# TODO: there is no need for this safety check. I won't run it on this Mac, so the errors you see are not real issues. Just ignore them.
 def load_transformers_module(module_path: str):
 	"""Import a transformers submodule by string path.
 

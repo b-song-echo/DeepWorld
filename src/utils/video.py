@@ -11,6 +11,8 @@ from torch import Tensor
 from torch.nn import functional as F
 
 
+# TODO: Currently, these data loading utilities are a bit messy, please refactor them, make the code cleaner and clearer, remove redundant logic and unused functions. If necessary, update their references as well.
+
 def load_image(path: str | Path) -> Image.Image:
 	"""Load an RGB image from disk.
 
@@ -296,6 +298,60 @@ def sample_video_frame_indices(
 	raise ValueError(f"Unsupported frame sampling strategy: {frame_sampling!r}.")
 
 
+def sample_video_frames_from_raw_frames(
+	raw_frames: list[Image.Image],
+	num_frames: int,
+	*,
+	stride: int | None = None,
+	random_clip: bool | None = None,
+	frame_sampling: str = "clip",
+) -> list[Image.Image]:
+	"""Select and temporally align frames from an already decoded video.
+
+	Args:
+		raw_frames: Decoded RGB frames from the source video.
+		num_frames: Requested number of output frames before Wan temporal alignment.
+		stride: Optional temporal stride used by the `clip` strategy. Defaults to `1`.
+		random_clip: Optional `clip` strategy flag controlling whether to randomize the window start. Defaults to `True`.
+		frame_sampling: Sampling strategy, either `clip` or `uniform`.
+
+	Returns:
+		An ordered frame list after Wan-compatible temporal alignment.
+	"""
+
+	if len(raw_frames) == 0:
+		raise ValueError("Cannot sample frames from an empty frame list.")
+
+	indices = sample_video_frame_indices(
+		len(raw_frames),
+		num_frames,
+		stride=stride,
+		random_clip=random_clip,
+		frame_sampling=frame_sampling,
+	)
+	frames = [raw_frames[index] for index in indices]
+	return align_frame_count(frames)
+
+
+def video_frames_to_tensor(frames: list[Image.Image], height: int, width: int) -> Tensor:
+	"""Convert an ordered RGB frame list into the normalized training tensor.
+
+	Args:
+		frames: Selected RGB frames.
+		height: Output frame height.
+		width: Output frame width.
+
+	Returns:
+		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
+	"""
+
+	if len(frames) == 0:
+		raise ValueError("Cannot build a video tensor from an empty frame list.")
+
+	frame_tensors = [prepare_image_tensor(frame, height, width, normalize_to_neg_one=True) for frame in frames]
+	return torch.stack(frame_tensors, dim=0)
+
+
 def load_video_frames(
 	path: str | Path,
 	num_frames: int,
@@ -321,18 +377,14 @@ def load_video_frames(
 		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
 	"""
 
-	raw_frames = decode_video_frames(path)
-	indices = sample_video_frame_indices(
-		len(raw_frames),
+	frames = sample_video_frames_from_raw_frames(
+		decode_video_frames(path),
 		num_frames,
 		stride=stride,
 		random_clip=random_clip,
 		frame_sampling=frame_sampling,
 	)
-	frames = [raw_frames[index] for index in indices]
-	frames = align_frame_count(frames)
-	frame_tensors = [prepare_image_tensor(frame, height, width, normalize_to_neg_one=True) for frame in frames]
-	return torch.stack(frame_tensors, dim=0)
+	return video_frames_to_tensor(frames, height, width)
 
 
 def load_video_frames_from_raw_frames(
@@ -360,20 +412,14 @@ def load_video_frames_from_raw_frames(
 		A tensor with shape `(T, 3, H, W)` normalized to `[-1, 1]`.
 	"""
 
-	if len(raw_frames) == 0:
-		raise ValueError("Cannot build a training clip from an empty frame list.")
-
-	indices = sample_video_frame_indices(
-		len(raw_frames),
+	frames = sample_video_frames_from_raw_frames(
+		raw_frames,
 		num_frames,
 		stride=stride,
 		random_clip=random_clip,
 		frame_sampling=frame_sampling,
 	)
-	frames = [raw_frames[index] for index in indices]
-	frames = align_frame_count(frames)
-	frame_tensors = [prepare_image_tensor(frame, height, width, normalize_to_neg_one=True) for frame in frames]
-	return torch.stack(frame_tensors, dim=0)
+	return video_frames_to_tensor(frames, height, width)
 
 
 def resize_tensor_image(image: Tensor, height: int, width: int) -> Tensor:
