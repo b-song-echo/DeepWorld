@@ -1,10 +1,11 @@
 from einops import rearrange
 import torch
 import torch.nn as nn
+from diffusers import AutoencoderKLWan, WanTransformer3DModel
 from torch import Tensor
 
 from src.config import WanRendererConfig
-from src.utils import resolve_torch_dtype, load_diffusers_classes
+from src.utils import resolve_torch_dtype
 
 
 class WanRenderer(nn.Module):
@@ -23,7 +24,6 @@ class WanRenderer(nn.Module):
 
 	def __init__(self, wan_config: WanRendererConfig, condition_dim: int, gradient_checkpointing: bool = True):
 		super().__init__()
-		AutoencoderKLWan, _, WanTransformer3DModel = load_diffusers_classes()
 		transformer_load_kwargs = {
 			"subfolder": "transformer",
 			"local_files_only": True,
@@ -58,7 +58,7 @@ class WanRenderer(nn.Module):
 		
 		if self.condition_injection_mode == "input_addition":
 			condition_projection_dim = self.inner_dim
-		if self.condition_injection_mode == "cross_attention":
+		elif self.condition_injection_mode == "cross_attention":
 			condition_projection_dim = int(self.transformer.config.text_dim)
 		else:
 			raise ValueError(f"Unsupported Wan conditioning mode: {self.condition_injection_mode!r}.")
@@ -332,14 +332,6 @@ class WanRenderer(nn.Module):
 			return timestep.expand(batch_size, num_tokens)
 		return timestep
 
-	# TODO: There is really no need for a standalone function. This can be achieved with a single line of code, and you put this in a method, absurd.
-	def _api_timestep(self, token_timestep: Tensor) -> Tensor:
-		"""Adapt normalized token timesteps to the configured Wan API shape."""
-
-		if self.expand_timesteps:
-			return token_timestep
-		return token_timestep[:, 0]
-
 	def _forward_cross_attention(
 		self,
 		hidden_states: Tensor,
@@ -363,7 +355,7 @@ class WanRenderer(nn.Module):
 		)
 		output = self.transformer(
 			hidden_states=hidden_states.to(dtype=dtype),
-			timestep=self._api_timestep(timestep),
+			timestep=timestep if self.expand_timesteps else timestep[:, 0],
 			encoder_hidden_states=encoder_hidden_states,
 			return_dict=False,
 		)[0]

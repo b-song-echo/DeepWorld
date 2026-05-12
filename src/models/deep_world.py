@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
+from diffusers import FlowMatchEulerDiscreteScheduler
 from torch import Tensor
 
 from src.config import WorldModelConfig
 from src.models.qwen_brain import QwenBrain
 from src.models.wan_renderer import WanRenderer
-from src.utils import load_diffusers_classes
 
 
 def build_wan_scheduler(config: WorldModelConfig, scheduler_cls):
@@ -69,7 +69,6 @@ class DeepWorld(nn.Module):
 			condition_dim=self.brain.hidden_size,
 			gradient_checkpointing=config.training.gradient_checkpointing,
 		)
-		_, FlowMatchEulerDiscreteScheduler, _ = load_diffusers_classes()
 		self.scheduler = build_wan_scheduler(config, FlowMatchEulerDiscreteScheduler)
 
 	def _build_loss_masks(self, frame_counts: Tensor, latents: Tensor) -> tuple[Tensor, Tensor]:

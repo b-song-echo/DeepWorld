@@ -1,19 +1,20 @@
+import os
+
 import torch
 
 from src.utils.video import center_crop_and_resize, load_image, load_video_frames
 
 
-# TODO: There is really no need for this function, it basically does nothing, why do you even do this... Just import them at the top of a file the way you do with transformers, OK? Again, for the entire implementation, get rid of those redundant checks and functions, and keep the code nice and clean, OK? 
-def load_diffusers_classes():
-	"""Import the Wan diffusers classes used by the prototype.
+def get_world_size() -> int:
+	"""Return the active distributed world size.
 
 	Returns:
-		A tuple of `(AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel)`.
+		The distributed world size, or `1` for single-process execution.
 	"""
 
-	from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
-
-	return AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
+	if torch.distributed.is_available() and torch.distributed.is_initialized():
+		return max(int(torch.distributed.get_world_size()), 1)
+	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
 def resolve_torch_dtype(name: str | None) -> torch.dtype | None:
@@ -45,7 +46,7 @@ def resolve_torch_dtype(name: str | None) -> torch.dtype | None:
 
 __all__ = [
 	"center_crop_and_resize",
-	"load_diffusers_classes",
+	"get_world_size",
 	"load_image",
 	"load_video_frames",
 	"resolve_torch_dtype",

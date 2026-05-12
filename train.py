@@ -20,19 +20,11 @@ from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_c
 from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
+from src.utils import get_world_size
 from src.utils.video import save_image_tensor, save_video_tensor
 
 
 VIDEO_DURATION_SECONDS = 10.0
-
-
-# TODO: This function should belong to utils/__init__.py, and used across the entire implementation.
-def get_world_size() -> int:
-	"""Return the active distributed world size for runtime setup."""
-
-	if torch.distributed.is_available() and torch.distributed.is_initialized():
-		return max(int(torch.distributed.get_world_size()), 1)
-	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -810,12 +802,9 @@ def main() -> None:
 		steps_per_epoch * config.training.max_total_epochs
 		if config.training.max_total_epochs is not None else config.training.max_total_steps
 	)
-	# TODO: This can simply be written as `config.training.max_total_steps or max_epoch_steps`, which improves readability significantly. Check the entire implementation for similar cases that evaluate an optional value with a default, change them to this python `or` expression. Besides, this name `max_step_steps` is weird.
-	max_step_steps = (
-		config.training.max_total_steps
-		if config.training.max_total_steps is not None else max_epoch_steps
-	)
-	total_training_steps = min(max_epoch_steps, max_step_steps)
+	max_total_steps = config.training.max_total_steps or max_epoch_steps
+	total_training_steps = min(max_epoch_steps, max_total_steps)
+	
 	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)
 	progress_bar = tqdm(
 		total=total_training_steps,
