@@ -8,6 +8,7 @@ from src.config import WanRendererConfig
 from src.utils import resolve_torch_dtype
 
 
+# TODO: Please make sure that this WanRenderer 1) can handle both Wan2.1-T2V-1.3B and Wan2.2-TI2V-5B as backbones especially in terms of timesteps, and 2) can correctly remove/freeze/unfreeze parameters as intended depending on the condition injection mode. If the current implementation is correct, then do nothing and simply remove this comment; if not, please then fix it.
 class WanRenderer(nn.Module):
 	"""Wan VAE and transformer wrapper conditioned by Qwen generation states.
 

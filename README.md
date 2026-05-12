@@ -21,3 +21,6 @@ Data loading crashes due to system out of shared shm memory, even though `batch_
 - The error goes away if `num_workers` is 0, but this slows down data loading significatly, and is really not feasible.
 - The error goes away by setting `prefetch_factor` to 1, which defaults to 2 when `num_workers > 0`. This is the current solution.
 This must some way to prevent this, otherwise, larger batch size becomes an issue.
+
+
+Chat template and special tokens are not used at the moment, which diviates from Qwen-VL standards, and probably JoyAI-Image-Und as well.
