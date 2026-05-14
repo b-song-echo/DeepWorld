@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
+# TODO: There is no need to put this in a separate function, simply do this in `configure_fsdp_model` function.
 def align_fsdp_managed_dtypes(model: DeepWorld) -> None:
 	"""Align non-ignored module dtypes for FSDP flattening.
 
@@ -176,6 +177,7 @@ def load_pretrained_model_state(
 	accelerator.wait_for_everyone()
 
 
+# TODO: Put the following three helper functions inside `log_param_summary` function. This keeps the training script well structured and clean.
 def _count_params(mod: nn.Module, trainable_only: bool = False) -> tuple[int, int]:
 	"""Return parameter count and byte size for one module tree."""
 
@@ -234,6 +236,7 @@ def log_param_summary(accelerator: Accelerator, model: DeepWorld) -> None:
 		)
 
 
+# TODO: There is no need for this function, get rid of it.
 def log_runtime_setup(accelerator: Accelerator, model: nn.Module) -> None:
 	"""Log the prepared distributed runtime and whether FSDP wrapping is active."""
 
@@ -330,6 +333,7 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
+# TODO: There is no need to this redundant check.
 def _validate_optimizer_groups(model: DeepWorld, grouped_params: list[nn.Parameter]) -> None:
 	"""Ensure optimizer grouping covers each trainable parameter exactly once.
 
@@ -402,6 +406,7 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 	renderer_transformer_params = train_params(model.renderer.transformer)
 	renderer_others_params = train_params_except(model.renderer, renderer_transformer_params)
 
+	# TODO: Here, instead of checking that all groups cover all params, create a new list for the rest params in model, which is usually empty. Upon adding this group, use the default learning rate. The add_optimizer_group function will automatically ignore this if the list is empty.
 	_validate_optimizer_groups(model, grouped_params=(
 		brain_language_model_params
 		+ brain_others_params
@@ -409,6 +414,7 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 		+ renderer_others_params
 	))
 
+	# TODO: Because now the learning rates can be null, you should use the `or`	expression like this `config.optimizer.brain_language_model_learning_rate or config.optimizer.learning_rate`.
 	param_groups: list[dict] = []
 	add_optimizer_group(
 		param_groups, "brain_language_model",
@@ -532,41 +538,7 @@ def build_eval_dataloader(
 	)
 
 
-def create_checkpoint_dir(accelerator: Accelerator, step: int, output_dir: Path) -> Path:
-	"""Create and synchronize one checkpoint directory before all ranks use it.
-
-	Args:
-		accelerator: Active Accelerate runtime.
-		step: Global optimizer step used in the checkpoint name.
-		output_dir: Root directory where checkpoints should be written.
-
-	Returns:
-		The synchronized checkpoint directory path.
-	"""
-
-	checkpoint_dir = output_dir / f"checkpoint-{step}"
-	if accelerator.is_main_process:
-		checkpoint_dir.mkdir(parents=True, exist_ok=True)
-	accelerator.wait_for_everyone()
-	return checkpoint_dir
-
-
-def make_eval_generator(device: torch.device, seed: int) -> torch.Generator:
-	"""Create a deterministic random generator on the active model device.
-
-	Args:
-		device: Device where random latents will be sampled.
-		seed: Deterministic seed for the sample.
-
-	Returns:
-		A seeded torch random generator.
-	"""
-
-	generator = torch.Generator(device=device)
-	generator.manual_seed(seed)
-	return generator
-
-
+# TODO: Make this a helper function inside the evaluation function, rather than placing it at the top level.
 def save_eval_sample_bundle(
 	batch: dict,
 	generated_video: Tensor,
@@ -601,6 +573,7 @@ def save_eval_sample_bundle(
 		save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
 
 
+# TODO: Rename this function to `evaluate`.
 def generate_checkpoint_samples(
 	accelerator: Accelerator,
 	model: nn.Module,
@@ -633,10 +606,9 @@ def generate_checkpoint_samples(
 				break
 
 			global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
-			generator = make_eval_generator(
-				accelerator.device,
-				config.training.seed + step * 1000003 + global_eval_index,
-			)
+			generator = torch.Generator(device=accelerator.device)
+			generator = generator.manual_seed(config.training.seed + step * 1000003 + global_eval_index)
+			
 			with torch.no_grad():
 				with accelerator.autocast():
 					outputs = model(batch, generate_samples=True, generator=generator)
@@ -671,24 +643,6 @@ def generate_checkpoint_samples(
 		)
 
 
-def save_checkpoint(accelerator: Accelerator, model: nn.Module, checkpoint_dir: Path) -> None:
-	"""Save one model checkpoint on the main process.
-
-	Args:
-		accelerator: Active Accelerate runtime.
-		model: Prepared model instance to serialize.
-		checkpoint_dir: Directory where `model.pt` should be written.
-	"""
-
-	# NOTE: accelerator.get_state_dict must be called on every processes, or the program will hang because the main process is indefinitely waiting for others.
-	accelerator.wait_for_everyone()
-	state_dict = accelerator.get_state_dict(model)
-	if accelerator.is_main_process:
-		checkpoint_dir.mkdir(parents=True, exist_ok=True)
-		torch.save(state_dict, checkpoint_dir / "model.pt")
-	accelerator.wait_for_everyone()
-
-
 def save_checkpoint_with_evaluation(
 	accelerator: Accelerator,
 	model: nn.Module,
@@ -708,9 +662,21 @@ def save_checkpoint_with_evaluation(
 		output_dir: Root directory where checkpoints should be written.
 	"""
 
-	checkpoint_dir = create_checkpoint_dir(accelerator, step, output_dir)
+	checkpoint_dir = output_dir / f"checkpoint-{step}"
+	if accelerator.is_main_process:
+		checkpoint_dir.mkdir(parents=True, exist_ok=True)
+	accelerator.wait_for_everyone()
+	
 	generate_checkpoint_samples(accelerator, model, eval_dataloader, config, step, checkpoint_dir)
-	save_checkpoint(accelerator, model, checkpoint_dir)
+	
+	# NOTE: accelerator.get_state_dict must be called on every processes, or the program will hang because the main process is indefinitely waiting for others.
+	# TODO: Optimize saving logic. Try to use accelerator to save to and load from sharded safentors. Keep full state dict for portability, use CPU offload and main-process-only for efficiency.
+	accelerator.wait_for_everyone()
+	state_dict = accelerator.get_state_dict(model)
+	if accelerator.is_main_process:
+		checkpoint_dir.mkdir(parents=True, exist_ok=True)
+		torch.save(state_dict, checkpoint_dir / "model.pt")
+	accelerator.wait_for_everyone()
 
 
 def set_preliminaries() -> None:

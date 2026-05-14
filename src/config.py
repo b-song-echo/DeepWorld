@@ -95,6 +95,7 @@ class OptimizerConfig:
 	def __post_init__(self) -> None:
 		"""Validate optimizer schedule settings."""
 
+		# TODO: Here, you do not re-assign values, you should do this when acreating the parameter groups. Leave the module specific lrs as optionally null.
 		if self.brain_language_model_learning_rate is None:
 			self.brain_language_model_learning_rate = self.learning_rate
 		if self.brain_others_learning_rate is None:
@@ -103,17 +104,6 @@ class OptimizerConfig:
 			self.renderer_transformer_learning_rate = self.learning_rate
 		if self.renderer_others_learning_rate is None:
 			self.renderer_others_learning_rate = self.renderer_transformer_learning_rate
-
-		for name in (
-			"learning_rate",
-			"brain_language_model_learning_rate",
-			"brain_others_learning_rate",
-			"renderer_transformer_learning_rate",
-			"renderer_others_learning_rate",
-		):
-			value = getattr(self, name)
-			if value <= 0:
-				raise ValueError(f"`optimizer.{name}` must be positive, got {value}.")
 
 		self.lr_schedule = self.lr_schedule.lower()
 		if self.lr_schedule not in {"cosine", "constant"}:
@@ -261,9 +251,7 @@ class WanRendererConfig:
 	def __post_init__(self) -> None:
 		"""Validate Wan renderer training and initialization settings."""
 
-		self.condition_injection_mode = self.condition_injection_mode.lower().replace("-", "_")
-		if self.condition_injection_mode == "cross_attn":
-			self.condition_injection_mode = "cross_attention"
+		self.condition_injection_mode = self.condition_injection_mode.lower()
 		if self.condition_injection_mode not in {"input_addition", "cross_attention"}:
 			raise ValueError(
 				"`wan_renderer.condition_injection_mode` must be `input_addition` or `cross_attention`, "
