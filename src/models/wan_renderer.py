@@ -111,8 +111,8 @@ class WanRenderer(nn.Module):
 		else:
 			raise ValueError(f"Unsupported condition projection init: {wan_config.condition_proj_init!r}.")
 
-	def _freeze_transformer_except_cross_attention(self) -> None:
-		"""Freeze Wan weights except the text and cross-attention conditioning path."""
+	def _freeze_all_except_text_conditioning(self) -> None:
+		"""Freeze all modules except text-conditioning."""
 
 		self.transformer.requires_grad_(False)
 		text_embedder = getattr(self.transformer.condition_embedder, "text_embedder", None)
@@ -129,7 +129,7 @@ class WanRenderer(nn.Module):
 				block.norm2.requires_grad_(True)
 
 	def _remove_text_conditioning_modules(self) -> None:
-		"""Delete cross-attention and text-conditioning modules that this wrapper never uses."""
+		"""Delete text-conditioning modules that this wrapper never uses."""
 
 		for block in self.transformer.blocks:
 			if not hasattr(block, "attn2") or not hasattr(block, "norm2"):
@@ -233,6 +233,7 @@ class WanRenderer(nn.Module):
 		if timestep_features.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
 			timestep_features = timestep_features.to(time_embedder_dtype)
 		timestep_features = timestep_features.to(device=device)
+		
 		temb = condition_embedder.time_embedder(timestep_features).to(dtype=dtype)
 		timestep_proj = condition_embedder.time_proj(condition_embedder.act_fn(temb)).to(dtype=dtype)
 		timestep_proj = timestep_proj.unflatten(2, (6, -1))
@@ -330,28 +331,16 @@ class WanRenderer(nn.Module):
 		if timestep.dim() == 0:
 			return timestep.view(1, 1).expand(batch_size, 1)
 		if timestep.dim() == 1:
-			if timestep.size(0) == 1 and batch_size != 1:
-				return timestep.view(1, 1).expand(batch_size, 1)
-			if timestep.size(0) != batch_size:
-				raise ValueError(
-					"Per-sample timesteps must have one value per batch item; "
-					f"got timestep={tuple(timestep.size())}, batch_size={batch_size}."
-				)
-			return timestep.unsqueeze(1)
+			return timestep.view(-1, 1)
 		if timestep.dim() != 2:
 			raise ValueError(f"`timestep` must be scalar, 1D, or 2D, got shape {tuple(timestep.size())}.")
-		if timestep.size(0) == 1 and batch_size != 1:
-			timestep = timestep.expand(batch_size, timestep.size(1))
-		if timestep.size(0) != batch_size:
-			raise ValueError(
-				"Timestep batch dimension must match hidden states; "
-				f"got timestep={tuple(timestep.size())}, batch_size={batch_size}."
-			)
 		if timestep.size(1) not in {1, num_tokens}:
 			raise ValueError(
-				"Timestep sequence length must be 1 for uniform per-sample schedules or match Wan patch tokens; "
+				"Timestep sequence length must be 1 or match Wan patch tokens; "
 				f"got timestep={tuple(timestep.size())}, num_tokens={num_tokens}."
 			)
+		if timestep.size(0) == 1 and batch_size != 1:
+			return timestep.expand(batch_size, timestep.size(1))
 		return timestep
 
 	def _forward_cross_attention(
@@ -375,7 +364,7 @@ class WanRenderer(nn.Module):
 			device=device,
 			dtype=dtype,
 		)
-		
+
 		output = self.transformer(
 			hidden_states=hidden_states.to(dtype=dtype),
 			timestep=timestep[:, 0] if timestep.size(1) == 1 else timestep,
@@ -470,10 +459,13 @@ class WanRenderer(nn.Module):
 				token_mask=token_mask,
 				return_dict=return_dict,
 			)
-		return self._forward_input_addition(
-			hidden_states=hidden_states,
-			timestep=timestep,
-			condition_hidden_states=condition_hidden_states,
-			token_mask=token_mask,
-			return_dict=return_dict,
-		)
+		elif self.condition_injection_mode == "input_addition":
+			return self._forward_input_addition(
+				hidden_states=hidden_states,
+				timestep=timestep,
+				condition_hidden_states=condition_hidden_states,
+				token_mask=token_mask,
+				return_dict=return_dict,
+			)
+		else:
+			raise ValueError(f"Unsupported Wan conditioning mode: {self.condition_injection_mode!r}.")
