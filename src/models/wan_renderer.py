@@ -8,7 +8,6 @@ from src.config import WanRendererConfig
 from src.utils import resolve_torch_dtype
 
 
-# TODO: Please make sure that this WanRenderer 1) can handle both Wan2.1-T2V-1.3B and Wan2.2-TI2V-5B as backbones especially in terms of timesteps, and 2) can correctly remove/freeze/unfreeze parameters as intended depending on the condition injection mode. If the current implementation is correct, then do nothing and simply remove this comment; if not, please then fix it.
 class WanRenderer(nn.Module):
 	"""Wan VAE and transformer wrapper conditioned by Qwen generation states.
 
@@ -68,7 +67,6 @@ class WanRenderer(nn.Module):
 		self.null_cond = nn.Parameter(torch.zeros(1, 1, condition_projection_dim, dtype=trainable_dtype))
 		self._initialize_conditioning_parameters(wan_config)
 		nn.init.normal_(self.null_cond, std=0.02)
-		self.expand_timesteps = wan_config.expand_timesteps
 
 		if self.condition_injection_mode == "input_addition":
 			self._remove_text_conditioning_modules()
@@ -114,9 +112,13 @@ class WanRenderer(nn.Module):
 			raise ValueError(f"Unsupported condition projection init: {wan_config.condition_proj_init!r}.")
 
 	def _freeze_transformer_except_cross_attention(self) -> None:
-		"""Freeze Wan weights except the cross-attention branch used for conditioning."""
+		"""Freeze Wan weights except the text and cross-attention conditioning path."""
 
 		self.transformer.requires_grad_(False)
+		text_embedder = getattr(self.transformer.condition_embedder, "text_embedder", None)
+		if not isinstance(text_embedder, nn.Module):
+			raise RuntimeError("The loaded Wan condition embedder no longer exposes `text_embedder`; update freezing logic.")
+		text_embedder.requires_grad_(True)
 		for block in self.transformer.blocks:
 			if not hasattr(block, "attn2") or not hasattr(block, "norm2"):
 				raise RuntimeError("The loaded Wan block no longer exposes `attn2`/`norm2`; update freezing logic.")
@@ -211,14 +213,14 @@ class WanRenderer(nn.Module):
 		"""Compute Wan time embeddings from per-sample or per-token timesteps.
 
 		Args:
-			timestep: Current diffusion timestep for each sample.
+			timestep: Current diffusion timestep for each sample or each patch token.
 			dtype: Target dtype for the returned tensors.
 			device: Target device.
 
 		Returns:
 			A tuple of:
 			- `temb`, the base time embedding,
-			- `timestep_proj`, the AdaLN modulation parameters reshaped as `(B, 6, D)` or `(B, N, 6, D)`.
+			- `timestep_proj`, the AdaLN modulation parameters reshaped as `(B, N, 6, D)`.
 		"""
 
 		condition_embedder = self.transformer.condition_embedder
@@ -310,27 +312,46 @@ class WanRenderer(nn.Module):
 		hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 		return hidden_states
 
-	def _prepare_token_timestep(
+	def _normalize_timestep(
 		self,
 		timestep: Tensor,
 		batch_size: int,
 		num_tokens: int,
 		device: torch.device,
 	) -> Tensor:
-		"""Return per-token timesteps for a Wan patch-token sequence.
+		"""Return timesteps in the 2D shape expected by Wan's per-token path.
 
-		Inputs may be scalar, per-sample `(B,)`, or already per-token `(B, N)`.
-		The renderer normalizes them to `(B, N)` internally, then squeezes back to
-		`(B,)` only when calling APIs configured for per-sample timesteps.
+		Scalar and per-sample timesteps become `(B, 1)`, which broadcasts across
+		patch tokens without materializing `(B, N)`. Real per-token timesteps keep
+		their `(B, N)` shape.
 		"""
 
 		timestep = timestep.to(device=device)
 		if timestep.dim() == 0:
-			return timestep.view(1, 1).expand(batch_size, num_tokens)
+			return timestep.view(1, 1).expand(batch_size, 1)
 		if timestep.dim() == 1:
-			return timestep.unsqueeze(1).expand(batch_size, num_tokens)
-		if timestep.size(1) == 1:
-			return timestep.expand(batch_size, num_tokens)
+			if timestep.size(0) == 1 and batch_size != 1:
+				return timestep.view(1, 1).expand(batch_size, 1)
+			if timestep.size(0) != batch_size:
+				raise ValueError(
+					"Per-sample timesteps must have one value per batch item; "
+					f"got timestep={tuple(timestep.size())}, batch_size={batch_size}."
+				)
+			return timestep.unsqueeze(1)
+		if timestep.dim() != 2:
+			raise ValueError(f"`timestep` must be scalar, 1D, or 2D, got shape {tuple(timestep.size())}.")
+		if timestep.size(0) == 1 and batch_size != 1:
+			timestep = timestep.expand(batch_size, timestep.size(1))
+		if timestep.size(0) != batch_size:
+			raise ValueError(
+				"Timestep batch dimension must match hidden states; "
+				f"got timestep={tuple(timestep.size())}, batch_size={batch_size}."
+			)
+		if timestep.size(1) not in {1, num_tokens}:
+			raise ValueError(
+				"Timestep sequence length must be 1 for uniform per-sample schedules or match Wan patch tokens; "
+				f"got timestep={tuple(timestep.size())}, num_tokens={num_tokens}."
+			)
 		return timestep
 
 	def _forward_cross_attention(
@@ -347,16 +368,17 @@ class WanRenderer(nn.Module):
 		device = hidden_states.device
 		grid_t, grid_h, grid_w = self._latent_patch_grid_tuple(hidden_states)
 		num_tokens = grid_t * grid_h * grid_w
-		timestep = self._prepare_token_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		timestep = self._normalize_timestep(timestep, hidden_states.size(0), num_tokens, device)
 		encoder_hidden_states = self._project_conditioning(
 			condition_hidden_states,
 			token_mask,
 			device=device,
 			dtype=dtype,
 		)
+		
 		output = self.transformer(
 			hidden_states=hidden_states.to(dtype=dtype),
-			timestep=timestep if self.expand_timesteps else timestep[:, 0],
+			timestep=timestep[:, 0] if timestep.size(1) == 1 else timestep,
 			encoder_hidden_states=encoder_hidden_states,
 			return_dict=False,
 		)[0]
@@ -380,7 +402,7 @@ class WanRenderer(nn.Module):
 		dtype = self.transformer.patch_embedding.weight.dtype
 		device = hidden_states.device
 
-		timestep = self._prepare_token_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		timestep = self._normalize_timestep(timestep, hidden_states.size(0), num_tokens, device)
 		rotary_emb = self.transformer.rope(hidden_states)
 		hidden_states = self.transformer.patch_embedding(hidden_states.to(dtype=dtype))
 		hidden_states = hidden_states.flatten(2).transpose(1, 2)

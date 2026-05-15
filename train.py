@@ -11,7 +11,9 @@ import torch.nn as nn
 import yaml
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.utils import enable_fsdp_ram_efficient_loading, set_seed
+from huggingface_hub import load_torch_model, save_torch_state_dict
 from torch import Tensor
+from torch.distributed.fsdp import FullStateDictConfig
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset, Subset
 from tqdm.auto import tqdm
@@ -42,46 +44,6 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-# TODO: There is no need to put this in a separate function, simply do this in `configure_fsdp_model` function.
-def align_fsdp_managed_dtypes(model: DeepWorld) -> None:
-	"""Align non-ignored module dtypes for FSDP flattening.
-
-	FSDP requires each flattened parameter group to use one dtype. Frozen encoders
-	that intentionally keep their own dtype are ignored by FSDP; all remaining
-	trainable and wrapped modules are cast to the Qwen language-model dtype.
-
-	Args:
-		model: Unprepared world-model instance.
-	"""
-
-	target_dtype = next(model.brain.language_model.parameters()).dtype
-	managed_mods = (
-		model.brain.language_model,
-		model.brain.geo_bridge,
-		model.brain.segment_tokens,
-		model.renderer.transformer,
-		model.renderer.condition_proj,
-	)
-	managed_params = (
-		model.brain.gen_slot_token,
-		model.renderer.null_cond,
-	)
-	managed_dtypes = {
-		param.dtype
-		for mod in managed_mods
-		for param in mod.parameters(recurse=True)
-	}
-	managed_dtypes.update(param.dtype for param in managed_params)
-	if managed_dtypes <= {target_dtype}:
-		return
-
-	for mod in managed_mods:
-		mod.to(dtype=target_dtype)
-	for param in managed_params:
-		with torch.no_grad():
-			param.data = param.data.to(dtype=target_dtype)
-
-
 def create_accelerator(
 	output_dir: str,
 	grad_acc_steps: int,
@@ -110,6 +72,9 @@ def create_accelerator(
 		auto_wrap_policy="TRANSFORMER_BASED_WRAP",
 		transformer_cls_names_to_wrap=["MoFfnQwenDecoderLayer"],
 		state_dict_type="FULL_STATE_DICT",
+		state_dict_config=FullStateDictConfig(
+			offload_to_cpu=True, rank0_only=True
+		),
 		backward_prefetch="BACKWARD_PRE",
 		forward_prefetch=False,
 		activation_checkpointing=False,
@@ -145,7 +110,33 @@ def configure_fsdp_model(accelerator: Accelerator, model: DeepWorld) -> None:
 	if fsdp_plugin is None:
 		return
 
-	align_fsdp_managed_dtypes(model)
+	# FSDP flattens wrapped parameters, so every non-ignored branch must share
+	# one dtype. Frozen encoders keep their checkpoint dtypes and are ignored.
+	target_dtype = next(model.brain.language_model.parameters()).dtype
+	managed_mods = (
+		model.brain.language_model,
+		model.brain.geo_bridge,
+		model.brain.segment_tokens,
+		model.renderer.transformer,
+		model.renderer.condition_proj,
+	)
+	managed_params = (
+		model.brain.gen_slot_token,
+		model.renderer.null_cond,
+	)
+	managed_dtypes = {
+		param.dtype
+		for mod in managed_mods
+		for param in mod.parameters(recurse=True)
+	}
+	managed_dtypes.update(param.dtype for param in managed_params)
+	if managed_dtypes - {target_dtype}:
+		for mod in managed_mods:
+			mod.to(dtype=target_dtype)
+		for param in managed_params:
+			with torch.no_grad():
+				param.data = param.data.to(dtype=target_dtype)
+
 	fsdp_plugin.ignored_modules = [
 		model.renderer.vae,
 		model.brain.geometry_encoder,
@@ -170,56 +161,52 @@ def load_pretrained_model_state(
 	"""
 
 	if pretrained_model_path is not None and accelerator.is_main_process:
-		model.load_state_dict(torch.load(
-			Path(pretrained_model_path),
-			map_location="cpu", weights_only=True, mmap=True,
-		))
+		load_result = load_torch_model(
+			model, Path(pretrained_model_path),
+			strict=False, safe=True, weights_only=True,
+			map_location="cpu", mmap=True,
+		)
+		if load_result.missing_keys or load_result.unexpected_keys:
+			raise RuntimeError(
+				"Pretrained checkpoint does not match the model state dict: "
+				f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}."
+			)
 	accelerator.wait_for_everyone()
-
-
-# TODO: Put the following three helper functions inside `log_param_summary` function. This keeps the training script well structured and clean.
-def _count_params(mod: nn.Module, trainable_only: bool = False) -> tuple[int, int]:
-	"""Return parameter count and byte size for one module tree."""
-
-	num_params = 0
-	num_bytes = 0
-	for param in mod.parameters():
-		if trainable_only and not param.requires_grad:
-			continue
-		num_params += param.numel()
-		num_bytes += param.numel() * param.element_size()
-	return num_params, num_bytes
-
-
-def _format_count(value: int) -> str:
-	"""Format large integer counts for startup logging."""
-
-	for unit in ["", "K", "M", "B", "T"]:
-		if abs(value) < 1000 or unit == "T":
-			return f"{value:.2f}{unit}" if unit else str(value)
-		value /= 1000
-	return str(value)
-
-
-def _format_bytes(value: int) -> str:
-	"""Format byte counts for startup logging."""
-
-	for unit in ["B", "KB", "MB", "GB", "TB"]:
-		if abs(value) < 1024 or unit == "TB":
-			return f"{value:.2f}{unit}" if unit != "B" else f"{value}B"
-		value /= 1024
-	return f"{value:.2f}TB"
 
 
 def log_param_summary(accelerator: Accelerator, model: DeepWorld) -> None:
 	"""Print a compact parameter and static-weight summary for memory debugging."""
 
-	total_params, total_bytes = _count_params(model)
-	trainable_params, trainable_bytes = _count_params(model, trainable_only=True)
+	def count_params(mod: nn.Module, trainable_only: bool = False) -> tuple[int, int]:
+		num_params = 0
+		num_bytes = 0
+		for param in mod.parameters():
+			if trainable_only and not param.requires_grad:
+				continue
+			num_params += param.numel()
+			num_bytes += param.numel() * param.element_size()
+		return num_params, num_bytes
+
+	def format_count(value: int) -> str:
+		for unit in ["", "K", "M", "B", "T"]:
+			if abs(value) < 1000 or unit == "T":
+				return f"{value:.2f}{unit}" if unit else str(value)
+			value /= 1000
+		return str(value)
+
+	def format_bytes(value: int) -> str:
+		for unit in ["B", "KB", "MB", "GB", "TB"]:
+			if abs(value) < 1024 or unit == "TB":
+				return f"{value:.2f}{unit}" if unit != "B" else f"{value}B"
+			value /= 1024
+		return f"{value:.2f}TB"
+
+	total_params, total_bytes = count_params(model)
+	trainable_params, trainable_bytes = count_params(model, trainable_only=True)
 	accelerator.print(
 		"Model parameters: "
-		f"total={_format_count(total_params)} ({_format_bytes(total_bytes)}), "
-		f"trainable={_format_count(trainable_params)} ({_format_bytes(trainable_bytes)})."
+		f"total={format_count(total_params)} ({format_bytes(total_bytes)}), "
+		f"trainable={format_count(trainable_params)} ({format_bytes(trainable_bytes)})."
 	)
 	for name, mod in (
 		("brain.language_model", model.brain.language_model),
@@ -228,36 +215,12 @@ def log_param_summary(accelerator: Accelerator, model: DeepWorld) -> None:
 		("renderer.transformer", model.renderer.transformer),
 		("renderer.vae", model.renderer.vae),
 	):
-		mod_params, mod_bytes = _count_params(mod)
-		mod_trainable, _ = _count_params(mod, trainable_only=True)
+		mod_params, mod_bytes = count_params(mod)
+		mod_trainable, _ = count_params(mod, trainable_only=True)
 		accelerator.print(
-			f"  {name}: {_format_count(mod_params)} params, {_format_bytes(mod_bytes)}, "
-			f"trainable={_format_count(mod_trainable)}"
+			f"  {name}: {format_count(mod_params)} params, {format_bytes(mod_bytes)}, "
+			f"trainable={format_count(mod_trainable)}"
 		)
-
-
-# TODO: There is no need for this function, get rid of it.
-def log_runtime_setup(accelerator: Accelerator, model: nn.Module) -> None:
-	"""Log the prepared distributed runtime and whether FSDP wrapping is active."""
-
-	distributed_type = getattr(accelerator.distributed_type, "name", str(accelerator.distributed_type))
-	accelerator.print(
-		f"Accelerate runtime: distributed_type={distributed_type}, world_size={accelerator.num_processes}, "
-		f"device={accelerator.device}."
-	)
-	if distributed_type != "FSDP":
-		return
-
-	is_fsdp_wrapped = False
-	try:
-		from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-		is_fsdp_wrapped = isinstance(model, FSDP)
-	except Exception:
-		pass
-	accelerator.print(
-		f"FSDP active={is_fsdp_wrapped}. Ignored branches: "
-		"`renderer.vae`, `brain.geometry_encoder`, `brain.vision_encoder`."
-	)
 
 
 def save_config_snapshot(config: WorldModelConfig, output_dir: Path, accelerator: Accelerator) -> None:
@@ -333,32 +296,6 @@ def build_lr_scheduler(optimizer: AdamW, config: WorldModelConfig, total_trainin
 	raise ValueError(f"Unsupported optimizer.lr_schedule: {config.optimizer.lr_schedule!r}.")
 
 
-# TODO: There is no need to this redundant check.
-def _validate_optimizer_groups(model: DeepWorld, grouped_params: list[nn.Parameter]) -> None:
-	"""Ensure optimizer grouping covers each trainable parameter exactly once.
-
-	Args:
-		model: Unprepared model whose trainable parameters should be optimized.
-		grouped_params: Flattened parameter list assigned to optimizer groups.
-
-	Raises:
-		RuntimeError: If any trainable parameter is missing or assigned more than once.
-	"""
-
-	trainable_ids = {id(param) for param in model.parameters() if param.requires_grad}
-	grouped_ids = [id(param) for param in grouped_params]
-	grouped_id_set = set(grouped_ids)
-	if len(grouped_ids) != len(grouped_id_set):
-		raise RuntimeError("Optimizer parameter groups contain duplicate trainable parameters.")
-	if trainable_ids != grouped_id_set:
-		missing_count = len(trainable_ids - grouped_id_set)
-		extra_count = len(grouped_id_set - trainable_ids)
-		raise RuntimeError(
-			"Optimizer parameter groups do not match the model's trainable parameters: "
-			f"missing={missing_count}, extra={extra_count}."
-		)
-
-
 def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 	"""Build AdamW with branch-specific learning-rate groups.
 
@@ -406,35 +343,47 @@ def build_optimizer(model: DeepWorld, config: WorldModelConfig) -> AdamW:
 	renderer_transformer_params = train_params(model.renderer.transformer)
 	renderer_others_params = train_params_except(model.renderer, renderer_transformer_params)
 
-	# TODO: Here, instead of checking that all groups cover all params, create a new list for the rest params in model, which is usually empty. Upon adding this group, use the default learning rate. The add_optimizer_group function will automatically ignore this if the list is empty.
-	_validate_optimizer_groups(model, grouped_params=(
-		brain_language_model_params
-		+ brain_others_params
-		+ renderer_transformer_params
-		+ renderer_others_params
-	))
+	grouped_ids = {
+		id(param)
+		for param in (
+			brain_language_model_params
+			+ brain_others_params
+			+ renderer_transformer_params
+			+ renderer_others_params
+		)
+	}
+	remainder_params = [param for param in model.parameters() if param.requires_grad and id(param) not in grouped_ids]
 
-	# TODO: Because now the learning rates can be null, you should use the `or`	expression like this `config.optimizer.brain_language_model_learning_rate or config.optimizer.learning_rate`.
+	brain_language_model_lr = config.optimizer.brain_language_model_learning_rate or config.optimizer.learning_rate
+	brain_others_lr = config.optimizer.brain_others_learning_rate or brain_language_model_lr
+	renderer_transformer_lr = config.optimizer.renderer_transformer_learning_rate or config.optimizer.learning_rate
+	renderer_others_lr = config.optimizer.renderer_others_learning_rate or renderer_transformer_lr
+
 	param_groups: list[dict] = []
 	add_optimizer_group(
 		param_groups, "brain_language_model",
 		brain_language_model_params,
-		config.optimizer.brain_language_model_learning_rate,
+		brain_language_model_lr,
 	)
 	add_optimizer_group(
 		param_groups, "brain_others",
 		brain_others_params,
-		config.optimizer.brain_others_learning_rate,
+		brain_others_lr,
 	)
 	add_optimizer_group(
 		param_groups, "renderer_transformer",
 		renderer_transformer_params,
-		config.optimizer.renderer_transformer_learning_rate,
+		renderer_transformer_lr,
 	)
 	add_optimizer_group(
 		param_groups, "renderer_others",
 		renderer_others_params,
-		config.optimizer.renderer_others_learning_rate,
+		renderer_others_lr,
+	)
+	add_optimizer_group(
+		param_groups, "remainder",
+		remainder_params,
+		config.optimizer.learning_rate,
 	)
 	if len(param_groups) == 0:
 		raise RuntimeError("No trainable parameters were found for optimizer construction.")
@@ -538,43 +487,7 @@ def build_eval_dataloader(
 	)
 
 
-# TODO: Make this a helper function inside the evaluation function, rather than placing it at the top level.
-def save_eval_sample_bundle(
-	batch: dict,
-	generated_video: Tensor,
-	batch_index: int,
-	global_eval_index: int,
-	checkpoint_dir: Path,
-) -> None:
-	"""Save one generated sample with its text and training inputs.
-
-	Args:
-		batch: Collated evaluation batch containing prompts, references, and GT video.
-		generated_video: Generated video tensor with shape `(3, T, H, W)`.
-		batch_index: Index of the sample inside the current dataloader batch.
-		global_eval_index: Stable global eval-sample index across ranks.
-		checkpoint_dir: Checkpoint directory where sample folders should be written.
-	"""
-
-	sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
-	sample_dir.mkdir(parents=True, exist_ok=True)
-	save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
-	save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
-
-	prompt = batch["prompts"][batch_index]
-	(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
-
-	reference_dir = sample_dir / "references"
-	reference_mask = batch["reference_mask"][batch_index]
-	reference_images = batch["geo_images"][batch_index]
-	for ref_index, is_valid in enumerate(reference_mask.tolist()):
-		if not is_valid:
-			continue
-		save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
-
-
-# TODO: Rename this function to `evaluate`.
-def generate_checkpoint_samples(
+def evaluate(
 	accelerator: Accelerator,
 	model: nn.Module,
 	eval_dataloader: DataLoader | None,
@@ -595,6 +508,28 @@ def generate_checkpoint_samples(
 
 	if eval_dataloader is None:
 		return
+
+	def save_sample_bundle(
+		batch: dict,
+		generated_video: Tensor,
+		batch_index: int,
+		global_eval_index: int,
+	) -> None:
+		sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
+		sample_dir.mkdir(parents=True, exist_ok=True)
+		save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
+		save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
+
+		prompt = batch["prompts"][batch_index]
+		(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+
+		reference_dir = sample_dir / "references"
+		reference_mask = batch["reference_mask"][batch_index]
+		reference_images = batch["geo_images"][batch_index]
+		for ref_index, is_valid in enumerate(reference_mask.tolist()):
+			if not is_valid:
+				continue
+			save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
 
 	per_process_samples = config.training.eval_num_samples // accelerator.num_processes
 	was_training = model.training
@@ -618,12 +553,11 @@ def generate_checkpoint_samples(
 				if num_saved >= per_process_samples:
 					break
 				global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
-				save_eval_sample_bundle(
+				save_sample_bundle(
 					batch=batch,
 					generated_video=videos[batch_index],
 					batch_index=batch_index,
 					global_eval_index=global_eval_index,
-					checkpoint_dir=checkpoint_dir,
 				)
 				num_saved += 1
 
@@ -667,15 +601,19 @@ def save_checkpoint_with_evaluation(
 		checkpoint_dir.mkdir(parents=True, exist_ok=True)
 	accelerator.wait_for_everyone()
 	
-	generate_checkpoint_samples(accelerator, model, eval_dataloader, config, step, checkpoint_dir)
+	evaluate(accelerator, model, eval_dataloader, config, step, checkpoint_dir)
 	
-	# NOTE: accelerator.get_state_dict must be called on every processes, or the program will hang because the main process is indefinitely waiting for others.
-	# TODO: Optimize saving logic. Try to use accelerator to save to and load from sharded safentors. Keep full state dict for portability, use CPU offload and main-process-only for efficiency.
+	# NOTE: `get_state_dict` is on all ranks.
 	accelerator.wait_for_everyone()
 	state_dict = accelerator.get_state_dict(model)
 	if accelerator.is_main_process:
 		checkpoint_dir.mkdir(parents=True, exist_ok=True)
-		torch.save(state_dict, checkpoint_dir / "model.pt")
+		save_torch_state_dict(
+			state_dict, checkpoint_dir,
+			max_shard_size="5GB",
+			metadata={"format": "pt"},
+			safe_serialization=True,
+		)
 	accelerator.wait_for_everyone()
 
 
@@ -760,7 +698,7 @@ def main() -> None:
 		model, optimizer = accelerator.prepare(model, optimizer)
 	else:
 		model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-	log_runtime_setup(accelerator, model)
+
 	grad_clip_params = tuple(p for group in optimizer.param_groups for p in group["params"])
 
 	steps_per_epoch = math.ceil(len(dataloader) / config.training.gradient_accumulation_steps)

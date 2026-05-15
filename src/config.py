@@ -95,16 +95,6 @@ class OptimizerConfig:
 	def __post_init__(self) -> None:
 		"""Validate optimizer schedule settings."""
 
-		# TODO: Here, you do not re-assign values, you should do this when acreating the parameter groups. Leave the module specific lrs as optionally null.
-		if self.brain_language_model_learning_rate is None:
-			self.brain_language_model_learning_rate = self.learning_rate
-		if self.brain_others_learning_rate is None:
-			self.brain_others_learning_rate = self.brain_language_model_learning_rate
-		if self.renderer_transformer_learning_rate is None:
-			self.renderer_transformer_learning_rate = self.learning_rate
-		if self.renderer_others_learning_rate is None:
-			self.renderer_others_learning_rate = self.renderer_transformer_learning_rate
-
 		self.lr_schedule = self.lr_schedule.lower()
 		if self.lr_schedule not in {"cosine", "constant"}:
 			raise ValueError(f"`optimizer.lr_schedule` must be either `cosine` or `constant`, got {self.lr_schedule!r}.")
@@ -228,7 +218,6 @@ class WanRendererConfig:
 		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero`, `normal`, or `default`.
 		condition_proj_init_std: Optional standard deviation used when `condition_proj_init=normal`. If omitted, defaults to `1e-3`.
 		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
-		expand_timesteps: Whether to provide per-token timesteps, matching Wan2.2 TI2V pipeline behavior.
 		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
 			inferred from the checkpoint scheduler config when available.
 		inference_steps: Default number of denoising steps during sampling.
@@ -244,7 +233,6 @@ class WanRendererConfig:
 	condition_proj_init: str = "zero"
 	condition_proj_init_std: float | None = None
 	condition_dropout_prob: float = 0.1
-	expand_timesteps: bool = True
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
 
