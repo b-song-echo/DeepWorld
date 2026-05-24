@@ -1,8 +1,6 @@
-# TODO: I have some TODOs in `synthesize.py` about renaming the stages. It is basically a change of terminologies. With these changes, you may need to update their corresponding templates as well. Note that their roles do not change, it is only their names that slightly alter, the template should still use what is most suitable for the LM backbones.
+MOTION_DIGESTING_TEMPLATE = """You are digesting numeric camera-motion extraction into a camera-motion caption.
 
-TRAJECTORY_DIGEST_TEMPLATE = """You are converting numeric camera trajectory statistics into a camera trajectory caption.
-
-The whole trajectory is split into sub-trajectories. You receive statistics for the whole trajectory and for all sub-trajectories. Fields with the "local" prefix in each sub-trajectory are computed relative to the first pose of that sub-trajectory; they describe the local motion within that unit. Fields with the "first_pose" prefix in each sub-trajectory are computed relative to the first pose of the whole trajectory; they describe where the unit begins within the entire trajectory.
+The whole clip is split into motion units. You receive statistics for the overall motion and all motion units. Fields with the "local" prefix in each motion unit are computed relative to the first pose of that unit; they describe the local motion within that unit. Fields with the "first_pose" prefix in each motion unit are computed relative to the first pose of the whole clip; they describe where the unit begins within the full motion.
 
 Return JSON only. Do not include Markdown.
 
@@ -25,21 +23,21 @@ Input field meanings:
 - "delta_yaw_deg": net yaw change from the first pose to the last pose. Positive means turning/panning right; negative means turning/panning left.
 - "delta_pitch_deg": net pitch change from the first pose to the last pose. Positive means tilting up; negative means tilting down.
 - "delta_roll_deg": net roll change from the first pose to the last pose. Positive means rolling clockwise; negative means rolling counterclockwise.
-- "sub_trajectories": fixed-duration temporal units of the whole trajectory.
-- "time_range_s": start and end time of the sub-trajectory within the clip.
-- "first_pose_position_m": where the sub-trajectory begins, expressed relative to the first pose of the whole trajectory.
-- "first_pose_yaw_deg", "first_pose_pitch_deg", and "first_pose_roll_deg": the camera orientation at the beginning of the sub-trajectory, expressed relative to the first pose of the whole trajectory. These describe the starting state of the unit, not the motion within the unit.
-- "local_trajectory_length_m": accumulated path length within the sub-trajectory.
-- "local_translation_right_m", "local_translation_down_m", and "local_translation_forward_m": net displacement within the sub-trajectory, expressed relative to the first pose of that sub-trajectory.
-- "local_translation_distance_m": straight-line distance between the first and last camera positions within the sub-trajectory.
-- "local_delta_yaw_deg", "local_delta_pitch_deg", and "local_delta_roll_deg": orientation change within the sub-trajectory.
+- "motion_units": fixed-duration temporal units of the whole clip.
+- "time_range_s": start and end time of the motion unit within the clip.
+- "first_pose_position_m": where the motion unit begins, expressed relative to the first pose of the whole clip.
+- "first_pose_yaw_deg", "first_pose_pitch_deg", and "first_pose_roll_deg": the camera orientation at the beginning of the motion unit, expressed relative to the first pose of the whole clip. These describe the starting state of the unit, not the motion within the unit.
+- "local_trajectory_length_m": accumulated path length within the motion unit.
+- "local_translation_right_m", "local_translation_down_m", and "local_translation_forward_m": net displacement within the motion unit, expressed relative to the first pose of that unit.
+- "local_translation_distance_m": straight-line distance between the first and last camera positions within the motion unit.
+- "local_delta_yaw_deg", "local_delta_pitch_deg", and "local_delta_roll_deg": orientation change within the motion unit.
 
 Your task:
-- Interpret each sub-trajectory as a camera motion unit.
+- Interpret each motion unit as a camera motion phrase.
 - Use the numeric values to choose camera-motion terms.
 - Produce compact intermediate motion evidence for each motion unit.
 - Write a short description for each motion unit.
-- Write one final detailed camera trajectory caption that encapsulates all motion.
+- Write one final detailed camera-motion caption that encapsulates all motion.
 
 Candidate camera-motion vocabulary:
 - move forward, move backward, push in, pull back, dolly in, dolly out,
@@ -65,8 +63,8 @@ Numeric interpretation hints:
 - Yaw delta: positive means panning/turning right; negative means panning/turning left.
 - Pitch delta: positive means tilting up; negative means tilting down.
 - Roll delta: positive means rolling clockwise; negative means rolling counterclockwise.
-- Use the local fields to describe motion within each sub-trajectory.
-- Use the first_pose fields only to understand how the sub-trajectories connect over time.
+- Use the local fields to describe motion within each motion unit.
+- Use the first_pose fields only to understand how the motion units connect over time.
 - If trajectory_length_m is much larger than translation_distance_m, the motion may be curved, indirect, or back-and-forth.
 - Meaningful translation plus meaningful yaw can often be described as an arc, curve, sweep, or veer.
 - Forward motion plus lateral motion may be described as a diagonal move or a curved approach.
@@ -106,27 +104,27 @@ Required JSON schema:
     }
   ],
   "overall_motion_terms": ["string", "..."],
-  "trajectory_caption": "one concise paragraph describing the full camera trajectory"
+  "motion_caption": "one concise paragraph describing the full camera motion"
 }
 
-Camera trajectory statistics:
-<TRAJECTORY_STATISTICS_JSON>
+Camera motion extraction:
+<MOTION_EXTRACTION_JSON>
 """
 
 
-VIDEO_CAPTION_TEMPLATE = """You are generating training metadata for a scene-grounded video generation model.
+VIDEO_CAPTIONING_TEMPLATE = """You are generating training metadata for a scene-grounded video generation model.
 
 You receive:
 A. a 5-second video clip of a static indoor scene,
-B. a camera trajectory caption derived from numeric camera poses.
+B. a camera-motion caption derived from numeric camera poses.
 
 Return JSON only. Do not include Markdown.
 
-Use the video as visual evidence and the trajectory caption as motion guidance. Prioritize camera motion, visible scene layout, and object grounding over generic visual captioning.
+Use the video as visual evidence and the motion caption as guidance. Prioritize camera motion, visible scene layout, and object grounding over generic visual captioning.
 
 Source usage:
 - Use the video frames as the source of truth for visible objects, room layout, and visual details.
-- Use the camera trajectory caption as the source of truth for the camera-motion direction, magnitude, and temporal order.
+- Use the camera-motion caption as the source of truth for the camera-motion direction, magnitude, and temporal order.
 - Ground the camera motion to visible objects or regions when the video clearly supports it.
 - Do not describe objects or regions that are not visible.
 
@@ -142,7 +140,7 @@ Rules:
 - Do not describe object motion unless it is clearly visible.
 - Treat the scene as static unless the video clearly shows otherwise.
 - Do not introduce lighting changes, time-of-day changes, weather, or environment changes.
-- You may use approximate natural quantities such as "about 45 degrees", "about 90 degrees", or "roughly one meter" only when supported by the trajectory caption.
+- You may use approximate natural quantities such as "about 45 degrees", "about 90 degrees", or "roughly one meter" only when supported by the motion caption.
 - Do not mention hidden metadata, camera poses, trajectory statistics, implementation details, or dataset internals.
 - Focus on what a user would need to prompt a video generator.
 
@@ -154,14 +152,14 @@ Required JSON schema:
   "video_caption": "single detailed paragraph"
 }
 
-Camera trajectory caption:
-<TRAJECTORY_CAPTION_JSON>
+Camera-motion caption:
+<MOTION_CAPTION_JSON>
 """
 
 
-IMAGE_CAPTION_TEMPLATE = """You are captioning one reference image for a scene-grounded video generation dataset.
+IMAGE_CAPTIONING_TEMPLATE = """You are captioning one reference image for a scene-grounded video generation dataset.
 
-The index of this image is <REF_INDEX>. It <IS_VIDEO_START_CLAUSE> the start frame of the video.
+The index of this image is <REF_INDEX>, and it <IS_VIDEO_START_CLAUSE> the start frame of the video. Explicitly mention this two facts in the caption.
 
 Return JSON only. Do not include Markdown.
 
@@ -179,8 +177,8 @@ Rules:
 - Do not invent objects.
 - Be specific about object identity and position.
 - Avoid vague phrases like "some furniture" when objects are identifiable.
-- Explicitly refer to the image by its index, such as "the first image", "the second image", etc.
-- If this image is the start frame, explicitly mention this fact.
+- Refer to this image by its index, such as "the first image", "the third image", "image 6", "image 12", etc. But avoid using the word "index" directly.
+- Always mention whether this image is the start frame of the video.
 - If the room type is unclear, use "unknown" rather than guessing.
 - Do not describe camera motion; this is a single still reference image.
 - Do not mention hidden metadata, file names, implementation details, or dataset internals.
@@ -197,7 +195,7 @@ Required JSON schema:
 """
 
 
-CROSS_REFERENCE_TEMPLATE = """You are rewriting metadata for a scene-grounded video generation dataset.
+CAPTION_WIRING_TEMPLATE = """You are wiring captions for a scene-grounded video generation dataset.
 
 You receive:
 A. a detailed caption of the video,
@@ -205,7 +203,7 @@ B. captions of all reference images.
 
 Return JSON only. Do not include Markdown.
 
-Rewrite the video caption so it cross-refers to the reference images in a way that a user could naturally prompt a video generator.
+Rewrite the video caption so it is wired up to the reference images in a way that a user could naturally prompt a video generator.
 
 Source hierarchy:
 - The video caption is the source of truth for the generated video's visual content, camera motion, and temporal order.
@@ -221,7 +219,7 @@ Rules:
 - Do not claim an object appears in a reference image unless the reference caption supports it.
 - Do not force every reference image into the caption. Use only references that help identify the start view, target objects, or spatial layout.
 - Do not introduce environment changes such as nighttime, lights on/off, weather, or new objects unless the video caption supports them.
-- Do not mention "caption", "metadata", "dataset", "camera poses", or "trajectory caption".
+- Do not mention "caption", "metadata", "dataset", "camera poses", or "motion caption".
 - Keep this as a descriptive intermediate caption, not yet an imperative user prompt.
 - Preserve a natural reading order: start view first, then camera motion, then revealed or emphasized regions.
 
@@ -240,7 +238,7 @@ Required JSON schema:
     }
   ],
   "objects_visible_in_video_but_not_references": ["string", "..."],
-  "cross_referenced_caption": "string"
+  "wired_caption": "string"
 }
 
 Video caption:
@@ -251,7 +249,7 @@ Reference image captions:
 """
 
 
-PROMPT_REWRITE_TEMPLATE = """You are converting a cross-referenced scene/video caption into an instruction-style user prompt for a scene-grounded video generation model.
+CAPTION_REPHRASING_TEMPLATE = """You are rephrasing a wired scene/video caption into an instruction-style user prompt for a scene-grounded video generation model.
 
 Return JSON only. Do not include Markdown.
 
@@ -265,7 +263,7 @@ Rules:
 - Preserve scene geometry and object layout.
 - Preserve objects or regions that the camera approaches, leaves, reveals, passes by, or turns toward.
 - Do not mention hidden metadata, numeric poses, captions, datasets, manifests, or internal fields.
-- Do not add visual content not supported by the cross-referenced caption.
+- Do not add visual content not supported by the wired caption.
 - Do not introduce lighting changes, time-of-day changes, weather, scene transitions, or new objects.
 - Do not overfit to dataset language.
 - Avoid overly technical phrasing; make it sound like a natural user request.
@@ -276,15 +274,15 @@ Required JSON schema:
   "synthesized_prompt": "string"
 }
 
-Cross-referenced caption:
-<CROSS_REFERENCED_CAPTION_JSON>
+Wired caption:
+<WIRED_CAPTION_JSON>
 """
 
 
-JUDGE_TEMPLATE = """You are validating a synthesized user prompt for a scene-grounded video generation dataset.
+CRITIC_JUDGING_TEMPLATE = """You are judging a synthesized user prompt for a scene-grounded video generation dataset.
 
 You receive:
-A. a natural-language camera trajectory caption,
+A. a natural-language camera-motion caption,
 B. a detailed caption of the ground-truth video,
 C. captions of all reference images,
 D. the synthesized prompt.
@@ -294,7 +292,7 @@ Return JSON only. Do not include Markdown.
 The prompt was synthesized from multiple sources using large models. Check whether it is faithful, useful, properly grounded, and suitable as an instruction to a video generation model.
 
 Source hierarchy:
-- The camera trajectory caption is the main source of truth for camera motion.
+- The camera-motion caption is the main source of truth for camera motion.
 - The video caption is the main source of truth for visible scene content, layout, and what the camera approaches, leaves, reveals, or turns toward.
 - The reference image captions are the only source of truth for claims about what appears in each reference image.
 - The synthesized prompt is the candidate output to validate.
@@ -323,7 +321,7 @@ Fatal checks:
 - "no_invalid_reference_index": true only if every referenced image index exists in the reference image captions.
 - "no_unverified_reference_claim": true only if every claim about a specific reference image is supported by that reference image caption.
 - "no_start_frame_reference_error": true only if the prompt does not incorrectly identify which reference image is the video start frame.
-- "no_contradictory_camera_motion": true only if the prompt does not contradict the camera trajectory caption or video caption in direction, order, scale, or type of motion.
+- "no_contradictory_camera_motion": true only if the prompt does not contradict the camera-motion caption or video caption in direction, order, scale, or type of motion.
 - "no_opposite_motion_direction": true only if the prompt does not reverse any important motion direction, such as left versus right, forward versus backward, up versus down, pan left versus pan right, or tilt up versus tilt down.
 - "no_invalid_zoom_claim": true only if the prompt does not describe pose-derived forward/backward camera motion as optical zoom unless the video caption explicitly supports zoom.
 - "no_temporal_or_duration_contradiction": true only if the prompt does not contradict the 5-second duration or the temporal order of the motion.
@@ -334,10 +332,9 @@ Quality checks:
 - "has_clear_start_viewpoint": true only if the prompt clearly establishes the initial view of the generated video.
 - "uses_start_frame_reference_if_available": true only if the first frame is included as a reference image and the prompt correctly uses it as the starting viewpoint.
 - "describes_start_view_visually_if_no_start_reference": true only if the first frame is not included as a reference image and the prompt instead describes the starting viewpoint visually.
-- "describes_5_second_video": true only if the prompt clearly asks for a short video consistent with the 5-second clip.
 - "has_meaningful_camera_motion": true only if the prompt contains a clear camera movement rather than only describing a static scene.
-- "motion_aligns_with_camera_trajectory": true only if the prompt's camera motion is consistent with the trajectory caption.
-- "camera_motion_matches_video_caption": true only if the prompt's camera motion is also consistent with the video caption.
+- "aligns_with_motion_caption": true only if the prompt's camera motion aligns with the camera motion caption.
+- "aligns_with_video_caption": true only if the prompt's content aligns with the video caption.
 - "preserves_motion_order": true only if the prompt preserves the temporal order of major motion phases.
 - "preserves_motion_strength": true only if the prompt does not exaggerate weak motion or understate dominant motion in a misleading way.
 - "mentions_relevant_scene_objects": true only if the prompt mentions important scene objects or regions needed to ground the camera motion.
@@ -379,10 +376,9 @@ Required JSON schema:
     "has_clear_start_viewpoint": <bool>,
     "uses_start_frame_reference_if_available": <bool>,
     "describes_start_view_visually_if_no_start_reference": <bool>,
-    "describes_5_second_video": <bool>,
-    "has_meaningful_camera_motion": <bool>,
-    "motion_aligns_with_camera_trajectory": <bool>,
-    "camera_motion_matches_video_caption": <bool>,
+		"has_meaningful_camera_motion": <bool>,
+		"aligns_with_motion_caption": <bool>,
+    "aligns_with_video_caption": <bool>,
     "preserves_motion_order": <bool>,
     "preserves_motion_strength": <bool>,
     "mentions_relevant_scene_objects": <bool>,
@@ -404,8 +400,8 @@ Required JSON schema:
   }
 }
 
-Camera trajectory caption:
-<TRAJECTORY_CAPTION_JSON>
+Camera-motion caption:
+<MOTION_CAPTION_JSON>
 
 Video caption:
 <VIDEO_CAPTION_JSON>

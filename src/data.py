@@ -9,7 +9,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from src.config import DatasetConfig
-from src.utils.video import (
+from src.utils import (
 	center_crop_to_aspect,
 	load_image,
 	load_video_frames,

@@ -22,8 +22,11 @@ from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_c
 from src.config import load_config, WorldModelConfig
 from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
-from src.utils import get_world_size
-from src.utils.video import save_image_tensor, save_video_tensor
+from src.utils import (
+	get_world_size,
+	save_image_tensor,
+	save_video_tensor
+)
 
 
 def parse_args() -> argparse.Namespace:

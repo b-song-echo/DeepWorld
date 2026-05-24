@@ -34,7 +34,7 @@ optimizer:
 
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/demo
-  seed: 42
+  seed: 20021021
   max_total_epochs: 30
   max_total_steps: 1500
   per_device_batch_size: 1
