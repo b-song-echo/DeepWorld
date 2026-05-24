@@ -1310,6 +1310,7 @@ def run_worker(args: argparse.Namespace, worker_index: int = 0) -> None:
 	if state["current_count"] >= state["target_count"]:
 		return
 
+	# TODO: Currently, it seems that wach process load the two gaint backbones to the target GPU, while only one of the model is used at each stage. Can you implement some configurable GPU VRAM optimization techniques, such as optional CPU offloading, to mitigate CUDA OOM if I ever encounter.
 	print(f"[worker {worker_index}] loading VLM from {args.vlm_backend_path}", flush=True)
 	vlm = VisionLanguageBackend(args.vlm_backend_path, local_rank=local_rank)
 	print(f"[worker {worker_index}] loading LLM from {args.llm_backend_path}", flush=True)
