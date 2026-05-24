@@ -4,6 +4,8 @@ import torch
 
 from src.utils.video import center_crop_and_resize, load_image, load_video_frames
 
+# TODO: Migrate the content in this file to utils.py. Update all references in this codebase. Then delete this file.
+
 
 def get_world_size() -> int:
 	"""Return the active distributed world size.

@@ -10,6 +10,8 @@ from PIL import Image
 from torch import Tensor
 
 
+# TODO: Cleanup this file, remove redundent or unused helper functions, make private called-once functions nested functions. Put everything in this file into utils.py. Update their references in this codebase. Then delete this file.
+
 def load_image(path: str | Path) -> Image.Image:
 	"""Load an RGB image from disk.
 
@@ -142,40 +144,6 @@ def decode_video_frames(source: str | Path | bytes) -> list[Image.Image]:
 	if len(raw_frames) == 0:
 		raise ValueError("No frames found in video source.")
 	return raw_frames
-
-
-def sample_reference_images(
-	frames: list[Image.Image],
-	num_reference_images: int,
-	random_selection: bool = True,
-	preserve_order: bool = True,
-) -> list[Image.Image]:
-	"""Sample reference images from decoded video frames.
-
-	Args:
-		frames: Candidate RGB frames.
-		num_reference_images: Maximum number of reference frames to select.
-		random_selection: Whether to sample frames randomly instead of uniformly.
-		preserve_order: Whether selected frames should keep their temporal order.
-
-	Returns:
-		A list of RGB reference images.
-	"""
-
-	if len(frames) == 0:
-		raise ValueError("Cannot sample reference images from an empty frame list.")
-
-	selection_count = min(num_reference_images, len(frames))
-	if random_selection:
-		indices = random.sample(range(len(frames)), k=selection_count)
-		if preserve_order:
-			indices = sorted(indices)
-	else:
-		if selection_count == 1:
-			indices = [len(frames) // 2]
-		else:
-			indices = [round(index * (len(frames) - 1) / (selection_count - 1)) for index in range(selection_count)]
-	return [frames[index].copy() for index in indices]
 
 
 def align_frame_count(frames: list[Image.Image], temporal_factor: int = 4) -> list[Image.Image]:

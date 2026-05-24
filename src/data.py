@@ -1,55 +1,21 @@
-import glob
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-import webdataset as wds
 from torch import Tensor
-from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from torch.utils.data import Dataset
 
 from src.config import DatasetConfig
-from src.utils import get_world_size
 from src.utils.video import (
 	center_crop_to_aspect,
-	decode_video_frames,
 	load_image,
 	load_video_frames,
 	pil_to_tensor,
 	resize_image,
-	sample_reference_images,
-	sample_video_frames_from_raw_frames,
-	video_frames_to_tensor,
 )
-
-
-def partition_count(total: int, index: int, partitions: int) -> int:
-	"""Return the item count assigned to one deterministic partition.
-
-	The first `total % partitions` partitions receive one extra item. This keeps
-	the global sample cap exact while preserving a stable assignment for a fixed
-	world-size and dataloader-worker configuration.
-
-	Args:
-		total: Total number of items to divide.
-		index: Zero-based partition index.
-		partitions: Number of partitions.
-
-	Returns:
-		The item count assigned to `index`.
-	"""
-
-	if total <= 0:
-		return 0
-	if partitions <= 0:
-		raise ValueError(f"`partitions` must be positive, got {partitions}.")
-	if index < 0 or index >= partitions:
-		raise ValueError(f"`index` must be in [0, {partitions}), got {index}.")
-
-	base = total // partitions
-	remainder = total % partitions
-	return base + int(index < remainder)
 
 
 def resolve_geo_image_size(dataset_config: DatasetConfig, patch_size: int) -> int:
@@ -105,11 +71,13 @@ class WorldModelSample:
 	video: Tensor
 
 
-class ManifestWorldModelDataset(Dataset):
-	"""Manifest-driven dataset for grounded video training.
+class WorldDataset(Dataset):
+	"""Curated ScanNet++ world-model dataset backed by a JSONL manifest.
 
-	Each row in the JSONL manifest is expected to provide prompt text, several
-	reference image paths, and one ground-truth video path.
+	Each manifest row is produced by `data_gen.py` and contains a self-contained
+	ground-truth clip, ordered reference images, a rich synthesized prompt, and
+	medium/coarse distilled prompt variants. Reference order is preserved because
+	the prompt may refer to "the first image" or similar fixed indices.
 	"""
 
 	def __init__(self, config: DatasetConfig):
@@ -119,7 +87,10 @@ class ManifestWorldModelDataset(Dataset):
 			config: Dataset section of the root config.
 		"""
 
+		if not config.manifest_path:
+			raise ValueError("`dataset.manifest_path` must point to a curated JSONL manifest.")
 		self.config = config
+		self.data_root = Path(config.data_root) if config.data_root else Path(config.manifest_path).parent
 		self.records = self._load_manifest(config.manifest_path)
 		if config.num_samples > 0:
 			self.records = self.records[: config.num_samples]
@@ -148,6 +119,46 @@ class ManifestWorldModelDataset(Dataset):
 			raise ValueError(f"Manifest is empty: {manifest_path}")
 		return records
 
+	def _resolve_path(self, path: str) -> Path:
+		"""Resolve one manifest path against the configured dataset root.
+
+		Args:
+			path: Absolute path or manifest-relative sample path.
+
+		Returns:
+			A concrete local filesystem path.
+		"""
+
+		candidate = Path(path)
+		if candidate.is_absolute():
+			return candidate
+		return self.data_root / candidate
+
+	def _choose_prompt(self, record: dict[str, Any]) -> str:
+		"""Sample one prompt granularity according to configured probabilities.
+
+		Args:
+			record: Parsed manifest row containing rich and distilled prompts.
+
+		Returns:
+			The selected prompt string.
+		"""
+
+		distilled = record.get("distilled_prompts") or {}
+		prompt_table = [
+			(str(record["synthesized_prompt"]), self.config.prompt_rich_prob),
+			(str(distilled.get("medium") or record["synthesized_prompt"]), self.config.prompt_medium_prob),
+			(str(distilled.get("coarse") or distilled.get("medium") or record["synthesized_prompt"]), self.config.prompt_coarse_prob),
+		]
+		total = sum(weight for _, weight in prompt_table)
+		draw = random.random() * total
+		running = 0.0
+		for prompt, weight in prompt_table:
+			running += weight
+			if draw <= running:
+				return prompt
+		return prompt_table[-1][0]
+
 	def __len__(self) -> int:
 		"""Return the active manifest subset size."""
 
@@ -164,193 +175,37 @@ class ManifestWorldModelDataset(Dataset):
 		"""
 
 		record = self.records[index]
-		reference_paths = record["reference_images"][: self.config.num_reference_images]
-		reference_images = [load_image(path) for path in reference_paths]
+		reference_images = [
+			load_image(self._resolve_path(ref["path"]))
+			for ref in record["ref_imgs"]
+		]
 		video = load_video_frames(
-			record["video_path"],
+			self._resolve_path(record["gt_clip"]["path"]),
 			num_frames=self.config.video_num_frames,
-			stride=self.config.video_frame_stride,
 			height=self.config.video_height,
 			width=self.config.video_width,
-			random_clip=self.config.shuffle,
-		)
-		return WorldModelSample(
-			sample_id=str(record.get("id", index)),
-			prompt=record["prompt"],
-			reference_images=reference_images,
-			video=video,
-		)
-
-
-class WebDatasetVideoCaptionDataset(IterableDataset):
-	"""Temporary WebDataset loader for video-caption tar shards.
-
-	Each grouped sample is expected to contain:
-
-	- one `.mp4` file with the source video,
-	- one `.json` metadata file containing `video_caption`.
-
-	The prompt is read from `video_caption`, and reference images are sampled
-	randomly from the decoded video frames.
-	"""
-
-	def __init__(self, config: DatasetConfig):
-		"""Initialize the WebDataset-backed iterable dataset.
-
-		Args:
-			config: Dataset section of the root config.
-		"""
-
-		self.config = config
-		if len(config.webdataset_urls) == 0:
-			raise ValueError("`dataset.webdataset_urls` must be provided for `dataset_source=webdataset`.")
-		if config.num_samples <= 0:
-			raise ValueError("`dataset.num_samples` must be positive for `dataset_source=webdataset`.")
-		self.shard_paths = self._resolve_shard_paths(config.webdataset_urls)
-
-	def __len__(self) -> int:
-		"""Return the exact capped sample count seen by one distributed process."""
-
-		return self._rank_sample_limit()
-
-	def _rank_sample_limit(self) -> int:
-		"""Return this process's deterministic share of the global sample cap.
-
-		WebDataset is sharded inside the dataset rather than by Accelerate's
-		dataloader wrapper, so every distributed rank must consume the same number
-		of samples to avoid uneven collective calls during training.
-		"""
-
-		world_size = get_world_size()
-		if self.config.num_samples % world_size != 0:
-			raise ValueError(
-				"`dataset.num_samples` must be divisible by the distributed world size when "
-				f"`dataset_source=webdataset`; got num_samples={self.config.num_samples}, world_size={world_size}."
-			)
-		return self.config.num_samples // world_size
-
-	def _worker_sample_limit(self) -> int:
-		"""Return this dataloader worker's deterministic share of the rank cap."""
-
-		worker_info = get_worker_info()
-		if worker_info is None:
-			return self._rank_sample_limit()
-		return partition_count(
-			self._rank_sample_limit(),
-			worker_info.id,
-			worker_info.num_workers,
-		)
-
-	def _resolve_shard_paths(self, urls: list[str] | str) -> list[str]:
-		"""Resolve the configured shard globs into a stable path list.
-
-		Args:
-			urls: One or more shard glob patterns.
-
-		Returns:
-			A sorted list of matching shard paths.
-
-		Raises:
-			ValueError: If none of the shard patterns match.
-		"""
-
-		patterns = urls if isinstance(urls, list) else [urls]
-		shard_paths = sorted(path for pattern in patterns for path in glob.glob(pattern))
-		if len(shard_paths) == 0:
-			raise ValueError(f"No WebDataset shards matched: {patterns}")
-		return shard_paths
-
-	def _parse_metadata(self, metadata: bytes | str | dict[str, Any]) -> dict[str, Any]:
-		"""Convert the stored metadata payload into a Python dictionary.
-
-		Args:
-			metadata: Raw `.json` payload from WebDataset.
-
-		Returns:
-			A parsed metadata dictionary.
-		"""
-
-		if isinstance(metadata, dict):
-			return metadata
-		if isinstance(metadata, bytes):
-			return json.loads(metadata.decode("utf-8"))
-		return json.loads(metadata)
-
-	def _build_sample(self, sample: dict[str, Any]) -> WorldModelSample:
-		"""Convert one grouped WebDataset sample into a `WorldModelSample`.
-
-		Args:
-			sample: Grouped sample dictionary produced by WebDataset.
-
-		Returns:
-			A fully materialized `WorldModelSample`.
-		"""
-
-		if "mp4" not in sample or "json" not in sample:
-			raise ValueError("Each WebDataset sample must contain both `mp4` and `json` entries.")
-
-		metadata = self._parse_metadata(sample["json"])
-		raw_frames = decode_video_frames(sample["mp4"])
-		sampled_frames = sample_video_frames_from_raw_frames(
-			raw_frames,
-			num_frames=self.config.video_num_frames,
+			random_clip=False,
 			frame_sampling="uniform",
 		)
-		reference_images = sample_reference_images(
-			sampled_frames,
-			num_reference_images=self.config.num_reference_images,
-			random_selection=True,
-			preserve_order=False,
-		)
-		video = video_frames_to_tensor(
-			sampled_frames,
-			height=self.config.video_height,
-			width=self.config.video_width,
-		)
 		return WorldModelSample(
-			sample_id=str(sample.get("__key__", metadata.get("id", ""))),
-			prompt=str(metadata["video_caption"]),
+			sample_id=str(record.get("sample_id", index)),
+			prompt=self._choose_prompt(record),
 			reference_images=reference_images,
 			video=video,
 		)
 
-	def __iter__(self):
-		"""Iterate over a deterministic capped subset of grouped tar samples."""
 
-		sample_limit = self._worker_sample_limit()
-		if sample_limit <= 0:
-			return
-		dataset = wds.WebDataset(
-			self.shard_paths,
-			shardshuffle=100 if self.config.shuffle else False,
-			nodesplitter=wds.split_by_node,
-			workersplitter=wds.split_by_worker,
-		)
-		if self.config.shuffle:
-			dataset = dataset.shuffle(1000)
-		num_emitted = 0
-		for sample in dataset:
-			if num_emitted >= sample_limit:
-				break
-			yield self._build_sample(sample)
-			num_emitted += 1
-
-
-def build_dataset(config: DatasetConfig) -> Dataset | IterableDataset:
-	"""Construct the requested dataset backend from config.
+def build_dataset(config: DatasetConfig) -> Dataset:
+	"""Construct the curated world-model dataset from config.
 
 	Args:
 		config: Dataset section of the root config.
 
 	Returns:
-		Either a map-style manifest dataset or an iterable WebDataset loader.
+		A map-style curated-manifest dataset.
 	"""
 
-	if config.dataset_source == "manifest":
-		return ManifestWorldModelDataset(config)
-	if config.dataset_source == "webdataset":
-		return WebDatasetVideoCaptionDataset(config)
-	raise ValueError(f"Unsupported dataset source: {config.dataset_source}")
+	return WorldDataset(config)
 
 
 class WorldModelBatchCollator:

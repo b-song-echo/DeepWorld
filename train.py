@@ -15,7 +15,7 @@ from huggingface_hub import load_torch_model, save_torch_state_dict
 from torch import Tensor
 from torch.distributed.fsdp import FullStateDictConfig
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, IterableDataset, Subset
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
@@ -24,9 +24,6 @@ from src.data import WorldModelBatchCollator, build_dataset
 from src.models import DeepWorld
 from src.utils import get_world_size
 from src.utils.video import save_image_tensor, save_video_tensor
-
-
-VIDEO_DURATION_SECONDS = 10.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -435,7 +432,7 @@ def build_eval_dataloader(
 	collator: WorldModelBatchCollator,
 	accelerator: Accelerator,
 ) -> DataLoader | None:
-	"""Build a deterministic per-rank evaluation loader over a training-data prefix.
+	"""Build a deterministic per-rank evaluation loader over the validation split.
 
 	Args:
 		config: Root training configuration.
@@ -449,6 +446,8 @@ def build_eval_dataloader(
 	eval_num_samples = config.training.eval_num_samples
 	if eval_num_samples == 0:
 		return None
+	if not config.dataset.eval_manifest_path:
+		raise ValueError("`dataset.eval_manifest_path` must be set when `training.eval_num_samples` is positive.")
 	if eval_num_samples % accelerator.num_processes != 0:
 		raise ValueError(
 			"`training.eval_num_samples` must be divisible by the distributed world size; "
@@ -459,24 +458,20 @@ def build_eval_dataloader(
 			"`training.eval_num_samples` must be either 0 or at least the distributed world size; "
 			f"got eval_num_samples={eval_num_samples}, world_size={accelerator.num_processes}."
 		)
-	if config.dataset.num_samples > 0 and eval_num_samples > config.dataset.num_samples:
-		raise ValueError(
-			"`training.eval_num_samples` must not exceed `dataset.num_samples` when the training set is capped; "
-			f"got eval_num_samples={eval_num_samples}, dataset.num_samples={config.dataset.num_samples}."
-		)
-
-	eval_dataset_config = replace(config.dataset, num_samples=eval_num_samples, shuffle=False)
+	eval_dataset_config = replace(
+		config.dataset,
+		manifest_path=config.dataset.eval_manifest_path,
+		num_samples=eval_num_samples,
+		shuffle=False,
+	)
 	eval_dataset = build_dataset(eval_dataset_config)
-	if isinstance(eval_dataset, IterableDataset):
-		eval_source = eval_dataset
-	else:
-		if len(eval_dataset) < eval_num_samples:
-			raise ValueError(
-				"`training.eval_num_samples` exceeds the available evaluation dataset size; "
-				f"got eval_num_samples={eval_num_samples}, available={len(eval_dataset)}."
-			)
-		rank_indices = list(range(accelerator.process_index, eval_num_samples, accelerator.num_processes))
-		eval_source = Subset(eval_dataset, rank_indices)
+	if len(eval_dataset) < eval_num_samples:
+		raise ValueError(
+			"`training.eval_num_samples` exceeds the available evaluation dataset size; "
+			f"got eval_num_samples={eval_num_samples}, available={len(eval_dataset)}."
+		)
+	rank_indices = list(range(accelerator.process_index, eval_num_samples, accelerator.num_processes))
+	eval_source = Subset(eval_dataset, rank_indices)
 
 	return create_world_dataloader(
 		dataset=eval_source,
@@ -517,8 +512,8 @@ def evaluate(
 	) -> None:
 		sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
 		sample_dir.mkdir(parents=True, exist_ok=True)
-		save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
-		save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=VIDEO_DURATION_SECONDS)
+		save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=config.dataset.video_duration)
+		save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=config.dataset.video_duration)
 
 		prompt = batch["prompts"][batch_index]
 		(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
@@ -688,16 +683,13 @@ def main() -> None:
 	dataloader = create_world_dataloader(
 		dataset=dataset,
 		batch_size=config.training.per_device_batch_size,
-		shuffle=(not isinstance(dataset, IterableDataset)) and config.dataset.shuffle,
+		shuffle=config.dataset.shuffle,
 		dataset_config=config.dataset,
 		collator=collator,
 	)
 	eval_dataloader = build_eval_dataloader(config, collator, accelerator)
 
-	if isinstance(dataset, IterableDataset):
-		model, optimizer = accelerator.prepare(model, optimizer)
-	else:
-		model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+	model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
 	grad_clip_params = tuple(p for group in optimizer.param_groups for p in group["params"])
 

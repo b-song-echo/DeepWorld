@@ -24,15 +24,17 @@ class DatasetConfig:
 	"""Dataset and dataloader settings for world-model training.
 
 	Attributes:
-		dataset_source: Dataset backend, either `manifest` or `webdataset`.
-		manifest_path: JSONL manifest describing the training set.
-		webdataset_urls: Absolute local tar-shard paths or brace-expand patterns for WebDataset loading.
-		num_samples: Optional deterministic per-epoch sample cap. For manifest datasets, `0` means all records. For WebDataset, this must be positive and divisible by distributed world size because it defines both the stream cap and reported length.
-		num_reference_images: Maximum number of reference images to load per sample.
-		video_num_frames: Target number of frames to sample from each GT video.
-		video_frame_stride: Temporal stride used when sampling frames from the GT clip.
-		video_height: Spatial height used for GT video training clips.
-		video_width: Spatial width used for GT video training clips.
+		manifest_path: JSONL manifest describing the generated training split.
+		eval_manifest_path: JSONL manifest describing the generated validation split.
+		data_root: Optional root used to resolve relative sample paths. If omitted, the manifest directory is used.
+		num_samples: Optional deterministic per-epoch sample cap. `0` means all records.
+		video_width: Spatial width used for GT video training clips and square reference preprocessing.
+		video_height: Spatial height used for GT video training clips and square reference preprocessing.
+		video_fps: Uniform FPS used to sample frames from each curated 5-second GT clip.
+		video_duration: Duration in seconds represented by the curated clip.
+		prompt_rich_prob: Probability of using the full synthesized prompt.
+		prompt_medium_prob: Probability of using the medium distilled prompt.
+		prompt_coarse_prob: Probability of using the coarse distilled prompt.
 		vis_image_size: Square reference-image size used for Qwen's visual encoder.
 		geo_image_size: Optional square reference-image size used for VGGT. If omitted, it is derived from `vis_image_size` by rounding down to a multiple of VGGT's patch size.
 		max_text_length: Maximum prompt token length after tokenization.
@@ -43,15 +45,17 @@ class DatasetConfig:
 		persistent_workers: Whether worker processes should stay alive across epochs.
 	"""
 
-	dataset_source: str = "webdataset"
 	manifest_path: str = ""
-	webdataset_urls: List[str] | str = field(default_factory=list)
+	eval_manifest_path: str = ""
+	data_root: str = ""
 	num_samples: int = 0
-	num_reference_images: int = 4
-	video_num_frames: int = 121
-	video_frame_stride: int = 1
-	video_height: int = 448
 	video_width: int = 448
+	video_height: int = 448
+	video_fps: float = 24.0
+	video_duration: float = 5.0
+	prompt_rich_prob: float = 0.5
+	prompt_medium_prob: float = 0.3
+	prompt_coarse_prob: float = 0.2
 	vis_image_size: int = 448
 	geo_image_size: int | None = None
 	max_text_length: int = 1024
@@ -60,6 +64,35 @@ class DatasetConfig:
 	prefetch_factor: int | None = None
 	pin_memory: bool = True
 	persistent_workers: bool = True
+
+	def __post_init__(self) -> None:
+		"""Validate curated-manifest preprocessing settings."""
+
+		if self.num_samples < 0:
+			raise ValueError(f"`dataset.num_samples` must be non-negative, got {self.num_samples}.")
+		if self.video_width <= 0 or self.video_height <= 0:
+			raise ValueError(f"`dataset.width` and `dataset.height` must be positive, got {(self.video_width, self.video_height)}.")
+		if self.video_fps <= 0:
+			raise ValueError(f"`dataset.video_fps` must be positive, got {self.video_fps}.")
+		if self.video_duration <= 0:
+			raise ValueError(f"`dataset.video_duration` must be positive, got {self.video_duration}.")
+		if self.vis_image_size <= 0:
+			raise ValueError(f"`dataset.vis_image_size` must be positive, got {self.vis_image_size}.")
+		for name, value in (
+			("prompt_rich_prob", self.prompt_rich_prob),
+			("prompt_medium_prob", self.prompt_medium_prob),
+			("prompt_coarse_prob", self.prompt_coarse_prob),
+		):
+			if value < 0:
+				raise ValueError(f"`dataset.{name}` must be non-negative, got {value}.")
+		if self.prompt_rich_prob + self.prompt_medium_prob + self.prompt_coarse_prob <= 0:
+			raise ValueError("At least one prompt probability must be positive.")
+
+	@property
+	def video_num_frames(self) -> int:
+		"""Return the Wan-aligned endpoint-inclusive frame count for the clip."""
+
+		return int(round(self.video_fps * self.video_duration)) + 1
 
 
 @dataclass
