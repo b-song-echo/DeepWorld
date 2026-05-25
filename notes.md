@@ -1,5 +1,6 @@
-Unsolved Problems
-(Codex should not care about these at the moment.)
+(To Codex: Ignore this file.)
+(To Codex: Ignore this file.)
+(To Codex: Ignore this file.)
 
 
 The FSDP accelerator preparation breaks due to device mismatch, two possible workaround (they are not the real solutions):
@@ -24,3 +25,11 @@ This must some way to prevent this, otherwise, larger batch size becomes an issu
 
 
 Chat template and special tokens are not used at the moment, which diviates from Qwen-VL standards, and probably JoyAI-Image-Und as well.
+
+
+Some code refactors:
+- Don't check CUDA availability frequently in code, throw an error at the start if not available.
+- Abstract common utilities, such as IO, etc.
+- 80-chars width limit.
+- More consistent naming conventions and codeing style.
+
