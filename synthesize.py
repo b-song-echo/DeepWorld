@@ -496,7 +496,7 @@ class DataSamplingStage:
 			return 1.0
 		return valid_pixels / total_pixels
 	
-	def _prepare_gt_clip(self,ctx: SampleContext) -> None:
+	def _prepare_gt_clip(self, ctx: SampleContext) -> None:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
 		video_valid_fraction = self._stream_mask_fraction(
@@ -576,7 +576,11 @@ class DataSamplingStage:
 				raise RejectedSample("Reference source has no materialized image path.")
 			with Image.open(source.image_path) as loaded:
 				image = self._center_crop_square_image(loaded.convert("RGB"))
-			valid_fraction = source.valid_fraction or self._image_mask_valid_fraction(source.mask_path)
+			valid_fraction = (
+				source.valid_fraction
+				if source.valid_fraction is not None else
+				self._image_mask_valid_fraction(source.mask_path)
+			)
 			if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
 				raise RejectedSample(
 					f"Reference valid fraction {valid_fraction:.4f} below threshold."
@@ -619,7 +623,7 @@ class DataSamplingStage:
 		if ctx.final_dir.exists() or ctx.tmp_dir.exists():
 			raise RejectedSample(f"Sample already exists or is in progress: {ctx.sample_id}")
 		ctx.tmp_dir.mkdir(parents=True)
-		(ctx.tmp_dir / "intermediate").mkdir()
+		ctx.intermediate_dir.mkdir()
 		ctx.manifest_entry = {
 			"sample_id": ctx.sample_id,
 			"scene_id": ctx.scene_id,
@@ -635,7 +639,7 @@ class DataSamplingStage:
 			self._prepare_start_frame(ctx, ref_sources)
 			self._prepare_reference_images(ctx, ref_sources)
 		except Exception:
-			shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+			cleanup_sample_tmp(ctx)
 			raise
 
 
