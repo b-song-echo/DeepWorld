@@ -275,7 +275,8 @@ class DataSamplingStage:
 		self.scene_ids = self._load_scene_ids(self.args)
 		self.scene_types = self._load_scene_types(self.args)
 		self.rng = rng
-		self.data_root = Path(args.scannetpp_root) / "data"
+		# self.data_root = Path(args.scannetpp_root) / "data"
+		self.data_root = Path(args.scannetpp_root)
 		self.samples_root = output_root(args) / "samples"
 	
 	def _load_scene_types(self, args: Namespace) -> dict[str, str]:

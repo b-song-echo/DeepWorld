@@ -1,21 +1,26 @@
 set -euo pipefail
 
+SCANNETPP_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf
+OUTPUT_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data
+VLM_BACKBONE_PATH=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
+LLM_BACKBONE_PATH=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen2.5-3B
+
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
 python synthesize.py \
-	--scannetpp_root /path/to/scannetpp \
-	--output_root /path/to/output \
-	--num_processes 8 \
+	--scannetpp_root $SCANNETPP_ROOT \
+	--output_root $OUTPUT_ROOT \
+	--num_processes 1 \
 	--seed 20021021 \
-	--split train \
+	--split val \
 	--num_samples 100000 \
 	--clip_seconds 5.0 \
 	--max_ref_images 10 \
 	--include_start_frame_prob 0.35 \
-	--vlm_backend_path /path/to/Qwen3-VL-32B-Instruct \
-	--llm_backend_path /path/to/Qwen3.6-27B \
+	--vlm_backend_path $VLM_BACKBONE_PATH \
+	--llm_backend_path $LLM_BACKBONE_PATH \
 	--video_captioning_width 720 \
 	--video_captioning_height 720 \
 	--video_captioning_fps 2 \
