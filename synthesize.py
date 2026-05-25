@@ -1,4 +1,5 @@
 from argparse import ArgumentParser, Namespace
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -7,7 +8,7 @@ import os
 import random
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,28 +42,6 @@ class RejectedSample(Exception):
 	"""Expected rejection for a sampled candidate that fails a curation gate."""
 
 
-# TODO: There is no need for this class, SampleContext should do its job.
-@dataclass
-class VideoInfo:
-	"""Basic video stream metadata used for deterministic clip sampling."""
-
-	width: int
-	height: int
-	fps: float
-	num_frames: int
-	duration_s: float
-
-
-# TODO: There is no need for this class.
-@dataclass
-class DslrCandidate:
-	"""One valid DSLR reference-image candidate."""
-
-	image_path: Path
-	mask_path: Path | None
-	ref_id: str
-
-
 @dataclass
 class RefSource:
 	"""One selected reference source before it is copied into the sample."""
@@ -79,23 +58,82 @@ class RefSource:
 class SampleContext:
 	"""Mutable state for one candidate sample while it moves through stages."""
 
-	# TODO: Generate default values for this dataclass, so that it can be instantiated with `SampleContext()`.
-	scene_id: str
-	scene_type: str
-	scene: ScannetppScene_Release
-	sample_id: str
-	start_frame: int
-	clip_frames: int
-	video_fps: float
-	tmp_dir: Path
-	final_dir: Path
-	manifest_entry: dict[str, Any]
+	scene_id: str = ""
+	scene_type: str = "unknown"
+	sample_id: str = ""
+	start_frame: int = 0
+	clip_frames: int = 0
+	clip_duration_s: float = 0.0
+	video_width: int = 0
+	video_height: int = 0
+	video_fps: float = 0.0
+	video_num_frames: int = 0
+	video_duration_s: float = 0.0
+	source_video_path: Path | None = None
+	source_video_mask_path: Path | None = None
+	source_pose_path: Path | None = None
+	tmp_dir: Path | None = None
+	final_dir: Path | None = None
+	manifest_entry: dict[str, Any] = field(default_factory=dict)
 
 	@property
 	def intermediate_dir(self) -> Path:
 		"""Return the intermediate-output directory for this sample."""
 
-		return self.tmp_dir / "intermediate"
+		return self.require_tmp_dir() / "intermediate"
+
+	@property
+	def gt_clip_path(self) -> Path:
+		"""Return the temporary ground-truth clip path."""
+
+		return self.require_tmp_dir() / "gt_clip.mp4"
+
+	@property
+	def ref_img_dir(self) -> Path:
+		"""Return the temporary reference-image directory."""
+
+		return self.require_tmp_dir() / "ref_imgs"
+
+	@property
+	def video_square_size(self) -> int:
+		"""Return the side length of the center-cropped square video."""
+
+		return min(self.video_width, self.video_height)
+
+	def require_tmp_dir(self) -> Path:
+		"""Return the temporary sample directory or raise if it is unset."""
+
+		if self.tmp_dir is None:
+			raise RuntimeError("Temporary sample directory is not initialized.")
+		return self.tmp_dir
+
+	def require_final_dir(self) -> Path:
+		"""Return the final sample directory or raise if it is unset."""
+
+		if self.final_dir is None:
+			raise RuntimeError("Final sample directory is not initialized.")
+		return self.final_dir
+
+	def require_source_video_path(self) -> Path:
+		"""Return the source RGB video path or raise if it is unset."""
+
+		if self.source_video_path is None:
+			raise RuntimeError("Source video path is not initialized.")
+		return self.source_video_path
+
+	def require_source_video_mask_path(self) -> Path:
+		"""Return the source video mask path or raise if it is unset."""
+
+		if self.source_video_mask_path is None:
+			raise RuntimeError("Source video mask path is not initialized.")
+		return self.source_video_mask_path
+
+	def require_source_pose_path(self) -> Path:
+		"""Return the source pose path or raise if it is unset."""
+
+		if self.source_pose_path is None:
+			raise RuntimeError("Source pose path is not initialized.")
+		return self.source_pose_path
 
 
 def parse_args() -> Namespace:
@@ -261,50 +299,70 @@ class DataSamplingStage:
 			raise ValueError(f"ScanNet++ split file is empty: {path}")
 		return scene_ids
 	
-	def _load_dslr_candidates(self, scene: ScannetppScene_Release) -> list[DslrCandidate]:
-		"""Load DSLR reference candidates that are not marked as bad."""
+	def _resolve_dslr_image_path(self, scene: ScannetppScene_Release, file_value: str) -> Path | None:
+		"""Resolve one DSLR frame image path across ScanNet++ transform variants."""
+
+		image_path = Path(file_value)
+		candidates = [image_path] if image_path.is_absolute() else [
+			image_path,
+			scene.dslr_dir / image_path,
+			scene.dslr_resized_undistorted_dir / image_path.name,
+		]
+		for candidate in candidates:
+			if candidate.exists():
+				return candidate
+		return None
+
+	def _resolve_dslr_mask_path(
+		self,
+		scene: ScannetppScene_Release,
+		image_path: Path,
+		frame: dict[str, Any],
+	) -> Path | None:
+		"""Resolve an optional DSLR validity mask for one reference image."""
+
+		mask_value = frame.get("mask_path") or frame.get("mask")
+		if mask_value:
+			mask_path = Path(mask_value)
+			candidates = [mask_path] if mask_path.is_absolute() else [
+				mask_path,
+				scene.dslr_dir / mask_path,
+				scene.dslr_resized_undistorted_mask_dir / mask_path.name,
+			]
+			for candidate in candidates:
+				if candidate.exists():
+					return candidate
+
+		default_mask = scene.dslr_resized_undistorted_mask_dir / f"{image_path.stem}.png"
+		return default_mask if default_mask.exists() else None
+
+	def _load_dslr_reference_pool(self, scene: ScannetppScene_Release) -> dict[str, tuple[Path, Path | None]]:
+		"""Load usable DSLR reference images keyed by stable reference ID."""
 
 		transform_path = scene.dslr_nerfstudio_transform_undistorted_path
 		if not transform_path.exists():
 			raise RejectedSample(f"Missing DSLR transforms: {transform_path}")
 		payload = read_json(transform_path)
 		frames = list(payload.get("frames") or []) + list(payload.get("test_frames") or [])
-		candidates: dict[str, DslrCandidate] = {}
+		candidates: dict[str, tuple[Path, Path | None]] = {}
 		for frame in frames:
 			if frame.get("is_bad", False):
 				continue
 			file_value = frame.get("file_path") or frame.get("image_path") or frame.get("name")
 			if not file_value:
 				continue
-			image_path = Path(file_value)
-			if not image_path.is_absolute():
-				if image_path.exists():
-					image_path = image_path
-				else:
-					image_path = scene.dslr_dir / image_path
-					if not image_path.exists():
-						image_path = scene.dslr_resized_undistorted_dir / Path(file_value).name
-			if not image_path.exists():
+			image_path = self._resolve_dslr_image_path(scene, str(file_value))
+			if image_path is None:
 				continue
 
-			mask_value = frame.get("mask_path") or frame.get("mask")
-			mask_path = None
-			if mask_value:
-				mask_candidate = Path(mask_value)
-				if not mask_candidate.is_absolute():
-					mask_candidate = scene.dslr_dir / mask_candidate
-				mask_path = mask_candidate if mask_candidate.exists() else None
-			if mask_path is None:
-				default_mask = scene.dslr_resized_undistorted_mask_dir / f"{image_path.stem}.png"
-				mask_path = default_mask if default_mask.exists() else None
-
 			ref_id = f"dslr:{image_path.name}"
-			candidates[ref_id] = DslrCandidate(image_path=image_path, mask_path=mask_path, ref_id=ref_id)
-		return [candidates[key] for key in sorted(candidates)]
-	
-	def _probe_video(self, path: Path) -> VideoInfo:
-		"""Probe video stream metadata."""
+			candidates[ref_id] = (image_path, self._resolve_dslr_mask_path(scene, image_path, frame))
+		return candidates
 
+	def _probe_video(self, ctx: SampleContext) -> None:
+		"""Probe source video stream metadata into the sample context."""
+
+		path = ctx.require_source_video_path()
 		probe = ffmpeg.probe(str(path), select_streams="v:0")
 		streams = probe.get("streams") or []
 		if not streams:
@@ -317,35 +375,47 @@ class DataSamplingStage:
 			if value is None or value in {"0/0", "N/A", ""}:
 				return None
 			if "/" in value:
-				numerator, denominator = value.split("/", 1)
-				den = float(denominator)
-				if den == 0:
+				try:
+					numerator, denominator = value.split("/", 1)
+					den = float(denominator)
+					if den == 0:
+						return None
+					return float(numerator) / den
+				except ValueError:
 					return None
-				return float(numerator) / den
-			return float(value)
+			try:
+				return float(value)
+			except ValueError:
+				return None
+
+		def optional_float(value: Any) -> float:
+			"""Parse optional FFprobe numeric fields, treating missing values as zero."""
+
+			try:
+				return float(value)
+			except (TypeError, ValueError):
+				return 0.0
 		
 		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
 		if fps is None or fps <= 0:
 			raise RuntimeError(f"Could not determine FPS for video: {path}")
-		duration = float(stream.get("duration") or 0.0)
+		duration = optional_float(stream.get("duration"))
 		num_frames_raw = stream.get("nb_frames")
 		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
 		if num_frames <= 0 and duration > 0:
 			num_frames = int(round(duration * fps))
 		if num_frames <= 0:
 			raise RuntimeError(f"Could not determine frame count for video: {path}")
-		return VideoInfo(
-			width=int(stream["width"]),
-			height=int(stream["height"]),
-			fps=float(fps),
-			num_frames=num_frames,
-			duration_s=duration if duration > 0 else num_frames / float(fps),
-		)
+		ctx.video_width = int(stream["width"])
+		ctx.video_height = int(stream["height"])
+		ctx.video_fps = float(fps)
+		ctx.video_num_frames = num_frames
+		ctx.video_duration_s = duration if duration > 0 else num_frames / float(fps)
 	
-	def _select_references(
+	def _select_reference_images(
 		self,
 		scene: ScannetppScene_Release,
-		start_frame: int,
+		start_frame: int
 	) -> list[RefSource]:
 		"""Select and shuffle start-frame and DSLR reference sources."""
 
@@ -360,42 +430,43 @@ class DataSamplingStage:
 				mask_path=None,
 				is_start_frame=True,
 			))
-		# TODO: The following two steps can be merged into a single step. Rather than first creating all DslrCandidate instances and copy a subset into RefSource instances, you can directly creating the specified number of RefSource instances, then there is no need for the DslrCandidate class at all.
 		dslr_needed = num_refs - int(include_start)
-		candidates = self._load_dslr_candidates(scene)
-		if len(candidates) < dslr_needed:
-			raise RejectedSample(
-				f"Scene {scene.scene_id} has {len(candidates)} usable DSLR images, needs {dslr_needed}."
-			)
-		for candidate in self.rng.sample(candidates, k=dslr_needed):
-			ref_sources.append(RefSource(
-				kind="dslr",
-				ref_id=candidate.ref_id,
-				image_path=candidate.image_path,
-				mask_path=candidate.mask_path,
-				is_start_frame=False,
-			))
+		if dslr_needed > 0:
+			candidates = self._load_dslr_reference_pool(scene)
+			if len(candidates) < dslr_needed:
+				raise RejectedSample(
+					f"Scene {scene.scene_id} has {len(candidates)} usable DSLR images, needs {dslr_needed}."
+				)
+			for ref_id in self.rng.sample(sorted(candidates), k=dslr_needed):
+				image_path, mask_path = candidates[ref_id]
+				ref_sources.append(RefSource(
+					kind="dslr",
+					ref_id=ref_id,
+					image_path=image_path,
+					mask_path=mask_path,
+					is_start_frame=False,
+				))
 		self.rng.shuffle(ref_sources)
 		return ref_sources
 	
 	def _stream_mask_fraction(
 		self,
 		ctx: SampleContext,
-		video_info: VideoInfo,
 		duration_s: float,
 		max_frames: int | None = None,
 	) -> float:
 		"""Stream a cropped mask clip through FFmpeg and compute valid pixels."""
 
-		if not ctx.scene.iphone_video_mask_path.exists():
+		mask_path = ctx.require_source_video_mask_path()
+		if not mask_path.exists():
 			return 1.0
 		stream = ffmpeg.input(
-			str(ctx.scene.iphone_video_mask_path),
-			ss=ctx.start_frame / video_info.fps,
+			str(mask_path),
+			ss=ctx.start_frame / ctx.video_fps,
 			t=duration_s
 		).video
 		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("fps", fps=video_info.fps)
+		stream = stream.filter("fps", fps=ctx.video_fps)
 		stream = stream.filter("format", "gray")
 		output_kwargs: dict[str, Any] = {
 			"format": "rawvideo",
@@ -406,7 +477,7 @@ class DataSamplingStage:
 		stream = ffmpeg.output(stream, "pipe:", **output_kwargs)
 		process = stream.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
 		assert process.stdout is not None
-		frame_size = min(video_info.width, video_info.height) ** 2
+		frame_size = ctx.video_square_size ** 2
 		valid_pixels = 0
 		total_pixels = 0
 		while True:
@@ -425,12 +496,7 @@ class DataSamplingStage:
 			return 1.0
 		return valid_pixels / total_pixels
 	
-	def _prepare_gt_clip(
-		self,
-		ctx: SampleContext,
-		video_info: VideoInfo,
-		clip_path: Path
-	) -> None:
+	def _prepare_gt_clip(self,ctx: SampleContext) -> None:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
 		video_valid_fraction = self._stream_mask_fraction(
@@ -440,44 +506,38 @@ class DataSamplingStage:
 			raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
 
 		stream = ffmpeg.input(
-			str(ctx.scene.iphone_video_path),
-			ss=ctx.start_frame / video_info.fps,
+			str(ctx.require_source_video_path()),
+			ss=ctx.start_frame / ctx.video_fps,
 			t=self.args.clip_seconds
 		).video
 		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("fps", fps=video_info.fps)
+		stream = stream.filter("fps", fps=ctx.video_fps)
 		stream = ffmpeg.output(
-			stream, str(clip_path),
+			stream, str(ctx.gt_clip_path),
 			vcodec="libx264", crf=18, pix_fmt="yuv420p", an=None,
 		).overwrite_output()
 		try:
 			ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
 			ctx.manifest_entry["gt_clip"] = {
-				"fps": video_info.fps,
+				"fps": ctx.video_fps,
 				"duration_sec": self.args.clip_seconds,
-				"width": min(video_info.width, video_info.height),
-				"height": min(video_info.width, video_info.height),
+				"width": ctx.video_square_size,
+				"height": ctx.video_square_size,
 				"path": f"samples/{ctx.sample_id}/gt_clip.mp4",
-			},
+			}
 		except ffmpeg.Error as error:
 			message = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
-			raise RuntimeError(f"ffmpeg failed while writing {clip_path}: {message}") from error
+			raise RuntimeError(f"ffmpeg failed while writing {ctx.gt_clip_path}: {message}") from error
 	
-	def _prepare_start_frame(
-		self,
-		ctx: SampleContext,
-		ref_sources: list[RefSource],
-		video_info: VideoInfo,
-		clip_path: Path,
-	) -> None:
+	def _prepare_start_frame(self, ctx: SampleContext, ref_sources: list[RefSource]) -> None:
 		"""Materialize the video start frame so every reference follows one path."""
 
 		if not any(source.is_start_frame for source in ref_sources):
 			return
 		start_valid_fraction = self._stream_mask_fraction(
-			ctx=ctx, duration_s=1.0 / video_info.fps, max_frames=1
+			ctx=ctx, duration_s=1.0 / ctx.video_fps, max_frames=1
 		)
-		start_image = Image.fromarray(next(iio.imiter(clip_path))).convert("RGB")
+		start_image = Image.fromarray(next(iio.imiter(ctx.gt_clip_path))).convert("RGB")
 		start_path = ctx.intermediate_dir / "start_frame.jpg"
 		start_image.save(start_path, quality=95)
 		for source in ref_sources:
@@ -505,14 +565,10 @@ class DataSamplingStage:
 			mask = np.max(mask[..., :3], axis=-1)
 		return float((mask > 127).mean())
 
-	def _prepare_reference_images(
-		self,
-		ctx: SampleContext,
-		ref_sources: list[RefSource],
-	) -> None:
+	def _prepare_reference_images(self, ctx: SampleContext, ref_sources: list[RefSource]) -> None:
 		"""Copy selected references into fixed sample order."""
 
-		ref_dir = ctx.tmp_dir / "ref_imgs"
+		ref_dir = ctx.ref_img_dir
 		ref_dir.mkdir(parents=True, exist_ok=True)
 		metadata: list[dict[str, Any]] = []
 		for index, source in enumerate(ref_sources, start=1):
@@ -538,39 +594,32 @@ class DataSamplingStage:
 
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Create one sampled candidate under `samples/.tmp_<sample_id>`."""
-
-		# TODO: Currently, separate VideoInfo instance and SampleContext instances are created and passed around, but they have overlapping roles. There is no need for a VideoInfo dataclass, you can put everything into SampleContext, which encapsulates all source and target information, including data sampling metadata, media specs, all paths, etc. and can be passed around. Do this without changing the overall implementation.
 		
-		scene_id = self.rng.choice(self.scene_ids)
-		scene = ScannetppScene_Release(scene_id, data_root=self.data_root)
+		ctx.scene_id = self.rng.choice(self.scene_ids)
+		scene = ScannetppScene_Release(ctx.scene_id, data_root=self.data_root)
 		if not scene.iphone_video_path.exists():
-			raise RejectedSample(f"Missing iPhone RGB video: {scene.iphone_video_path}")
-		video_info = self._probe_video(scene.iphone_video_path)
-		clip_frames = int(round(video_info.fps * self.args.clip_seconds))
-		if clip_frames <= 1 or video_info.num_frames <= clip_frames:
-			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {scene.iphone_video_path}")
-		start_frame = self.rng.randint(0, video_info.num_frames - clip_frames)
-		ref_sources = self._select_references(scene, start_frame)
+			raise RejectedSample(f"Missing iPhone video: {scene.iphone_video_path}")
+		ctx.scene_type = str(self.scene_types.get(ctx.scene_id, "unknown"))
+		ctx.clip_duration_s = self.args.clip_seconds
+		ctx.source_video_path = scene.iphone_video_path
+		ctx.source_video_mask_path = scene.iphone_video_mask_path
+		ctx.source_pose_path = scene.iphone_pose_intrinsic_imu_path
+		self._probe_video(ctx)
+		ctx.clip_frames = int(round(ctx.video_fps * self.args.clip_seconds))
+		if ctx.clip_frames <= 1 or ctx.video_num_frames <= ctx.clip_frames:
+			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {ctx.source_video_path}")
+		ctx.start_frame = self.rng.randint(0, ctx.video_num_frames - ctx.clip_frames)
+		
+		ref_sources = self._select_reference_images(scene, ctx.start_frame)
 		payload = "|".join(source.ref_id for source in ref_sources)
 		ref_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
-		sample_id = f"{scene_id}__f{start_frame:07d}__r{ref_hash}"
-		
-		tmp_dir = self.samples_root / f".tmp_{sample_id}"
-		final_dir = self.samples_root / sample_id
-		if final_dir.exists() or tmp_dir.exists():
-			raise RejectedSample(f"Sample already exists or is in progress: {sample_id}")
-		tmp_dir.mkdir(parents=True)
-		(tmp_dir / "intermediate").mkdir()
-		
-		ctx.scene_id = scene_id
-		ctx.scene_type = str(self.scene_types.get(scene_id, "unknown"))
-		ctx.scene = scene
-		ctx.sample_id = sample_id
-		ctx.start_frame = start_frame
-		ctx.clip_frames = clip_frames
-		ctx.video_fps = video_info.fps
-		ctx.tmp_dir = tmp_dir
-		ctx.final_dir = final_dir
+		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}__r{ref_hash}"
+		ctx.tmp_dir = self.samples_root / f".tmp_{ctx.sample_id}"
+		ctx.final_dir = self.samples_root / ctx.sample_id
+		if ctx.final_dir.exists() or ctx.tmp_dir.exists():
+			raise RejectedSample(f"Sample already exists or is in progress: {ctx.sample_id}")
+		ctx.tmp_dir.mkdir(parents=True)
+		(ctx.tmp_dir / "intermediate").mkdir()
 		ctx.manifest_entry = {
 			"sample_id": ctx.sample_id,
 			"scene_id": ctx.scene_id,
@@ -579,37 +628,14 @@ class DataSamplingStage:
 			"ref_imgs": [],
 			"gt_clip": {},
 			"synthesized_prompt": "",
-			"distilled_prompts": {
-				"medium": "",
-				"coarse": "",
-			},
+			"distilled_prompts": {},
 		}
 		try:
-			gt_clip_path = tmp_dir / "gt_clip.mp4"
-			self._prepare_gt_clip(
-				ctx=ctx,
-				video_info=video_info,
-				clip_path=gt_clip_path
-			)
-			self._prepare_start_frame(
-				ctx=ctx, 
-				ref_sources=ref_sources,
-				video_info=video_info,
-				clip_path=gt_clip_path
-			)
+			self._prepare_gt_clip(ctx)
+			self._prepare_start_frame(ctx, ref_sources)
 			self._prepare_reference_images(ctx, ref_sources)
-			write_json(ctx.intermediate_dir / "sampling_metadata.json", {
-				"source_scene_id": ctx.scene_id,
-				"start_frame": ctx.start_frame,
-				"clip_frames": ctx.clip_frames,
-				"reference_sources": [{
-					"index": index,
-					"ref_id": source.ref_id,
-					"kind": source.kind,
-				} for index, source in enumerate(ref_sources, start=1)],
-			})
 		except Exception:
-			shutil.rmtree(tmp_dir, ignore_errors=True)
+			shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
 			raise
 
 
@@ -649,6 +675,8 @@ class MotionExtractionStage:
 	def _load_pose_sequence(self, path: Path) -> list[np.ndarray | None]:
 		"""Load aligned iPhone poses, falling back to raw poses."""
 
+		if not path.exists():
+			raise RejectedSample(f"Missing iPhone pose file: {path}")
 		payload = read_json(path)
 		poses_payload = payload.get("aligned_poses")
 		if poses_payload is None:
@@ -674,7 +702,7 @@ class MotionExtractionStage:
 		roll = math.degrees(math.atan2(-down[0], down[1]))
 		return yaw, pitch, roll
 
-	def _valid_clip_poses(self, poses: list[np.ndarray | None]) -> tuple[list[np.ndarray], float]:
+	def _valid_clip_poses(self, poses: list[np.ndarray | None]) -> list[np.ndarray]:
 		"""Return valid whole-clip poses."""
 		
 		valid_poses = [pose for pose in poses if pose is not None]
@@ -713,7 +741,7 @@ class MotionExtractionStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
-		all_poses = self._load_pose_sequence(ctx.scene.iphone_pose_intrinsic_imu_path)
+		all_poses = self._load_pose_sequence(ctx.require_source_pose_path())
 		clip_poses = all_poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
@@ -770,12 +798,13 @@ class TextGenerationBackend:
 	The backend keeps generation policy centralized for all language-only stages:
 	sampling uses no top-k, `top_p=0.9`, and KV caching; temperature `0.0`
 	switches to deterministic decoding. When `cpu_offload` is enabled, the model
-	stays on CPU between calls and is moved to the worker GPU only while
-	generating.
+	stays on CPU between active sessions and can remain on the worker GPU across
+	adjacent stages that share the same backend.
 	"""
 
 	def __init__(self, model_path: str, local_rank: int | None, cpu_offload: bool = False):
 		self.cpu_offload = cpu_offload
+		self._active_lease_count = 0
 		self.target_device = torch.device(
 			f"cuda:{local_rank}" if torch.cuda.is_available() and local_rank is not None else
 			"cuda" if torch.cuda.is_available() else
@@ -799,16 +828,20 @@ class TextGenerationBackend:
 		self.model.eval()
 
 	def _activate(self) -> torch.device:
-		"""Move the model to its active device and return that device."""
+		"""Acquire one active-device lease and return the generation device."""
 
-		if self.cpu_offload and self.target_device.type == "cuda":
+		if self.cpu_offload and self.target_device.type == "cuda" and self._active_lease_count == 0:
 			self.model.to(self.target_device)
+		self._active_lease_count += 1
 		return self.target_device if not self.cpu_offload or self.target_device.type == "cuda" else torch.device("cpu")
 
 	def _deactivate(self) -> None:
-		"""Move the model back to CPU after generation when offload is enabled."""
+		"""Release one active-device lease and offload after the last lease."""
 
-		if self.cpu_offload and self.target_device.type == "cuda":
+		if self._active_lease_count <= 0:
+			return
+		self._active_lease_count -= 1
+		if self.cpu_offload and self.target_device.type == "cuda" and self._active_lease_count == 0:
 			self.model.to("cpu")
 			torch.cuda.empty_cache()
 
@@ -830,7 +863,7 @@ class TextGenerationBackend:
 			})
 		return kwargs
 	
-	def _extract_json_response(text: str) -> Any:
+	def _extract_json_response(self, text: str) -> Any:
 		"""Parse the first JSON object from a model response."""
 
 		candidate = text.strip()
@@ -850,6 +883,16 @@ class TextGenerationBackend:
 				return json.loads(candidate[start:(end + 1)])
 			raise
 
+	@contextmanager
+	def active_session(self):
+		"""Keep an offloaded backend active across a contiguous stage group."""
+
+		self._activate()
+		try:
+			yield
+		finally:
+			self._deactivate()
+	
 	def generate(self, prompt: str, temperature: float, max_new_tokens: int, media: list[dict[str, Any]] | None = None) -> str:
 		"""Generate text from a prompt."""
 
@@ -903,6 +946,7 @@ class VisionLanguageBackend(TextGenerationBackend):
 
 	def __init__(self, model_path: str, local_rank: int | None, cpu_offload: bool = False):
 		self.cpu_offload = cpu_offload
+		self._active_lease_count = 0
 		self.target_device = torch.device(
 			f"cuda:{local_rank}" if torch.cuda.is_available() and local_rank is not None else
 			"cuda" if torch.cuda.is_available() else
@@ -1037,7 +1081,7 @@ class VideoCaptioningStage:
 			max_new_tokens=self.args.video_captioning_vlm_max_new_tokens,
 			media=[{
 				"type": "video",
-				"path": str(ctx.tmp_dir / "gt_clip.mp4"),
+				"path": str(ctx.gt_clip_path),
 				"fps": self.args.video_captioning_fps,
 				"resized_width": self.args.video_captioning_width,
 				"resized_height": self.args.video_captioning_height,
@@ -1079,7 +1123,7 @@ class ImageCaptioningStage:
 				max_new_tokens=self.args.image_captioning_vlm_max_new_tokens,
 				media=[{
 					"type": "image",
-					"path": str(ctx.tmp_dir / "ref_imgs" / f"ref_{index:02d}.jpg"),
+					"path": str(ctx.ref_img_dir / f"ref_{index:02d}.jpg"),
 					"resized_width": self.args.image_captioning_width,
 					"resized_height": self.args.image_captioning_height,
 				}],
@@ -1251,16 +1295,18 @@ def commit_sample(args: Namespace, ctx: SampleContext) -> bool | None:
 		global target has already been reached.
 	"""
 
+	tmp_dir = ctx.require_tmp_dir()
+	final_dir = ctx.require_final_dir()
 	with exclusive_lock(args):
 		state = read_json(state_path(args))
 		if state["current_count"] >= state["target_count"]:
-			shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+			shutil.rmtree(tmp_dir, ignore_errors=True)
 			return None
-		if ctx.final_dir.exists():
-			shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+		if final_dir.exists():
+			shutil.rmtree(tmp_dir, ignore_errors=True)
 			return False
-		write_json(ctx.tmp_dir / "sample.json", ctx.manifest_entry)
-		os.replace(ctx.tmp_dir, ctx.final_dir)
+		write_json(tmp_dir / "sample.json", ctx.manifest_entry)
+		os.replace(tmp_dir, final_dir)
 		append_jsonl(manifest_path(args), ctx.manifest_entry)
 		state["current_count"] += 1
 		write_json(state_path(args), state)
@@ -1290,6 +1336,50 @@ def initialize_state(args: Namespace) -> None:
 		})
 	
 
+def cleanup_sample_tmp(ctx: SampleContext) -> None:
+	"""Remove a sample temporary directory without risking unrelated paths."""
+
+	tmp_dir = ctx.tmp_dir
+	if tmp_dir is None:
+		return
+	if tmp_dir.name.startswith(".tmp_"):
+		shutil.rmtree(tmp_dir, ignore_errors=True)
+	ctx.tmp_dir = None
+
+
+def stage_generation_backend(stage: Callable[[SampleContext], None]) -> TextGenerationBackend | None:
+	"""Return the model backend owned by a generation stage, if it has one."""
+
+	backend = getattr(stage, "llm", None)
+	if isinstance(backend, TextGenerationBackend):
+		return backend
+	backend = getattr(stage, "vlm", None)
+	if isinstance(backend, TextGenerationBackend):
+		return backend
+	return None
+
+
+def run_stages(stages: list[Callable[[SampleContext], None]], ctx: SampleContext) -> None:
+	"""Run stages while keeping shared offloaded backends resident across groups."""
+
+	index = 0
+	while index < len(stages):
+		backend = stage_generation_backend(stages[index])
+		if backend is None:
+			stages[index](ctx)
+			index += 1
+			continue
+
+		group_end = index + 1
+		while group_end < len(stages) and stage_generation_backend(stages[group_end]) is backend:
+			group_end += 1
+
+		with backend.active_session():
+			for stage in stages[index:group_end]:
+				stage(ctx)
+		index = group_end
+
+
 def run_worker(args: Namespace, worker_index: int = 0) -> None:
 	"""Run one independent sample-generation loop."""
 
@@ -1302,8 +1392,6 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 			torch.cuda.set_device(local_rank)
 	else:
 		local_rank = None
-
-	# TODO: With CPU offloading enabled, each stage will move its backend to the target device at the start, then move it back to CPU at the end. But this is not efficient, because some consecutive stages (all stages after image captioning) use the same backbone, and there is no need to move the backbone between these stages. Think of a clever mechanism to achieve this goal.
 	
 	seed = process_seed(args, worker_index)
 	rng = random.Random(seed)
@@ -1342,8 +1430,7 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 			break
 		ctx = SampleContext()
 		try:
-			for stage in stages:
-				stage(ctx)
+			run_stages(stages, ctx)
 			result = commit_sample(args, ctx)
 			if result is None:
 				break
@@ -1351,12 +1438,10 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 				updated_state = read_json(state_path(args))
 				print(f"[worker {worker_index}] committed {ctx.sample_id} ({updated_state['current_count']}/{updated_state['target_count']})", flush=True)
 		except RejectedSample as error:
-			if ctx is not None:
-				shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+			cleanup_sample_tmp(ctx)
 			print(f"[worker {worker_index}] rejected sample: {error}", flush=True)
 		except Exception:
-			if ctx is not None:
-				shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+			cleanup_sample_tmp(ctx)
 			raise
 
 
