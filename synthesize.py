@@ -41,6 +41,7 @@ class RejectedSample(Exception):
 	"""Expected rejection for a sampled candidate that fails a curation gate."""
 
 
+# TODO: There is no need for this class, SampleContext should do its job.
 @dataclass
 class VideoInfo:
 	"""Basic video stream metadata used for deterministic clip sampling."""
@@ -52,6 +53,7 @@ class VideoInfo:
 	duration_s: float
 
 
+# TODO: There is no need for this class.
 @dataclass
 class DslrCandidate:
 	"""One valid DSLR reference-image candidate."""
@@ -259,146 +261,6 @@ class DataSamplingStage:
 			raise ValueError(f"ScanNet++ split file is empty: {path}")
 		return scene_ids
 	
-	def _probe_video(self, path: Path) -> VideoInfo:
-		"""Probe video stream metadata."""
-
-		probe = ffmpeg.probe(str(path), select_streams="v:0")
-		streams = probe.get("streams") or []
-		if not streams:
-			raise RuntimeError(f"No video stream found in {path}")
-		stream = streams[0]
-
-		def rational_to_float(value: str | None) -> float | None:
-			"""Parse an FFprobe rational number such as `60000/1001`."""
-
-			if value is None or value in {"0/0", "N/A", ""}:
-				return None
-			if "/" in value:
-				numerator, denominator = value.split("/", 1)
-				den = float(denominator)
-				if den == 0:
-					return None
-				return float(numerator) / den
-			return float(value)
-		
-		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
-		if fps is None or fps <= 0:
-			raise RuntimeError(f"Could not determine FPS for video: {path}")
-		duration = float(stream.get("duration") or 0.0)
-		num_frames_raw = stream.get("nb_frames")
-		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
-		if num_frames <= 0 and duration > 0:
-			num_frames = int(round(duration * fps))
-		if num_frames <= 0:
-			raise RuntimeError(f"Could not determine frame count for video: {path}")
-		return VideoInfo(
-			width=int(stream["width"]),
-			height=int(stream["height"]),
-			fps=float(fps),
-			num_frames=num_frames,
-			duration_s=duration if duration > 0 else num_frames / float(fps),
-		)
-
-	def _extract_square_clip(
-		self,
-		video_path: Path,
-		output_path: Path,
-		start_frame: int,
-		fps: float,
-		duration_s: float,
-	) -> None:
-		"""Extract and center-crop one clip while preserving the source FPS."""
-
-		start_time = start_frame / fps
-		stream = ffmpeg.input(str(video_path), ss=start_time, t=duration_s).video
-		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("fps", fps=fps)
-		stream = ffmpeg.output(
-			stream,
-			str(output_path),
-			vcodec="libx264",
-			crf=18,
-			pix_fmt="yuv420p",
-			an=None,
-		).overwrite_output()
-		try:
-			ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
-		except ffmpeg.Error as error:
-			message = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
-			raise RuntimeError(f"ffmpeg failed while writing {output_path}: {message}") from error
-
-	def _decode_first_frame(self, video_path: Path) -> Image.Image:
-		"""Decode the first RGB frame from a video file."""
-
-		for frame in iio.imiter(video_path):
-			return Image.fromarray(frame).convert("RGB")
-		raise RejectedSample(f"No frames decoded from {video_path}")
-
-	def _center_crop_square_image(self, image: Image.Image) -> Image.Image:
-		"""Return the largest centered square crop of an image."""
-
-		width, height = image.size
-		side = min(width, height)
-		left = (width - side) // 2
-		top = (height - side) // 2
-		return image.crop((left, top, left + side, top + side))
-
-	def _image_mask_valid_fraction(self, mask_path: Path | None) -> float:
-		"""Compute one DSLR reference mask valid-pixel fraction."""
-
-		if mask_path is None or not mask_path.exists():
-			return 1.0
-		with Image.open(mask_path) as image:
-			mask = np.asarray(self._center_crop_square_image(image.convert("L")))
-		if mask.ndim == 3:
-			mask = np.max(mask[..., :3], axis=-1)
-		return float((mask > 127).mean())
-
-	def _stream_mask_fraction(
-		self,
-		mask_path: Path,
-		start_frame: int,
-		fps: float,
-		duration_s: float,
-		crop_side: int,
-		max_frames: int | None = None,
-	) -> float:
-		"""Stream a cropped mask clip through FFmpeg and compute valid pixels."""
-
-		if not mask_path.exists():
-			return 1.0
-		start_time = start_frame / fps
-		stream = ffmpeg.input(str(mask_path), ss=start_time, t=duration_s).video
-		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("format", "gray")
-		output_kwargs: dict[str, Any] = {
-			"format": "rawvideo",
-			"pix_fmt": "gray",
-		}
-		if max_frames is not None:
-			output_kwargs["vframes"] = max_frames
-		stream = ffmpeg.output(stream, "pipe:", **output_kwargs)
-		process = stream.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
-		assert process.stdout is not None
-		frame_size = crop_side * crop_side
-		valid_pixels = 0
-		total_pixels = 0
-		while True:
-			chunk = process.stdout.read(frame_size)
-			if not chunk:
-				break
-			if len(chunk) != frame_size:
-				break
-			mask = np.frombuffer(chunk, dtype=np.uint8)
-			valid_pixels += int((mask > 127).sum())
-			total_pixels += mask.size
-		_, stderr = process.communicate()
-		if process.returncode not in {0, None} and total_pixels == 0:
-			raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-		if total_pixels == 0:
-			return 1.0
-		return valid_pixels / total_pixels
-
 	def _load_dslr_candidates(self, scene: ScannetppScene_Release) -> list[DslrCandidate]:
 		"""Load DSLR reference candidates that are not marked as bad."""
 
@@ -439,40 +301,46 @@ class DataSamplingStage:
 			ref_id = f"dslr:{image_path.name}"
 			candidates[ref_id] = DslrCandidate(image_path=image_path, mask_path=mask_path, ref_id=ref_id)
 		return [candidates[key] for key in sorted(candidates)]
-
-	def _valid_fraction_for_source(self, source: RefSource) -> float:
-		"""Return the already-known or mask-derived valid-pixel fraction."""
-
-		if source.valid_fraction is not None:
-			return source.valid_fraction
-		return self._image_mask_valid_fraction(source.mask_path)
 	
-	def _prepare_start_reference(
-		self,
-		ctx: SampleContext,
-		ref_sources: list[RefSource],
-		video_info: VideoInfo,
-		start_image: Image.Image,
-	) -> float:
-		"""Materialize the video start frame so every reference follows one path."""
+	def _probe_video(self, path: Path) -> VideoInfo:
+		"""Probe video stream metadata."""
 
-		if not any(source.is_start_frame for source in ref_sources):
-			return 1.0
-		start_valid_fraction = self._stream_mask_fraction(
-			ctx.scene.iphone_video_mask_path,
-			start_frame=ctx.start_frame,
-			fps=video_info.fps,
-			duration_s=1.0 / video_info.fps,
-			crop_side=min(video_info.width, video_info.height),
-			max_frames=1,
+		probe = ffmpeg.probe(str(path), select_streams="v:0")
+		streams = probe.get("streams") or []
+		if not streams:
+			raise RuntimeError(f"No video stream found in {path}")
+		stream = streams[0]
+
+		def rational_to_float(value: str | None) -> float | None:
+			"""Parse an FFprobe rational number such as `60000/1001`."""
+
+			if value is None or value in {"0/0", "N/A", ""}:
+				return None
+			if "/" in value:
+				numerator, denominator = value.split("/", 1)
+				den = float(denominator)
+				if den == 0:
+					return None
+				return float(numerator) / den
+			return float(value)
+		
+		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
+		if fps is None or fps <= 0:
+			raise RuntimeError(f"Could not determine FPS for video: {path}")
+		duration = float(stream.get("duration") or 0.0)
+		num_frames_raw = stream.get("nb_frames")
+		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
+		if num_frames <= 0 and duration > 0:
+			num_frames = int(round(duration * fps))
+		if num_frames <= 0:
+			raise RuntimeError(f"Could not determine frame count for video: {path}")
+		return VideoInfo(
+			width=int(stream["width"]),
+			height=int(stream["height"]),
+			fps=float(fps),
+			num_frames=num_frames,
+			duration_s=duration if duration > 0 else num_frames / float(fps),
 		)
-		start_path = ctx.intermediate_dir / "start_frame_reference.jpg"
-		start_image.save(start_path, quality=95)
-		for source in ref_sources:
-			if source.is_start_frame:
-				source.image_path = start_path
-				source.valid_fraction = start_valid_fraction
-		return start_valid_fraction
 	
 	def _select_references(
 		self,
@@ -483,12 +351,6 @@ class DataSamplingStage:
 
 		num_refs = self.rng.randint(1, self.args.max_ref_images)
 		include_start = self.rng.random() < self.args.include_start_frame_prob
-		dslr_needed = num_refs - int(include_start)
-		candidates = self._load_dslr_candidates(scene)
-		if len(candidates) < dslr_needed:
-			raise RejectedSample(
-				f"Scene {scene.scene_id} has {len(candidates)} usable DSLR images, needs {dslr_needed}."
-			)
 		ref_sources: list[RefSource] = []
 		if include_start:
 			ref_sources.append(RefSource(
@@ -498,6 +360,13 @@ class DataSamplingStage:
 				mask_path=None,
 				is_start_frame=True,
 			))
+		# TODO: The following two steps can be merged into a single step. Rather than first creating all DslrCandidate instances and copy a subset into RefSource instances, you can directly creating the specified number of RefSource instances, then there is no need for the DslrCandidate class at all.
+		dslr_needed = num_refs - int(include_start)
+		candidates = self._load_dslr_candidates(scene)
+		if len(candidates) < dslr_needed:
+			raise RejectedSample(
+				f"Scene {scene.scene_id} has {len(candidates)} usable DSLR images, needs {dslr_needed}."
+			)
 		for candidate in self.rng.sample(candidates, k=dslr_needed):
 			ref_sources.append(RefSource(
 				kind="dslr",
@@ -508,12 +377,139 @@ class DataSamplingStage:
 			))
 		self.rng.shuffle(ref_sources)
 		return ref_sources
+	
+	def _stream_mask_fraction(
+		self,
+		ctx: SampleContext,
+		video_info: VideoInfo,
+		duration_s: float,
+		max_frames: int | None = None,
+	) -> float:
+		"""Stream a cropped mask clip through FFmpeg and compute valid pixels."""
 
-	def _write_references(
+		if not ctx.scene.iphone_video_mask_path.exists():
+			return 1.0
+		stream = ffmpeg.input(
+			str(ctx.scene.iphone_video_mask_path),
+			ss=ctx.start_frame / video_info.fps,
+			t=duration_s
+		).video
+		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
+		stream = stream.filter("fps", fps=video_info.fps)
+		stream = stream.filter("format", "gray")
+		output_kwargs: dict[str, Any] = {
+			"format": "rawvideo",
+			"pix_fmt": "gray",
+		}
+		if max_frames is not None:
+			output_kwargs["vframes"] = max_frames
+		stream = ffmpeg.output(stream, "pipe:", **output_kwargs)
+		process = stream.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
+		assert process.stdout is not None
+		frame_size = min(video_info.width, video_info.height) ** 2
+		valid_pixels = 0
+		total_pixels = 0
+		while True:
+			chunk = process.stdout.read(frame_size)
+			if not chunk:
+				break
+			if len(chunk) != frame_size:
+				break
+			mask = np.frombuffer(chunk, dtype=np.uint8)
+			valid_pixels += int((mask > 127).sum())
+			total_pixels += mask.size
+		_, stderr = process.communicate()
+		if process.returncode not in {0, None} and total_pixels == 0:
+			raise RuntimeError(stderr.decode("utf-8", errors="replace"))
+		if total_pixels == 0:
+			return 1.0
+		return valid_pixels / total_pixels
+	
+	def _prepare_gt_clip(
+		self,
+		ctx: SampleContext,
+		video_info: VideoInfo,
+		clip_path: Path
+	) -> None:
+		"""Extract and center-crop one clip while preserving the source FPS."""
+
+		video_valid_fraction = self._stream_mask_fraction(
+			ctx=ctx, duration_s=self.args.clip_seconds
+		)
+		if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
+			raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
+
+		stream = ffmpeg.input(
+			str(ctx.scene.iphone_video_path),
+			ss=ctx.start_frame / video_info.fps,
+			t=self.args.clip_seconds
+		).video
+		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
+		stream = stream.filter("fps", fps=video_info.fps)
+		stream = ffmpeg.output(
+			stream, str(clip_path),
+			vcodec="libx264", crf=18, pix_fmt="yuv420p", an=None,
+		).overwrite_output()
+		try:
+			ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
+			ctx.manifest_entry["gt_clip"] = {
+				"fps": video_info.fps,
+				"duration_sec": self.args.clip_seconds,
+				"width": min(video_info.width, video_info.height),
+				"height": min(video_info.width, video_info.height),
+				"path": f"samples/{ctx.sample_id}/gt_clip.mp4",
+			},
+		except ffmpeg.Error as error:
+			message = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
+			raise RuntimeError(f"ffmpeg failed while writing {clip_path}: {message}") from error
+	
+	def _prepare_start_frame(
 		self,
 		ctx: SampleContext,
 		ref_sources: list[RefSource],
-	) -> list[dict[str, Any]]:
+		video_info: VideoInfo,
+		clip_path: Path,
+	) -> None:
+		"""Materialize the video start frame so every reference follows one path."""
+
+		if not any(source.is_start_frame for source in ref_sources):
+			return
+		start_valid_fraction = self._stream_mask_fraction(
+			ctx=ctx, duration_s=1.0 / video_info.fps, max_frames=1
+		)
+		start_image = Image.fromarray(next(iio.imiter(clip_path))).convert("RGB")
+		start_path = ctx.intermediate_dir / "start_frame.jpg"
+		start_image.save(start_path, quality=95)
+		for source in ref_sources:
+			if source.is_start_frame:
+				source.image_path = start_path
+				source.valid_fraction = start_valid_fraction
+	
+	def _center_crop_square_image(self, image: Image.Image) -> Image.Image:
+		"""Return the largest centered square crop of an image."""
+
+		width, height = image.size
+		side = min(width, height)
+		left = (width - side) // 2
+		top = (height - side) // 2
+		return image.crop((left, top, left + side, top + side))
+
+	def _image_mask_valid_fraction(self, mask_path: Path | None) -> float:
+		"""Compute one DSLR reference mask valid-pixel fraction."""
+
+		if mask_path is None or not mask_path.exists():
+			return 1.0
+		with Image.open(mask_path) as image:
+			mask = np.asarray(self._center_crop_square_image(image.convert("L")))
+		if mask.ndim == 3:
+			mask = np.max(mask[..., :3], axis=-1)
+		return float((mask > 127).mean())
+
+	def _prepare_reference_images(
+		self,
+		ctx: SampleContext,
+		ref_sources: list[RefSource],
+	) -> None:
 		"""Copy selected references into fixed sample order."""
 
 		ref_dir = ctx.tmp_dir / "ref_imgs"
@@ -524,7 +520,7 @@ class DataSamplingStage:
 				raise RejectedSample("Reference source has no materialized image path.")
 			with Image.open(source.image_path) as loaded:
 				image = self._center_crop_square_image(loaded.convert("RGB"))
-			valid_fraction = self._valid_fraction_for_source(source)
+			valid_fraction = source.valid_fraction or self._image_mask_valid_fraction(source.mask_path)
 			if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
 				raise RejectedSample(
 					f"Reference valid fraction {valid_fraction:.4f} below threshold."
@@ -538,11 +534,13 @@ class DataSamplingStage:
 				"height": image.height,
 				"path": f"samples/{ctx.sample_id}/ref_imgs/{output_name}",
 			})
-		return metadata
+		ctx.manifest_entry["ref_imgs"] = metadata
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Create one sampled candidate under `samples/.tmp_<sample_id>`."""
 
+		# TODO: Currently, separate VideoInfo instance and SampleContext instances are created and passed around, but they have overlapping roles. There is no need for a VideoInfo dataclass, you can put everything into SampleContext, which encapsulates all source and target information, including data sampling metadata, media specs, all paths, etc. and can be passed around. Do this without changing the overall implementation.
+		
 		scene_id = self.rng.choice(self.scene_ids)
 		scene = ScannetppScene_Release(scene_id, data_root=self.data_root)
 		if not scene.iphone_video_path.exists():
@@ -561,84 +559,54 @@ class DataSamplingStage:
 		final_dir = self.samples_root / sample_id
 		if final_dir.exists() or tmp_dir.exists():
 			raise RejectedSample(f"Sample already exists or is in progress: {sample_id}")
-
 		tmp_dir.mkdir(parents=True)
 		(tmp_dir / "intermediate").mkdir()
+		
+		ctx.scene_id = scene_id
+		ctx.scene_type = str(self.scene_types.get(scene_id, "unknown"))
+		ctx.scene = scene
+		ctx.sample_id = sample_id
+		ctx.start_frame = start_frame
+		ctx.clip_frames = clip_frames
+		ctx.video_fps = video_info.fps
+		ctx.tmp_dir = tmp_dir
+		ctx.final_dir = final_dir
+		ctx.manifest_entry = {
+			"sample_id": ctx.sample_id,
+			"scene_id": ctx.scene_id,
+			"scene_type": ctx.scene_type,
+			"split": self.args.split,
+			"ref_imgs": [],
+			"gt_clip": {},
+			"synthesized_prompt": "",
+			"distilled_prompts": {
+				"medium": "",
+				"coarse": "",
+			},
+		}
 		try:
 			gt_clip_path = tmp_dir / "gt_clip.mp4"
-			self._extract_square_clip(
-				scene.iphone_video_path,
-				gt_clip_path,
-				start_frame=start_frame,
-				fps=video_info.fps,
-				duration_s=self.args.clip_seconds,
+			self._prepare_gt_clip(
+				ctx=ctx,
+				video_info=video_info,
+				clip_path=gt_clip_path
 			)
-			start_image = self._decode_first_frame(gt_clip_path)
-			clip_width, clip_height = start_image.size
-			video_valid_fraction = self._stream_mask_fraction(
-				scene.iphone_video_mask_path,
-				start_frame=start_frame,
-				fps=video_info.fps,
-				duration_s=self.args.clip_seconds,
-				crop_side=min(video_info.width, video_info.height),
+			self._prepare_start_frame(
+				ctx=ctx, 
+				ref_sources=ref_sources,
+				video_info=video_info,
+				clip_path=gt_clip_path
 			)
-			if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
-				raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
-			start_valid_fraction = self._stream_mask_fraction(
-				scene.iphone_video_mask_path,
-				start_frame=start_frame,
-				fps=video_info.fps,
-				duration_s=1.0 / video_info.fps,
-				crop_side=min(video_info.width, video_info.height),
-				max_frames=1,
-			)
-			
-			ctx.scene_id = scene_id
-			ctx.scene_type = str(self.scene_types.get(scene_id, "unknown"))
-			ctx.scene = scene
-			ctx.sample_id = sample_id
-			ctx.start_frame = start_frame
-			ctx.clip_frames = clip_frames
-			ctx.video_fps = video_info.fps
-			ctx.tmp_dir = tmp_dir
-			ctx.final_dir = final_dir
-
-			start_valid_fraction = self._prepare_start_reference(ctx, ref_sources, video_info, start_image)
-			ref_metadata = self._write_references(ctx, ref_sources)
-			ctx.manifest_entry = {
-				"sample_id": sample_id,
-				"scene_id": scene_id,
-				"scene_type": ctx.scene_type,
-				"split": self.args.split,
-				"ref_imgs": ref_metadata,
-				"gt_clip": {
-					"fps": video_info.fps,
-					"duration_sec": self.args.clip_seconds,
-					"width": clip_width,
-					"height": clip_height,
-					"path": f"samples/{sample_id}/gt_clip.mp4",
-				},
-				"synthesized_prompt": "",
-				"distilled_prompts": {
-					"medium": "",
-					"coarse": "",
-				},
-			}
+			self._prepare_reference_images(ctx, ref_sources)
 			write_json(ctx.intermediate_dir / "sampling_metadata.json", {
-				"source_scene_id": scene_id,
-				"start_frame": start_frame,
-				"clip_frames": clip_frames,
-				"video_valid_fraction": video_valid_fraction,
-				"start_frame_valid_fraction": start_valid_fraction,
-				"reference_sources": [
-					{
-						"index": index,
-						"ref_id": source.ref_id,
-						"kind": source.kind,
-						"is_start_frame": source.is_start_frame,
-					}
-					for index, source in enumerate(ref_sources, start=1)
-				],
+				"source_scene_id": ctx.scene_id,
+				"start_frame": ctx.start_frame,
+				"clip_frames": ctx.clip_frames,
+				"reference_sources": [{
+					"index": index,
+					"ref_id": source.ref_id,
+					"kind": source.kind,
+				} for index, source in enumerate(ref_sources, start=1)],
 			})
 		except Exception:
 			shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -742,7 +710,7 @@ class MotionExtractionStage:
 			f"{prefix}delta_roll_deg": self._round(roll),
 		}
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
 		all_poses = self._load_pose_sequence(ctx.scene.iphone_pose_intrinsic_imu_path)
@@ -1019,7 +987,7 @@ class MotionDigestingStage:
 		self.args = args
 		self.llm = llm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `motion_caption.json`."""
 
 		motion_extraction_json = json.dumps(
@@ -1052,7 +1020,7 @@ class VideoCaptioningStage:
 		self.args = args
 		self.vlm = vlm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `video_caption.json`."""
 
 		motion_caption_json = json.dumps(
@@ -1093,16 +1061,16 @@ class ImageCaptioningStage:
 		self.args = args
 		self.vlm = vlm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `image_captions.json`."""
 
 		captions: list[str] = []
 		for ref in ctx.manifest_entry["ref_imgs"]:
-			ref_index = str(ref["index"])
+			index = ref["index"]
 			is_video_start_clause = "is" if ref["is_start_frame"] else "is not"
 			prompt = (
 				IMAGE_CAPTIONING_TEMPLATE
-				.replace("<REF_INDEX>", ref_index)
+				.replace("<REF_INDEX>", str(index))
 				.replace("<IS_VIDEO_START_CLAUSE>", is_video_start_clause)
 			)
 			result = self.vlm.generate_json(
@@ -1134,7 +1102,7 @@ class CaptionWiringStage:
 		self.args = args
 		self.llm = llm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `wired_caption.json`."""
 
 		video_caption_json = json.dumps(
@@ -1172,7 +1140,7 @@ class CaptionRephrasingStage:
 		self.args = args
 		self.llm = llm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Update the manifest entry with `synthesized_prompt`."""
 
 		wired_caption_json = json.dumps(
@@ -1203,7 +1171,7 @@ class CriticJudgingStage:
 		self.args = args
 		self.llm = llm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `critic_judging.json` and reject invalid prompt candidates."""
 
 		motion_caption_json = json.dumps(read_json(
@@ -1256,7 +1224,7 @@ class DistillationStage:
 		self.args = args
 		self.llm = llm
 
-	def run(self, ctx: SampleContext) -> None:
+	def __call__(self, ctx: SampleContext) -> None:
 		"""Update the manifest entry with distilled prompt variants."""
 
 		synthesized_prompt = ctx.manifest_entry["synthesized_prompt"]
@@ -1357,15 +1325,15 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 		cpu_offload=args.llm_cpu_offload
 	)
 	stages: list[Callable[[SampleContext], None]] = [
-		DataSamplingStage(args, rng).run,
-		MotionExtractionStage(args).run,
-		MotionDigestingStage(args, llm).run,
-		VideoCaptioningStage(args, vlm).run,
-		ImageCaptioningStage(args, vlm).run,
-		CaptionWiringStage(args, llm).run,
-		CaptionRephrasingStage(args, llm).run,
-		CriticJudgingStage(args, llm).run,
-		DistillationStage(args, llm).run,
+		DataSamplingStage(args, rng),
+		MotionExtractionStage(args),
+		MotionDigestingStage(args, llm),
+		VideoCaptioningStage(args, vlm),
+		ImageCaptioningStage(args, vlm),
+		CaptionWiringStage(args, llm),
+		CaptionRephrasingStage(args, llm),
+		CriticJudgingStage(args, llm),
+		DistillationStage(args, llm),
 	]
 
 	while True:
