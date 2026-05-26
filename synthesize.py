@@ -539,6 +539,7 @@ class DataSamplingStage:
 
 		if not any(source.is_start_frame for source in ref_sources):
 			return
+		# TODO: To compute the valid fraction for the start frame, why not this more intuitive approach: decode using imageio then save it to intermediate folder, just like what you did with the start image, then it can be processed similarly as other reference images in `_prepare_reference_images`.
 		start_valid_fraction = self._stream_mask_fraction(
 			ctx=ctx, duration_s=1.0 / ctx.video_fps, max_frames=1
 		)
