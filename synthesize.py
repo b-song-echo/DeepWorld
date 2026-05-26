@@ -461,22 +461,23 @@ class DataSamplingStage:
 		mask_path = ctx.require_source_video_mask_path()
 		if not mask_path.exists():
 			return 1.0
-		stream = ffmpeg.input(
-			str(mask_path),
-			ss=ctx.start_frame / ctx.video_fps,
-			t=duration_s
-		).video
-		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("fps", fps=ctx.video_fps)
-		stream = stream.filter("format", "gray")
-		output_kwargs: dict[str, Any] = {
-			"format": "rawvideo",
-			"pix_fmt": "gray",
-		}
+		
+		side = "min(iw,ih)"
+		crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
+		output_kwargs = {"format": "rawvideo", "pix_fmt": "gray"}
 		if max_frames is not None:
 			output_kwargs["vframes"] = max_frames
-		stream = ffmpeg.output(stream, "pipe:", **output_kwargs)
-		process = stream.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
+		process = (
+			ffmpeg.input(
+				str(mask_path),
+				ss=ctx.start_frame / ctx.video_fps, t=duration_s
+			).video
+			.filter_("crop", *crop_args)
+			.filter_("fps", fps=ctx.video_fps)
+			.filter_("format", "gray")
+			.output("pipe:", **output_kwargs)
+			.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
+		)		
 		assert process.stdout is not None
 		frame_size = ctx.video_square_size ** 2
 		valid_pixels = 0
@@ -505,20 +506,23 @@ class DataSamplingStage:
 		)
 		if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
 			raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
-
-		stream = ffmpeg.input(
-			str(ctx.require_source_video_path()),
-			ss=ctx.start_frame / ctx.video_fps,
-			t=self.args.clip_seconds
-		).video
-		stream = stream.filter_("crop", "min(iw,ih)", "min(iw,ih)", "(iw-min(iw,ih))/2", "(ih-min(iw,ih))/2")
-		stream = stream.filter("fps", fps=ctx.video_fps)
-		stream = ffmpeg.output(
-			stream, str(ctx.gt_clip_path),
-			vcodec="libx264", crf=18, pix_fmt="yuv420p", an=None,
-		).overwrite_output()
 		try:
-			ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
+			side = "min(iw,ih)"
+			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
+			(
+				ffmpeg
+				.input(
+					str(ctx.require_source_video_path()),
+					ss=ctx.start_frame / ctx.video_fps, t=self.args.clip_seconds
+				).video
+				.filter_("crop", *crop_args)
+				.filter_("fps", fps=ctx.video_fps)
+				.output(
+					str(ctx.gt_clip_path),
+					vcodec="libx264", crf=18, pix_fmt="yuv420p", an=None,
+				).overwrite_output()
+				.run(capture_stdout=True, capture_stderr=True, quiet=True)
+			)
 			ctx.manifest_entry["gt_clip"] = {
 				"fps": ctx.video_fps,
 				"duration_sec": self.args.clip_seconds,
