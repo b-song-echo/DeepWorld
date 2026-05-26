@@ -448,7 +448,6 @@ class DataSamplingStage:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
 		mask_path = ctx.require_source_video_mask_path()
-		video_valid_fraction = 1.0
 		if mask_path.exists():
 			side = "min(iw,ih)"
 			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
@@ -466,8 +465,7 @@ class DataSamplingStage:
 			)
 			assert process.stdout is not None
 			frame_size = ctx.video_square_size ** 2
-			valid_pixels = 0
-			total_pixels = 0
+			valid_pixels, total_pixels = 0, 0
 			while True:
 				chunk = process.stdout.read(frame_size)
 				if not chunk:
@@ -478,12 +476,12 @@ class DataSamplingStage:
 				valid_pixels += int((mask > 127).sum())
 				total_pixels += mask.size
 			_, stderr = process.communicate()
-			if process.returncode not in {0, None} and total_pixels == 0:
+			if process.returncode not in {0, None}:
 				raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-			if total_pixels != 0:
+			if total_pixels > 0:
 				video_valid_fraction = valid_pixels / total_pixels
-		if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
-			raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
+				if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
+					raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
 		
 		try:
 			side = "min(iw,ih)"
@@ -551,15 +549,14 @@ class DataSamplingStage:
 		for index, source in enumerate(ref_sources, start=1):
 			if source.image_path is None:
 				raise RejectedSample("Reference source has no materialized image path.")
-			valid_fraction = 1.0
 			if source.mask_path is not None and not source.mask_path.exists():
 				with Image.open(source.mask_path) as image:
 					mask = np.asarray(crop(image.convert("L")))
 				if mask.ndim == 3:
 					mask = np.max(mask[..., :3], axis=-1)
 				valid_fraction = float((mask > 127).mean())
-			if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
-				raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
+				if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
+					raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
 			
 			output_name = f"ref_{index:02d}.jpg"
 			with Image.open(source.image_path) as loaded:
