@@ -51,7 +51,6 @@ class RefSource:
 	image_path: Path | None
 	mask_path: Path | None
 	is_start_frame: bool
-	valid_fraction: float | None = None
 
 
 @dataclass
@@ -389,18 +388,13 @@ class DataSamplingStage:
 			except ValueError:
 				return None
 
-		def optional_float(value: Any) -> float:
-			"""Parse optional FFprobe numeric fields, treating missing values as zero."""
-
-			try:
-				return float(value)
-			except (TypeError, ValueError):
-				return 0.0
-		
 		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
 		if fps is None or fps <= 0:
 			raise RuntimeError(f"Could not determine FPS for video: {path}")
-		duration = optional_float(stream.get("duration"))
+		try:
+			duration = float(stream.get("duration"))
+		except (TypeError, ValueError):
+			duration = 0.0
 		num_frames_raw = stream.get("nb_frames")
 		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
 		if num_frames <= 0 and duration > 0:
@@ -450,62 +444,47 @@ class DataSamplingStage:
 		self.rng.shuffle(ref_sources)
 		return ref_sources
 	
-	def _stream_mask_fraction(
-		self,
-		ctx: SampleContext,
-		duration_s: float,
-		max_frames: int | None = None,
-	) -> float:
-		"""Stream a cropped mask clip through FFmpeg and compute valid pixels."""
-
-		mask_path = ctx.require_source_video_mask_path()
-		if not mask_path.exists():
-			return 1.0
-		
-		side = "min(iw,ih)"
-		crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
-		output_kwargs = {"format": "rawvideo", "pix_fmt": "gray"}
-		if max_frames is not None:
-			output_kwargs["vframes"] = max_frames
-		process = (
-			ffmpeg.input(
-				str(mask_path),
-				ss=ctx.start_frame / ctx.video_fps, t=duration_s
-			).video
-			.filter_("crop", *crop_args)
-			.filter_("fps", fps=ctx.video_fps)
-			.filter_("format", "gray")
-			.output("pipe:", **output_kwargs)
-			.run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
-		)		
-		assert process.stdout is not None
-		frame_size = ctx.video_square_size ** 2
-		valid_pixels = 0
-		total_pixels = 0
-		while True:
-			chunk = process.stdout.read(frame_size)
-			if not chunk:
-				break
-			if len(chunk) != frame_size:
-				break
-			mask = np.frombuffer(chunk, dtype=np.uint8)
-			valid_pixels += int((mask > 127).sum())
-			total_pixels += mask.size
-		_, stderr = process.communicate()
-		if process.returncode not in {0, None} and total_pixels == 0:
-			raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-		if total_pixels == 0:
-			return 1.0
-		return valid_pixels / total_pixels
-	
 	def _prepare_gt_clip(self, ctx: SampleContext) -> None:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
-		video_valid_fraction = self._stream_mask_fraction(
-			ctx=ctx, duration_s=self.args.clip_seconds
-		)
+		mask_path = ctx.require_source_video_mask_path()
+		video_valid_fraction = 1.0
+		if mask_path.exists():
+			side = "min(iw,ih)"
+			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
+			output_kwargs = {"format": "rawvideo", "pix_fmt": "gray"}
+			process = (
+				ffmpeg.input(
+					str(mask_path),
+					ss=ctx.start_frame / ctx.video_fps, t=self.args.clip_seconds
+				).video
+				.filter_("crop", *crop_args)
+				.filter_("fps", fps=ctx.video_fps)
+				.filter_("format", "gray")
+				.output("pipe:", **output_kwargs)
+				.run_async(pipe_stdout=True, pipe_stderr=True)
+			)
+			assert process.stdout is not None
+			frame_size = ctx.video_square_size ** 2
+			valid_pixels = 0
+			total_pixels = 0
+			while True:
+				chunk = process.stdout.read(frame_size)
+				if not chunk:
+					break
+				if len(chunk) != frame_size:
+					break
+				mask = np.frombuffer(chunk, dtype=np.uint8)
+				valid_pixels += int((mask > 127).sum())
+				total_pixels += mask.size
+			_, stderr = process.communicate()
+			if process.returncode not in {0, None} and total_pixels == 0:
+				raise RuntimeError(stderr.decode("utf-8", errors="replace"))
+			if total_pixels != 0:
+				video_valid_fraction = valid_pixels / total_pixels
 		if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
 			raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
+		
 		try:
 			side = "min(iw,ih)"
 			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
@@ -521,7 +500,7 @@ class DataSamplingStage:
 					str(ctx.gt_clip_path),
 					vcodec="libx264", crf=18, pix_fmt="yuv420p", an=None,
 				).overwrite_output()
-				.run(capture_stdout=True, capture_stderr=True, quiet=True)
+				.run(capture_stdout=True, capture_stderr=True)
 			)
 			ctx.manifest_entry["gt_clip"] = {
 				"fps": ctx.video_fps,
@@ -539,40 +518,32 @@ class DataSamplingStage:
 
 		if not any(source.is_start_frame for source in ref_sources):
 			return
-		# TODO: To compute the valid fraction for the start frame, why not this more intuitive approach: decode using imageio then save it to intermediate folder, just like what you did with the start image, then it can be processed similarly as other reference images in `_prepare_reference_images`.
-		start_valid_fraction = self._stream_mask_fraction(
-			ctx=ctx, duration_s=1.0 / ctx.video_fps, max_frames=1
-		)
-		start_image = Image.fromarray(next(iio.imiter(ctx.gt_clip_path))).convert("RGB")
+		def imread(path: Path, index: int) -> Image.Image:
+			return Image.fromarray(iio.imread(path, index=index))
+		
+		start_image = imread(ctx.gt_clip_path, 0).convert("RGB")
 		start_path = ctx.intermediate_dir / "start_frame.jpg"
 		start_image.save(start_path, quality=95)
+
+		start_mask_path: Path | None = None
+		source_mask_path = ctx.require_source_video_mask_path()
+		if source_mask_path.exists():
+			start_mask = imread(source_mask_path, ctx.start_frame).convert("L")
+			start_mask_path = ctx.intermediate_dir / "start_frame_mask.png"
+			start_mask.save(start_mask_path)
+
 		for source in ref_sources:
 			if source.is_start_frame:
 				source.image_path = start_path
-				source.valid_fraction = start_valid_fraction
-	
-	def _center_crop_square_image(self, image: Image.Image) -> Image.Image:
-		"""Return the largest centered square crop of an image."""
-
-		width, height = image.size
-		side = min(width, height)
-		left = (width - side) // 2
-		top = (height - side) // 2
-		return image.crop((left, top, left + side, top + side))
-
-	def _image_mask_valid_fraction(self, mask_path: Path | None) -> float:
-		"""Compute one DSLR reference mask valid-pixel fraction."""
-
-		if mask_path is None or not mask_path.exists():
-			return 1.0
-		with Image.open(mask_path) as image:
-			mask = np.asarray(self._center_crop_square_image(image.convert("L")))
-		if mask.ndim == 3:
-			mask = np.max(mask[..., :3], axis=-1)
-		return float((mask > 127).mean())
+				source.mask_path = start_mask_path
 
 	def _prepare_reference_images(self, ctx: SampleContext, ref_sources: list[RefSource]) -> None:
 		"""Copy selected references into fixed sample order."""
+
+		def crop(image: Image.Image) -> Image.Image:
+			side = min(image.width)
+			left, top = (image.width) // 2, (image.height) // 2
+			return image.crop((left, top, left + side, top + side))
 
 		ref_dir = ctx.ref_img_dir
 		ref_dir.mkdir(parents=True, exist_ok=True)
@@ -580,19 +551,20 @@ class DataSamplingStage:
 		for index, source in enumerate(ref_sources, start=1):
 			if source.image_path is None:
 				raise RejectedSample("Reference source has no materialized image path.")
-			with Image.open(source.image_path) as loaded:
-				image = self._center_crop_square_image(loaded.convert("RGB"))
-			valid_fraction = (
-				source.valid_fraction
-				if source.valid_fraction is not None else
-				self._image_mask_valid_fraction(source.mask_path)
-			)
+			valid_fraction = 1.0
+			if source.mask_path is not None and not source.mask_path.exists():
+				with Image.open(source.mask_path) as image:
+					mask = np.asarray(crop(image.convert("L")))
+				if mask.ndim == 3:
+					mask = np.max(mask[..., :3], axis=-1)
+				valid_fraction = float((mask > 127).mean())
 			if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
-				raise RejectedSample(
-					f"Reference valid fraction {valid_fraction:.4f} below threshold."
-				)
+				raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
+			
 			output_name = f"ref_{index:02d}.jpg"
-			image.save(ref_dir / output_name, quality=95)
+			with Image.open(source.image_path) as loaded:
+				image = crop(loaded.convert("RGB"))
+				image.save(ref_dir / output_name, quality=95)
 			metadata.append({
 				"index": index,
 				"is_start_frame": bool(source.is_start_frame),
