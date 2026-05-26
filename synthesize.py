@@ -482,7 +482,7 @@ class DataSamplingStage:
 				video_valid_fraction = valid_pixels / total_pixels
 				if self.args.filter_pixel_valid_fraction_min is not None and video_valid_fraction < self.args.filter_pixel_valid_fraction_min:
 					raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
-		
+
 		try:
 			side = "min(iw,ih)"
 			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
