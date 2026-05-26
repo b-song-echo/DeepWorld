@@ -1,5 +1,6 @@
 set -euo pipefail
 
+SCRIPT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py"
 SCANNETPP_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf
 OUTPUT_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data
 VLM_BACKBONE_PATH=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
@@ -9,7 +10,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
-python synthesize.py \
+python $SCRIPT \
 	--scannetpp_root $SCANNETPP_ROOT \
 	--output_root $OUTPUT_ROOT \
 	--num_processes 1 \

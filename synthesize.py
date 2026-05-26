@@ -291,7 +291,7 @@ class DataSamplingStage:
 		"""Load the requested ScanNet++ split scene IDs."""
 
 		split_name = "nvs_sem_train.txt" if args.split == "train" else "nvs_sem_val.txt"
-		path = Path(args.scannetpp_root) / "split" / split_name
+		path = Path(args.scannetpp_root) / "splits" / split_name
 		if not path.exists():
 			raise FileNotFoundError(f"ScanNet++ split file not found: {path}")
 		with path.open("r", encoding="utf-8") as handle:
@@ -1352,31 +1352,22 @@ def cleanup_sample_tmp(ctx: SampleContext) -> None:
 	ctx.tmp_dir = None
 
 
-def stage_generation_backend(stage: Callable[[SampleContext], None]) -> TextGenerationBackend | None:
-	"""Return the model backend owned by a generation stage, if it has one."""
-
-	backend = getattr(stage, "llm", None)
-	if isinstance(backend, TextGenerationBackend):
-		return backend
-	backend = getattr(stage, "vlm", None)
-	if isinstance(backend, TextGenerationBackend):
-		return backend
-	return None
-
-
 def run_stages(stages: list[Callable[[SampleContext], None]], ctx: SampleContext) -> None:
 	"""Run stages while keeping shared offloaded backends resident across groups."""
 
+	def get_backend(stage):
+		return getattr(stage, "llm", None) or getattr(stage, "vlm", None)
+
 	index = 0
 	while index < len(stages):
-		backend = stage_generation_backend(stages[index])
+		backend = get_backend(stages[index])
 		if backend is None:
 			stages[index](ctx)
 			index += 1
 			continue
 
 		group_end = index + 1
-		while group_end < len(stages) and stage_generation_backend(stages[group_end]) is backend:
+		while group_end < len(stages) and get_backend(stages[group_end]) is backend:
 			group_end += 1
 
 		with backend.active_session():
