@@ -9,6 +9,7 @@ import random
 import shutil
 import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -362,6 +363,46 @@ class DataSamplingStage:
 	def _probe_video(self, ctx: SampleContext) -> None:
 		"""Probe source video stream metadata into the sample context."""
 
+		def parse_duration(value: Any) -> float | None:
+			if value is None:
+				return None
+			text = str(value).strip()
+			if not text or text == "N/A":
+				return None
+			if ":" not in text:
+				try:
+					duration = float(text)
+				except ValueError:
+					return None
+				return duration if duration > 0 else None
+
+			parts = text.split(":")
+			if len(parts) != 3:
+				return None
+			try:
+				hours, minutes, seconds = parts
+				duration = int(hours) * 3600.0 + int(minutes) * 60.0 + float(seconds)
+			except ValueError:
+				return None
+			return duration if duration > 0 else None
+		
+		def parse_frame_rate(value: Any) -> float | None:
+			if value is None:
+				return None
+			try:
+				fps = float(Fraction(str(value)))
+			except (ValueError, ZeroDivisionError):
+				return None
+			return fps if fps > 0 else None
+
+		def parse_num_frames(value: Any) -> int:
+			if value is None:
+				return 0
+			try:
+				return min(int(value), 0)
+			except ValueError:
+				return 0
+		
 		path = ctx.require_source_video_path()
 		probe = ffmpeg.probe(str(path), select_streams="v:0")
 		streams = probe.get("streams") or []
@@ -369,65 +410,31 @@ class DataSamplingStage:
 			raise RejectedSample(f"No video stream found in {path}")
 		stream = streams[0]
 
-		def rational_to_float(value: str | None) -> float | None:
-			"""Parse an FFprobe rational number such as `60000/1001`."""
+		duration = (
+			parse_duration(stream.get("duration"))
+			or parse_duration((stream.get("tags") or {}).get("DURATION"))
+			or parse_duration((probe.get("format") or {}).get("duration"))
+		)
 
-			if value is None or value in {"0/0", "N/A", ""}:
-				return None
-			if "/" in value:
-				try:
-					numerator, denominator = value.split("/", 1)
-					den = float(denominator)
-					if den == 0:
-						return None
-					return float(numerator) / den
-				except ValueError:
-					return None
-			try:
-				return float(value)
-			except ValueError:
-				return None
-
-		def duration_to_float(value: Any) -> float:
-			"""Parse FFprobe duration values, including Matroska tag timestamps."""
-
-			if value is None:
-				return 0.0
-			text = str(value).strip()
-			if not text or text == "N/A":
-				return 0.0
-			try:
-				return float(text)
-			except ValueError:
-				pass
-			parts = text.split(":")
-			if len(parts) != 3:
-				return 0.0
-			try:
-				hours, minutes, seconds = parts
-				return int(hours) * 3600.0 + int(minutes) * 60.0 + float(seconds)
-			except ValueError:
-				return 0.0
-
-		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
-		if fps is None or fps <= 0:
+		frame_rate = (
+			parse_frame_rate(stream.get("avg_frame_rate"))
+			or parse_frame_rate(stream.get("r_frame_rate"))
+		)
+		if frame_rate is None:
 			raise RejectedSample(f"Could not determine FPS for video: {path}")
-		duration = duration_to_float(stream.get("duration"))
-		if duration <= 0:
-			duration = duration_to_float((stream.get("tags") or {}).get("DURATION"))
-		if duration <= 0:
-			duration = duration_to_float((probe.get("format") or {}).get("duration"))
-		num_frames_raw = stream.get("nb_frames")
-		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
-		if num_frames <= 0 and duration > 0:
-			num_frames = int(round(duration * fps))
+			
+		num_frames = (
+			parse_num_frames(stream.get("nb_frames"))
+			or int(round(frame_rate * (duration or 0.0)))
+		)
 		if num_frames <= 0:
 			raise RejectedSample(f"Could not determine frame count for video: {path}")
+
 		ctx.video_width = int(stream["width"])
 		ctx.video_height = int(stream["height"])
-		ctx.video_fps = float(fps)
+		ctx.video_fps = frame_rate
 		ctx.video_num_frames = num_frames
-		ctx.video_duration_s = duration if duration > 0 else num_frames / float(fps)
+		ctx.video_duration_s = duration if duration is not None else num_frames / frame_rate
 	
 	def _select_reference_images(
 		self,
@@ -650,92 +657,58 @@ class MotionExtractionStage:
 
 	def __init__(self, args: Namespace):
 		self.args = args
-	
-	def _round(self, value: float) -> float:
-		"""Round floats for stable, compact JSON metadata."""
-
-		return round(float(value), 4)
-	
-	def _parse_pose_matrix(self, value: Any) -> np.ndarray | None:
-		"""Convert one pose payload into a finite 4x4 matrix."""
-
-		if value is None:
-			return None
-		if isinstance(value, dict):
-			for key in (
-				"aligned_pose",
-				"aligned_transform_matrix",
-				"camera_to_world",
-				"cam2world",
-				"world_from_camera",
-				"transform_matrix",
-				"pose",
-				"pose_matrix",
-				"matrix",
-				"c2w",
-			):
-				if key in value:
-					value = value[key]
-					break
-		try:
-			array = np.asarray(value, dtype=np.float64)
-		except (TypeError, ValueError):
-			return None
-		if array.shape != (4, 4) or not np.isfinite(array).all():
-			return None
-		return array
-
-	def _pose_sort_key(self, key: Any) -> tuple[int, str]:
-		"""Return a stable frame order for numeric, filename, and string keys."""
-
-		text = str(key)
-		if text.isdigit():
-			return int(text), text
-		stem = Path(text).stem
-		digits = "".join(character for character in stem if character.isdigit())
-		if digits:
-			return int(digits), text
-		return 10**12, text
-
-	def _ordered_pose_values(self, poses_payload: Any) -> list[Any]:
-		"""Return pose entries from a list or frame-keyed dictionary."""
-
-		if isinstance(poses_payload, dict):
-			return [
-				value
-				for _, value in sorted(poses_payload.items(), key=lambda item: self._pose_sort_key(item[0]))
-			]
-		return list(poses_payload)
-
-	def _extract_pose_values(self, payload: Any) -> list[Any] | None:
-		"""Extract pose entries from supported ScanNet++ pose JSON layouts."""
-
-		if isinstance(payload, list):
-			return payload
-		if not isinstance(payload, dict):
-			return None
-
-		for key in ("aligned_poses", "poses", "frames", "camera_to_worlds", "c2ws", "transforms"):
-			poses_payload = payload.get(key)
-			if poses_payload is not None:
-				return self._ordered_pose_values(poses_payload)
-
-		ordered_values = self._ordered_pose_values(payload)
-		if any(self._parse_pose_matrix(value) is not None for value in ordered_values):
-			return ordered_values
-		return None
 
 	def _load_pose_sequence(self, path: Path) -> list[np.ndarray | None]:
 		"""Load aligned iPhone poses from the supported pose JSON layouts."""
 
+		def pose_sort_key(key: Any) -> tuple[int, str]:
+			text = str(key)
+			if text.isdigit():
+				return int(text), text
+			stem = Path(text).stem
+			digits = "".join(character for character in stem if character.isdigit())
+			if digits:
+				return int(digits), text
+			return 10**12, text
+
+		def parse_poses_payload(poses: Any) -> list[Any]:
+			if poses is None:
+				return []
+			if isinstance(poses, dict):				
+				items = sorted(poses.items(), key=lambda item: pose_sort_key(item[0]))
+				return [value for _, value in items]
+			return list(poses)
+		
+		def parse_pose(value: Any) -> np.ndarray | None:
+			if value is None:
+				return None
+			if isinstance(value, dict):
+				value = (
+					value.get("aligned_pose")
+					or value.get("transform_matrix")
+					or value.get("pose")
+					or value.get("c2w")
+				)
+			try:
+				array = np.asarray(value, dtype=np.float64)
+			except (TypeError, ValueError):
+				return None
+			if array.shape != (4, 4) or not np.isfinite(array).all():
+				return None
+			return array
+
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
 		payload = read_json(path)
-		values = self._extract_pose_values(payload)
-		if values is None:
-			keys = ", ".join(sorted(str(key) for key in payload.keys())) if isinstance(payload, dict) else type(payload).__name__
-			raise RejectedSample(f"No poses found in {path}; top-level keys: {keys}")
-		return [self._parse_pose_matrix(value) for value in values]
+
+		poses = (
+			parse_poses_payload(payload.get("aligned_poses"))
+			or parse_poses_payload(payload.get("poses"))
+			or parse_poses_payload(payload.get("frames"))
+		)
+		if not poses:
+			raise RejectedSample(f"No pose records found in {path}")
+		return [parse_pose(pose) for pose in poses]
 
 	def _rotation_to_yaw_pitch_roll(self, rotation: np.ndarray) -> tuple[float, float, float]:
 		"""Return approximate yaw, pitch, and roll in degrees for camera axes."""
@@ -757,6 +730,9 @@ class MotionExtractionStage:
 		if self.args.filter_pose_valid_fraction_min is not None and valid_fraction < self.args.filter_pose_valid_fraction_min:
 			raise RejectedSample(f"Pose valid fraction {valid_fraction:.4f} below threshold.")
 		return valid_poses
+	
+	def _round(self, value: float) -> float:
+		return round(float(value), 4)
 	
 	def _motion_stats(
 		self,
@@ -1017,15 +993,6 @@ class VisionLanguageBackend(TextGenerationBackend):
 	def generate(self, prompt: str, temperature: float, max_new_tokens: int, media: list[dict[str, Any]] | None = None) -> str:
 		"""Generate text from optional image/video media plus a prompt."""
 
-		def normalize_video_kwargs(video_kwargs: dict[str, Any]) -> dict[str, Any]:
-			"""Return processor-compatible video kwargs for a single prompt batch."""
-
-			normalized = dict(video_kwargs)
-			fps = normalized.get("fps")
-			if isinstance(fps, list) and len(fps) == 1:
-				normalized["fps"] = float(fps[0])
-			return normalized
-
 		content: list[dict[str, Any]] = []
 		for item in media or []:
 			if item["type"] == "image":
@@ -1046,14 +1013,24 @@ class VisionLanguageBackend(TextGenerationBackend):
 		content.append({"type": "text", "text": prompt})
 		messages = [{"role": "user", "content": content}]
 		text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-		image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-		video_kwargs = normalize_video_kwargs(video_kwargs)
+		
+		image_inputs, video_inputs, video_kwargs = process_vision_info(
+			messages, return_video_kwargs=True, return_video_metadata=True,
+		)
+		if video_inputs is not None:
+			video_inputs, video_metadata = zip(*video_inputs)
+			video_inputs, video_metadata = list(video_inputs), list(video_metadata)
+		else:
+			video_kwargs, video_metadata = {}, None
+		
 		device = self._activate()
 		try:
 			inputs = self.processor(
 				text=[text],
 				images=image_inputs,
 				videos=video_inputs,
+				video_metadata=video_metadata,
+				do_resize=False,
 				padding=True,
 				return_tensors="pt",
 				**video_kwargs,
