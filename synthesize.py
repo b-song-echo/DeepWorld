@@ -662,33 +662,79 @@ class MotionExtractionStage:
 		if value is None:
 			return None
 		if isinstance(value, dict):
-			for key in ("transform_matrix", "pose", "matrix", "c2w"):
+			for key in (
+				"aligned_pose",
+				"aligned_transform_matrix",
+				"camera_to_world",
+				"cam2world",
+				"world_from_camera",
+				"transform_matrix",
+				"pose",
+				"pose_matrix",
+				"matrix",
+				"c2w",
+			):
 				if key in value:
 					value = value[key]
 					break
-		array = np.asarray(value, dtype=np.float64)
+		try:
+			array = np.asarray(value, dtype=np.float64)
+		except (TypeError, ValueError):
+			return None
 		if array.shape != (4, 4) or not np.isfinite(array).all():
 			return None
 		return array
 
+	def _pose_sort_key(self, key: Any) -> tuple[int, str]:
+		"""Return a stable frame order for numeric, filename, and string keys."""
+
+		text = str(key)
+		if text.isdigit():
+			return int(text), text
+		stem = Path(text).stem
+		digits = "".join(character for character in stem if character.isdigit())
+		if digits:
+			return int(digits), text
+		return 10**12, text
+
+	def _ordered_pose_values(self, poses_payload: Any) -> list[Any]:
+		"""Return pose entries from a list or frame-keyed dictionary."""
+
+		if isinstance(poses_payload, dict):
+			return [
+				value
+				for _, value in sorted(poses_payload.items(), key=lambda item: self._pose_sort_key(item[0]))
+			]
+		return list(poses_payload)
+
+	def _extract_pose_values(self, payload: Any) -> list[Any] | None:
+		"""Extract pose entries from supported ScanNet++ pose JSON layouts."""
+
+		if isinstance(payload, list):
+			return payload
+		if not isinstance(payload, dict):
+			return None
+
+		for key in ("aligned_poses", "poses", "frames", "camera_to_worlds", "c2ws", "transforms"):
+			poses_payload = payload.get(key)
+			if poses_payload is not None:
+				return self._ordered_pose_values(poses_payload)
+
+		ordered_values = self._ordered_pose_values(payload)
+		if any(self._parse_pose_matrix(value) is not None for value in ordered_values):
+			return ordered_values
+		return None
+
 	def _load_pose_sequence(self, path: Path) -> list[np.ndarray | None]:
-		"""Load aligned iPhone poses, falling back to raw poses."""
+		"""Load aligned iPhone poses from the supported pose JSON layouts."""
 
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
 		payload = read_json(path)
-		poses_payload = payload.get("aligned_poses")
-		if poses_payload is None:
-			poses_payload = payload.get("poses")
-		if poses_payload is None:
-			raise RejectedSample(f"No poses found in {path}")
-		if isinstance(poses_payload, dict):
-			def sort_key(item: tuple[str, Any]) -> tuple[int, str]:
-				key = item[0]
-				return (int(key), key) if str(key).isdigit() else (10**12, str(key))
-			values = [value for _, value in sorted(poses_payload.items(), key=sort_key)]
-		else:
-			values = list(poses_payload)
+		values = self._extract_pose_values(payload)
+		if values is None:
+			keys = ", ".join(sorted(str(key) for key in payload.keys())) if isinstance(payload, dict) else type(payload).__name__
+			raise RejectedSample(f"No poses found in {path}; top-level keys: {keys}")
 		return [self._parse_pose_matrix(value) for value in values]
 
 	def _rotation_to_yaw_pitch_roll(self, rotation: np.ndarray) -> tuple[float, float, float]:
