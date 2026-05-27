@@ -366,8 +366,8 @@ class DataSamplingStage:
 		probe = ffmpeg.probe(str(path), select_streams="v:0")
 		streams = probe.get("streams") or []
 		if not streams:
-			raise RuntimeError(f"No video stream found in {path}")
-		stream = streams[0]; print(stream)
+			raise RejectedSample(f"No video stream found in {path}")
+		stream = streams[0]
 
 		def rational_to_float(value: str | None) -> float | None:
 			"""Parse an FFprobe rational number such as `60000/1001`."""
@@ -388,20 +388,41 @@ class DataSamplingStage:
 			except ValueError:
 				return None
 
-		print(stream)
+		def duration_to_float(value: Any) -> float:
+			"""Parse FFprobe duration values, including Matroska tag timestamps."""
+
+			if value is None:
+				return 0.0
+			text = str(value).strip()
+			if not text or text == "N/A":
+				return 0.0
+			try:
+				return float(text)
+			except ValueError:
+				pass
+			parts = text.split(":")
+			if len(parts) != 3:
+				return 0.0
+			try:
+				hours, minutes, seconds = parts
+				return int(hours) * 3600.0 + int(minutes) * 60.0 + float(seconds)
+			except ValueError:
+				return 0.0
+
 		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
 		if fps is None or fps <= 0:
-			raise RuntimeError(f"Could not determine FPS for video: {path}")
-		try:
-			duration = float(stream.get("duration"))
-		except (TypeError, ValueError):
-			duration = 0.0
+			raise RejectedSample(f"Could not determine FPS for video: {path}")
+		duration = duration_to_float(stream.get("duration"))
+		if duration <= 0:
+			duration = duration_to_float((stream.get("tags") or {}).get("DURATION"))
+		if duration <= 0:
+			duration = duration_to_float((probe.get("format") or {}).get("duration"))
 		num_frames_raw = stream.get("nb_frames")
 		num_frames = int(num_frames_raw) if num_frames_raw and str(num_frames_raw).isdigit() else 0
 		if num_frames <= 0 and duration > 0:
 			num_frames = int(round(duration * fps))
 		if num_frames <= 0:
-			raise RuntimeError(f"Could not determine frame count for video: {path}")
+			raise RejectedSample(f"Could not determine frame count for video: {path}")
 		ctx.video_width = int(stream["width"])
 		ctx.video_height = int(stream["height"])
 		ctx.video_fps = float(fps)
