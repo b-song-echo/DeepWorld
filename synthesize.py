@@ -1017,6 +1017,15 @@ class VisionLanguageBackend(TextGenerationBackend):
 	def generate(self, prompt: str, temperature: float, max_new_tokens: int, media: list[dict[str, Any]] | None = None) -> str:
 		"""Generate text from optional image/video media plus a prompt."""
 
+		def normalize_video_kwargs(video_kwargs: dict[str, Any]) -> dict[str, Any]:
+			"""Return processor-compatible video kwargs for a single prompt batch."""
+
+			normalized = dict(video_kwargs)
+			fps = normalized.get("fps")
+			if isinstance(fps, list) and len(fps) == 1:
+				normalized["fps"] = float(fps[0])
+			return normalized
+
 		content: list[dict[str, Any]] = []
 		for item in media or []:
 			if item["type"] == "image":
@@ -1038,6 +1047,7 @@ class VisionLanguageBackend(TextGenerationBackend):
 		messages = [{"role": "user", "content": content}]
 		text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 		image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+		video_kwargs = normalize_video_kwargs(video_kwargs)
 		device = self._activate()
 		try:
 			inputs = self.processor(
