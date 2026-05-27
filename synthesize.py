@@ -367,7 +367,7 @@ class DataSamplingStage:
 		streams = probe.get("streams") or []
 		if not streams:
 			raise RuntimeError(f"No video stream found in {path}")
-		stream = streams[0]
+		stream = streams[0]; print(stream)
 
 		def rational_to_float(value: str | None) -> float | None:
 			"""Parse an FFprobe rational number such as `60000/1001`."""
@@ -388,6 +388,7 @@ class DataSamplingStage:
 			except ValueError:
 				return None
 
+		print(stream)
 		fps = rational_to_float(stream.get("avg_frame_rate")) or rational_to_float(stream.get("r_frame_rate"))
 		if fps is None or fps <= 0:
 			raise RuntimeError(f"Could not determine FPS for video: {path}")
@@ -447,10 +448,10 @@ class DataSamplingStage:
 	def _prepare_gt_clip(self, ctx: SampleContext) -> None:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
+		side = "min(iw,ih)"
+		crop_args = (side, side, f"(iw-{side})/2", f"(ih-{side})/2")
 		mask_path = ctx.require_source_video_mask_path()
 		if mask_path.exists():
-			side = "min(iw,ih)"
-			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
 			output_kwargs = {"format": "rawvideo", "pix_fmt": "gray"}
 			process = (
 				ffmpeg.input(
@@ -484,8 +485,6 @@ class DataSamplingStage:
 					raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
 
 		try:
-			side = "min(iw,ih)"
-			crop_args = (side, side, f"(iw-{side})/2", "(ih-{side})/2")
 			(
 				ffmpeg
 				.input(
@@ -539,8 +538,8 @@ class DataSamplingStage:
 		"""Copy selected references into fixed sample order."""
 
 		def crop(image: Image.Image) -> Image.Image:
-			side = min(image.width)
-			left, top = (image.width) // 2, (image.height) // 2
+			side = min(image.width, image.height)
+			left, top = (image.width - side) // 2, (image.height - side) // 2
 			return image.crop((left, top, left + side, top + side))
 
 		ref_dir = ctx.ref_img_dir
@@ -549,7 +548,7 @@ class DataSamplingStage:
 		for index, source in enumerate(ref_sources, start=1):
 			if source.image_path is None:
 				raise RejectedSample("Reference source has no materialized image path.")
-			if source.mask_path is not None and not source.mask_path.exists():
+			if source.mask_path is not None and source.mask_path.exists():
 				with Image.open(source.mask_path) as image:
 					mask = np.asarray(crop(image.convert("L")))
 				if mask.ndim == 3:

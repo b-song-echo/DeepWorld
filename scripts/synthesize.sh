@@ -15,7 +15,7 @@ python $SCRIPT \
 	--output_root $OUTPUT_ROOT \
 	--num_processes 1 \
 	--seed 20021021 \
-	--split val \
+	--split train \
 	--num_samples 100000 \
 	--clip_seconds 5.0 \
 	--max_ref_images 10 \
