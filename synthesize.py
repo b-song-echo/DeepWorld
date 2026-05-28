@@ -661,7 +661,7 @@ class MotionExtractionStage:
 	def _load_pose_sequence(self, path: Path) -> list[np.ndarray | None]:
 		"""Load aligned iPhone poses from the supported pose JSON layouts."""
 
-		def pose_sort_key(key: Any) -> tuple[int, str]:
+		def sort_key(key: Any) -> tuple[int, str]:
 			text = str(key)
 			if text.isdigit():
 				return int(text), text
@@ -671,11 +671,11 @@ class MotionExtractionStage:
 				return int(digits), text
 			return 10**12, text
 
-		def parse_poses_payload(poses: Any) -> list[Any]:
+		def parse_payload(poses: Any) -> list[Any]:
 			if poses is None:
 				return []
 			if isinstance(poses, dict):				
-				items = sorted(poses.items(), key=lambda item: pose_sort_key(item[0]))
+				items = sorted(poses.items(), key=lambda item: sort_key(item[0]))
 				return [value for _, value in items]
 			return list(poses)
 		
@@ -683,12 +683,8 @@ class MotionExtractionStage:
 			if value is None:
 				return None
 			if isinstance(value, dict):
-				value = (
-					value.get("aligned_pose")
-					or value.get("transform_matrix")
-					or value.get("pose")
-					or value.get("c2w")
-				)
+				fields = ("aligned_pose", "transform_matrix", "pose", "c2w")
+				value = next((value[field] for field in fields if field in value), None)
 			try:
 				array = np.asarray(value, dtype=np.float64)
 			except (TypeError, ValueError):
@@ -700,17 +696,16 @@ class MotionExtractionStage:
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
 		payload = read_json(path)
-
 		poses = (
-			parse_poses_payload(payload.get("aligned_poses"))
-			or parse_poses_payload(payload.get("poses"))
-			or parse_poses_payload(payload.get("frames"))
-		)
+			parse_payload(payload.get("aligned_poses"))
+			or parse_payload(payload.get("poses"))
+			or parse_payload(payload)
+		) if isinstance(payload, dict) else parse_payload(payload)
 		if not poses:
 			raise RejectedSample(f"No pose records found in {path}")
 		return [parse_pose(pose) for pose in poses]
 
-	def _rotation_to_yaw_pitch_roll(self, rotation: np.ndarray) -> tuple[float, float, float]:
+	def _parse_rptation(self, rotation: np.ndarray) -> tuple[float, float, float]:
 		"""Return approximate yaw, pitch, and roll in degrees for camera axes."""
 
 		forward = rotation @ np.array([0.0, 0.0, 1.0])
@@ -746,7 +741,7 @@ class MotionExtractionStage:
 		trajectory_length = sum(float(np.linalg.norm(positions[index] - positions[index - 1])) for index in range(1, len(positions)))
 		relative = np.linalg.inv(poses[0]) @ poses[-1]
 		translation = relative[:3, 3]
-		yaw, pitch, roll = self._rotation_to_yaw_pitch_roll(relative[:3, :3])
+		yaw, pitch, roll = self._parse_rptation(relative[:3, :3])
 		return {
 			"duration_s": self._round(duration_s),
 			f"{prefix}trajectory_length_m": self._round(trajectory_length),
@@ -796,7 +791,7 @@ class MotionExtractionStage:
 				prefix="local_"
 			)
 			relative_first = np.linalg.inv(first_pose) @ motion_unit_valid_poses[0]
-			first_yaw, first_pitch, first_roll = self._rotation_to_yaw_pitch_roll(relative_first[:3, :3])
+			first_yaw, first_pitch, first_roll = self._parse_rptation(relative_first[:3, :3])
 			first_position = [self._round(value) for value in relative_first[:3, 3].tolist()]
 			motion_units.append({
 				"index": unit_index,
@@ -1016,6 +1011,7 @@ class VisionLanguageBackend(TextGenerationBackend):
 		
 		image_inputs, video_inputs, video_kwargs = process_vision_info(
 			messages, return_video_kwargs=True, return_video_metadata=True,
+			image_patch_size=self.processor.image_processor.patch_size,
 		)
 		if video_inputs is not None:
 			video_inputs, video_metadata = zip(*video_inputs)
@@ -1030,7 +1026,6 @@ class VisionLanguageBackend(TextGenerationBackend):
 				images=image_inputs,
 				videos=video_inputs,
 				video_metadata=video_metadata,
-				do_resize=False,
 				padding=True,
 				return_tensors="pt",
 				**video_kwargs,
