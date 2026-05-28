@@ -155,6 +155,7 @@ def parse_args() -> Namespace:
 	parser.add_argument("--llm_backend_path", type=str, required=True)
 	parser.add_argument("--vlm_cpu_offload", action="store_true")
 	parser.add_argument("--llm_cpu_offload", action="store_true")
+	parser.add_argument("--llm_think_if_available", action="store_true")
 	parser.add_argument("--video_captioning_width", type=int, default=720)
 	parser.add_argument("--video_captioning_height", type=int, default=720)
 	parser.add_argument("--video_captioning_fps", type=float, default=2.0)
@@ -835,8 +836,15 @@ class TextGenerationBackend:
 	adjacent stages that share the same backend.
 	"""
 
-	def __init__(self, model_path: str, local_rank: int | None, cpu_offload: bool = False):
+	def __init__(
+		self,
+		model_path: str,
+		local_rank: int | None,
+		cpu_offload: bool = False,
+		think_if_available: bool = False,
+	):
 		self.cpu_offload = cpu_offload
+		self.think_if_available = think_if_available
 		self._active_lease_count = 0
 		self.target_device = torch.device(
 			f"cuda:{local_rank}" if torch.cuda.is_available() and local_rank is not None else
@@ -930,7 +938,10 @@ class TextGenerationBackend:
 
 		del media
 		messages = [{"role": "user", "content": prompt}]
-		text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+		text = self.tokenizer.apply_chat_template(
+			messages, tokenize=False, add_generation_prompt=True,
+			enable_thinking=self.think_if_available,
+		)
 		with self.active() as device:
 			inputs = self.tokenizer([text], return_tensors="pt").to(device)
 			with torch.inference_mode():
@@ -984,7 +995,12 @@ class TextGenerationBackend:
 class VisionLanguageBackend(TextGenerationBackend):
 	"""Hugging Face image/video-to-text backend for Qwen3-VL-style models."""
 
-	def __init__(self, model_path: str, local_rank: int | None, cpu_offload: bool = False):
+	def __init__(
+		self,
+		model_path: str,
+		local_rank: int | None,
+		cpu_offload: bool = False
+	):
 		self.cpu_offload = cpu_offload
 		self._active_lease_count = 0
 		self.target_device = torch.device(
@@ -1480,7 +1496,8 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 	llm = TextGenerationBackend(
 		args.llm_backend_path,
 		local_rank=local_rank,
-		cpu_offload=args.llm_cpu_offload
+		cpu_offload=args.llm_cpu_offload,
+		think_if_available=args.llm_think_if_available,
 	)
 	stages: list[Callable[[SampleContext], None]] = [
 		DataSamplingStage(args, rng),
