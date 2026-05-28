@@ -917,12 +917,11 @@ class TextGenerationBackend:
 			raise
 
 	@contextmanager
-	def active_session(self):
+	def active(self):
 		"""Keep an offloaded backend active across a contiguous stage group."""
 
-		self._activate()
 		try:
-			yield
+			yield self._activate()
 		finally:
 			self._deactivate()
 	
@@ -932,8 +931,7 @@ class TextGenerationBackend:
 		del media
 		messages = [{"role": "user", "content": prompt}]
 		text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-		device = self._activate()
-		try:
+		with self.active() as device:
 			inputs = self.tokenizer([text], return_tensors="pt").to(device)
 			with torch.inference_mode():
 				outputs = self.model.generate(
@@ -946,8 +944,6 @@ class TextGenerationBackend:
 				)
 			new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
 			return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-		finally:
-			self._deactivate()
 
 	def generate_json(
 		self,
@@ -958,20 +954,21 @@ class TextGenerationBackend:
 	) -> Any:
 		"""Generate JSON and perform one deterministic repair if parsing fails."""
 
-		output = self.generate(prompt, temperature=temperature, max_new_tokens=max_new_tokens, media=media)
-		try:
-			return self._extract_json_response(output)
-		except Exception:
-			repair_prompt = (
-				"Repair the following model response into valid JSON only. "
-				"Do not add Markdown or explanation.\n\n"
-				f"Original task:\n{prompt}\n\nInvalid response:\n{output}"
-			)
-		repaired = self.generate(repair_prompt, temperature=0.0, max_new_tokens=max_new_tokens, media=media)
-		try:
-			return self._extract_json_response(repaired)
-		except Exception as error:
-			raise RejectedSample("Model response could not be decoded as JSON after one deterministic repair.") from error
+		with self.active():
+			output = self.generate(prompt, temperature=temperature, max_new_tokens=max_new_tokens, media=media)
+			try:
+				return self._extract_json_response(output)
+			except Exception:
+				repair_prompt = (
+					"Repair the following model response into valid JSON only. "
+					"Do not add Markdown or explanation.\n\n"
+					f"Original task:\n{prompt}\n\nInvalid response:\n{output}"
+				)
+			repaired = self.generate(repair_prompt, temperature=0.0, max_new_tokens=max_new_tokens, media=media)
+			try:
+				return self._extract_json_response(repaired)
+			except Exception as error:
+				raise RejectedSample("Model response could not be decoded as JSON after one deterministic repair.") from error
 	
 	def get_json_key(self, payload: Any, key: str) -> Any:
 		"""Return one required generated-JSON value or reject the sample."""
@@ -1403,10 +1400,10 @@ def prepare_output_root(args: Namespace) -> None:
 					active_entries.append(entry)
 		
 			for child in samples_root.iterdir():
-				if child.is_dir() and child.name not in active_sample_ids:
-					shutil.rmtree(child)
-				else:
+				if not child.is_dir():
 					child.unlink(missing_ok=True)
+				elif child.name not in active_sample_ids:
+					shutil.rmtree(child)
 			write_jsonl(manifest, *active_entries, append=False)
 		
 		write_json(state_path(args), {
@@ -1444,7 +1441,7 @@ def run_stages(stages: list[Callable[[SampleContext], None]], ctx: SampleContext
 		while group_end < len(stages) and get_backend(stages[group_end]) is backend:
 			group_end += 1
 
-		with backend.active_session():
+		with backend.active():
 			for stage in stages[index:group_end]:
 				stage(ctx)
 		index = group_end

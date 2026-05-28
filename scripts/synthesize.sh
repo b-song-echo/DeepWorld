@@ -3,8 +3,8 @@ set -euo pipefail
 SCRIPT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py"
 SCANNETPP_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf"
 OUTPUT_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data"
-VLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct"
-LLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen2.5-3B"
+VLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-32B-Instruct"
+LLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3.6-27B"
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -22,6 +22,8 @@ python $SCRIPT \
 	--include_start_frame_prob 0.35 \
 	--vlm_backend_path $VLM_BACKBONE_PATH \
 	--llm_backend_path $LLM_BACKBONE_PATH \
+	--vlm_cpu_offload \
+	--llm_cpu_offload \
 	--video_captioning_width 720 \
 	--video_captioning_height 720 \
 	--video_captioning_fps 2 \
