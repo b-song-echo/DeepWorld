@@ -2,7 +2,7 @@ set -euo pipefail
 
 SCRIPT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py"
 SCANNETPP_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf"
-OUTPUT_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data"
+OUTPUT_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data/heavy_lm"
 VLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-32B-Instruct"
 LLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3.6-27B"
 
