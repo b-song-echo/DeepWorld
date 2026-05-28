@@ -972,6 +972,16 @@ class TextGenerationBackend:
 			return self._extract_json_response(repaired)
 		except Exception as error:
 			raise RejectedSample("Model response could not be decoded as JSON after one deterministic repair.") from error
+	
+	def get_json_key(self, payload: Any, key: str) -> Any:
+		"""Return one required generated-JSON value or reject the sample."""
+
+		if not isinstance(payload, dict):
+			raise RejectedSample(f"Model JSON output is not an object; expected key `{key}`.")
+		if key not in payload:
+			available_keys = ", ".join(sorted(str(available_key) for available_key in payload.keys()))
+			raise RejectedSample(f"Model JSON output is missing key `{key}`. Available keys: {available_keys or 'none'}.")
+		return payload[key]
 
 
 class VisionLanguageBackend(TextGenerationBackend):
@@ -1092,7 +1102,7 @@ class MotionDigestingStage:
 			max_new_tokens=self.args.motion_digesting_llm_max_new_tokens,
 		)
 		write_json(ctx.intermediate_dir / "motion_caption.json", {
-			"motion_caption": str(result["motion_caption"]),
+			"motion_caption": self.llm.get_json_key(result, "motion_caption"),
 		})
 
 
@@ -1132,7 +1142,7 @@ class VideoCaptioningStage:
 			}],
 		)
 		write_json(ctx.intermediate_dir / "video_caption.json", {
-			"video_caption": str(result["video_caption"]),
+			"video_caption": self.vlm.get_json_key(result, "video_caption"),
 		})
 
 
@@ -1172,7 +1182,7 @@ class ImageCaptioningStage:
 					"resized_height": self.args.image_captioning_height,
 				}],
 			)
-			captions.append(str(result["image_caption"]))
+			captions.append(self.vlm.get_json_key(result, "image_caption"))
 		write_json(ctx.intermediate_dir / "image_captions.json", {
 			"image_captions": captions,
 		})
@@ -1212,7 +1222,7 @@ class CaptionWiringStage:
 			max_new_tokens=self.args.caption_wiring_llm_max_new_tokens,
 		)
 		write_json(ctx.intermediate_dir / "wired_caption.json", {
-			"wired_caption": str(result["wired_caption"]),
+			"wired_caption": self.llm.get_json_key(result, "wired_caption"),
 		})
 
 
@@ -1244,7 +1254,8 @@ class CaptionRephrasingStage:
 			temperature=self.args.caption_rephrasing_llm_temperature,
 			max_new_tokens=self.args.caption_rephrasing_llm_max_new_tokens,
 		)
-		ctx.manifest_entry["synthesized_prompt"] = str(result["synthesized_prompt"])
+		synthesized_prompt = self.llm.get_json_key(result, "synthesized_prompt")
+		ctx.manifest_entry["synthesized_prompt"] = synthesized_prompt
 
 
 class CriticJudgingStage:
@@ -1287,8 +1298,8 @@ class CriticJudgingStage:
 			temperature=self.args.critic_judging_llm_temperature,
 			max_new_tokens=self.args.critic_judging_llm_max_new_tokens,
 		)
-		fatal_checks = result.get("fatal_checks") or {}
-		quality_checks = result.get("quality_checks") or {}
+		fatal_checks = self.llm.get_json_key(result, "fatal_checks") or {}
+		quality_checks = self.llm.get_json_key(result, "quality_checks") or {}
 		fatal_passed = all(bool(value) for value in fatal_checks.values()) and len(fatal_checks) > 0
 		quality_values = [bool(value) for value in quality_checks.values()]
 		quality_score = sum(quality_values) / len(quality_values) if quality_values else 0.0
@@ -1326,8 +1337,8 @@ class DistillationStage:
 			max_new_tokens=self.args.distillation_llm_max_new_tokens,
 		)
 		ctx.manifest_entry["distilled_prompts"] = {
-			"medium": str(result["medium_prompt"]),
-			"coarse": str(result["coarse_prompt"]),
+			"medium": self.llm.get_json_key(result, "medium_prompt"),
+			"coarse": self.llm.get_json_key(result, "coarse_prompt"),
 		}
 
 
