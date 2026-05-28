@@ -145,6 +145,8 @@ def parse_args() -> Namespace:
 	parser.add_argument("--num_processes", type=int, default=1)
 	parser.add_argument("--seed", type=int, default=None)
 	parser.add_argument("--split", type=str, choices=["train", "val"], required=True)
+	parser.add_argument("--restart_fresh", action="store_true")
+	parser.add_argument("--no_cleanup", action="store_true")
 	parser.add_argument("--num_samples", type=int, required=True)
 	parser.add_argument("--clip_seconds", type=float, default=5.0)
 	parser.add_argument("--max_ref_images", type=int, default=8)
@@ -184,6 +186,8 @@ def parse_args() -> Namespace:
 		raise ValueError(f"`--num_processes` must be positive, got {args.num_processes}.")
 	if args.num_samples < 0:
 		raise ValueError(f"`--num_samples` must be non-negative, got {args.num_samples}.")
+	if args.restart_fresh and args.no_cleanup:
+		raise ValueError("`--restart_fresh` and `--no_cleanup` cannot be used together.")
 	if args.clip_seconds <= 0:
 		raise ValueError(f"`--clip_seconds` must be positive, got {args.clip_seconds}.")
 	if args.max_ref_images < 1:
@@ -232,28 +236,41 @@ def write_json(path: Path, payload: Any) -> None:
 	"""Write one formatted JSON file."""
 
 	path.parent.mkdir(parents=True, exist_ok=True)
-	with path.open("w", encoding="utf-8") as handle:
-		json.dump(payload, handle, indent=2, ensure_ascii=False)
-		handle.write("\n")
+	with path.open("w", encoding="utf-8") as f:
+		json.dump(payload, f, indent=2, ensure_ascii=False)
+		f.write("\n")
 
 
-def count_manifest(path: Path) -> int:
-	"""Count committed non-empty JSONL entries."""
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+	"""Read one JSONL into entry dictionaries."""
 
 	if not path.exists():
-		return 0
-	with path.open("r", encoding="utf-8") as handle:
-		return sum(1 for line in handle if line.strip())
+		return []
+	entries: list[dict[str, Any]] = []
+	with path.open("r", encoding="utf-8") as f:
+		for i, line in enumerate(f, start=1):
+			if not line.strip():
+				continue
+			entry = json.loads(line)
+			if not isinstance(entry, dict):
+				raise ValueError(f"Manifest entry {path}:{i} is not a JSON object.")
+			entries.append(entry)
+	return entries
 
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-	"""Append one manifest JSONL entry and fsync it."""
+def write_jsonl(
+	path: Path,
+	*payload: list[dict[str, Any]],
+	append=True
+) -> None:
+	"""Write/append JSONL entries and fsync it."""
 
 	path.parent.mkdir(parents=True, exist_ok=True)
-	with path.open("a", encoding="utf-8", buffering=1) as handle:
-		handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-		handle.flush()
-		os.fsync(handle.fileno())
+	with path.open("a" if append else "w", encoding="utf-8", buffering=1) as f:
+		for entry in payload:
+			f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+		f.flush()
+		os.fsync(f.fileno())
 
 
 class DataSamplingStage:
@@ -1334,34 +1351,58 @@ def commit_sample(args: Namespace, ctx: SampleContext) -> bool | None:
 			return False
 		write_json(tmp_dir / "sample.json", ctx.manifest_entry)
 		os.replace(tmp_dir, final_dir)
-		append_jsonl(manifest_path(args), ctx.manifest_entry)
+		write_jsonl(manifest_path(args), ctx.manifest_entry, append=True)
 		state["current_count"] += 1
 		write_json(state_path(args), state)
 		return True
 
 
-def process_seed(args: Namespace, worker_index: int) -> int:
-	"""Create a process-local time-dependent seed."""
+def prepare_output_root(args: Namespace) -> None:
+	"""Prepare output storage and initialize worker state.
 
-	base = args.seed if args.seed is not None else int.from_bytes(os.urandom(8), "little")
-	return (base ^ time.time_ns() ^ (os.getpid() << 16) ^ worker_index) & 0xFFFFFFFF
-
-
-def initialize_state(args: Namespace) -> None:
-	"""Initialize split state from the manifest ledger under the runtime lock."""
+	It optionally removes incomplete temporary samples and stale active-split
+	manifest entries while preserving samples referenced by split manifest.
+	"""
 
 	root = output_root(args)
-	(root / "samples").mkdir(parents=True, exist_ok=True)
+	root.mkdir(parents=True, exist_ok=True)
+	samples_root = root / "samples"
+	samples_root.mkdir(parents=True, exist_ok=True)
+	manifest = manifest_path(args)
 	manifest = manifest_path(args)
 	manifest.parent.mkdir(parents=True, exist_ok=True)
 	manifest.touch(exist_ok=True)
+	
 	with exclusive_lock(args):
-		current_count = count_manifest(manifest)
+		if not args.no_cleanup:
+			entries = read_jsonl(manifest)
+			active_entries: list[dict[str, Any]] = []
+			active_sample_ids: set[str] = set()
+			
+			if not args.restart_fresh:
+				for entry in entries:
+					sample_id = str(entry.get("sample_id", ""))
+					if not sample_id:
+						continue
+					if sample_id in active_sample_ids:
+						continue
+					if not (samples_root / sample_id).is_dir():
+						continue
+					active_sample_ids.add(sample_id)
+					active_entries.append(entry)
+		
+			for child in samples_root.iterdir():
+				if child.is_dir() and child.name not in active_sample_ids:
+					shutil.rmtree(child)
+				else:
+					child.unlink(missing_ok=True)
+			write_jsonl(manifest, *active_entries, append=False)
+		
 		write_json(state_path(args), {
-			"current_count": current_count,
+			"current_count": len(read_jsonl(manifest)),
 			"target_count": args.num_samples,
 		})
-	
+
 
 def cleanup_sample_tmp(ctx: SampleContext) -> None:
 	"""Remove a sample temporary directory without risking unrelated paths."""
@@ -1410,8 +1451,11 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 			torch.cuda.set_device(local_rank)
 	else:
 		local_rank = None
-	
-	seed = process_seed(args, worker_index)
+
+	# Process-local and time-dependent seed
+	base = args.seed if args.seed is not None else int.from_bytes(os.urandom(8), "little")
+	seed = (base ^ time.time_ns() ^ (os.getpid() << 16) ^ worker_index) & 0xFFFFFFFF
+
 	rng = random.Random(seed)
 	np.random.seed(seed)
 	state = read_json(state_path(args))
@@ -1467,7 +1511,7 @@ def main() -> None:
 	"""Launch one or more independent curation workers."""
 
 	args = parse_args()
-	initialize_state(args)
+	prepare_output_root(args)
 	if args.num_processes == 1:
 		run_worker(args, worker_index=0)
 		return

@@ -1,10 +1,10 @@
 set -euo pipefail
 
 SCRIPT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py"
-SCANNETPP_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf
-OUTPUT_ROOT=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data
-VLM_BACKBONE_PATH=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct
-LLM_BACKBONE_PATH=/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen2.5-3B
+SCANNETPP_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf"
+OUTPUT_ROOT="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/data"
+VLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen3-VL-8B-Instruct"
+LLM_BACKBONE_PATH="/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/Qwen2.5-3B"
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -46,4 +46,5 @@ python $SCRIPT \
 	--filter_pose_valid_fraction_min 0.90 \
 	--filter_camera_trajectory_length_m_min 0.15 \
 	--filter_camera_trajectory_length_m_max 4.50 \
-	--filter_quality_score_min 0.7
+	--filter_quality_score_min 0.7 \
+	"$@"

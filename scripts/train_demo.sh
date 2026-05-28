@@ -12,5 +12,5 @@ accelerate launch \
 	--multi_gpu \
 	--num_processes 8 \
 	$SCRIPT \
-	--config "$CONFIG_FILE" \
+	--config $CONFIG_FILE \
 	"$@"
