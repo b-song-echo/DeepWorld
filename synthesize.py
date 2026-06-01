@@ -676,7 +676,8 @@ class MotionExtractionStage:
 	def __init__(self, args: Namespace):
 		self.args = args
 
-	def _load_pose_sequence(self, path: Path) -> list[np.ndarray | None]:
+	# TODO: This should be a method of DataSamplingStage. It should parse the raw file to a clean python list, where each element is either None or a nested list and can be converted directly to numpy array. Then it store the clip slice to `intermediate/poses.json`, and return the entire sequence.
+	def _prepare_poses(self, ctx: SampleContext) -> list[np.ndarray | None]:
 		"""Load aligned iPhone poses from the supported pose JSON layouts."""
 
 		def sort_key(key: Any) -> tuple[int, str]:
@@ -711,6 +712,7 @@ class MotionExtractionStage:
 				return None
 			return array
 
+		path = ctx.require_source_pose_path()
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
 		payload = read_json(path)
@@ -721,9 +723,13 @@ class MotionExtractionStage:
 		) if isinstance(payload, dict) else parse_payload(payload)
 		if not poses:
 			raise RejectedSample(f"No pose records found in {path}")
-		return [parse_pose(pose) for pose in poses]
+		poses = [parse_pose(pose) for pose in poses]
+		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]		
+		if len(clip_poses) < ctx.clip_frames:
+			raise RejectedSample("Pose sequence is shorter than the sampled clip.")	
+		return poses
 
-	def _parse_rptation(self, rotation: np.ndarray) -> tuple[float, float, float]:
+	def _parse_rotation(self, rotation: np.ndarray) -> tuple[float, float, float]:
 		"""Return approximate yaw, pitch, and roll in degrees for camera axes."""
 
 		forward = rotation @ np.array([0.0, 0.0, 1.0])
@@ -733,6 +739,7 @@ class MotionExtractionStage:
 		roll = math.degrees(math.atan2(-down[0], down[1]))
 		return yaw, pitch, roll
 
+	# NOTE: This method should stay in this stage, which is responsible for returning valid poses of a clip or a unit, and reject the sample if the fraction drops bellow the specified threshold. DataSamplingStage does not filter valid fraction for poses.
 	def _valid_clip_poses(self, poses: list[np.ndarray | None]) -> list[np.ndarray]:
 		"""Return valid whole-clip poses."""
 		
@@ -759,7 +766,7 @@ class MotionExtractionStage:
 		trajectory_length = sum(float(np.linalg.norm(positions[index] - positions[index - 1])) for index in range(1, len(positions)))
 		relative = np.linalg.inv(poses[0]) @ poses[-1]
 		translation = relative[:3, 3]
-		yaw, pitch, roll = self._parse_rptation(relative[:3, :3])
+		yaw, pitch, roll = self._parse_rotation(relative[:3, :3])
 		return {
 			"duration_s": self._round(duration_s),
 			f"{prefix}trajectory_length_m": self._round(trajectory_length),
@@ -775,10 +782,9 @@ class MotionExtractionStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
-		all_poses = self._load_pose_sequence(ctx.require_source_pose_path())
+		# TODO: clip_poses is obtained by reading `intermediate/poses.json`, then each of its element is converted to numpy array.
+		all_poses = self._prepare_poses(ctx)	
 		clip_poses = all_poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
-		if len(clip_poses) < ctx.clip_frames:
-			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
 		
 		clip_valid_poses = self._valid_clip_poses(clip_poses)
 		trajectory = self._motion_stats(
@@ -809,7 +815,7 @@ class MotionExtractionStage:
 				prefix="local_"
 			)
 			relative_first = np.linalg.inv(first_pose) @ motion_unit_valid_poses[0]
-			first_yaw, first_pitch, first_roll = self._parse_rptation(relative_first[:3, :3])
+			first_yaw, first_pitch, first_roll = self._parse_rotation(relative_first[:3, :3])
 			first_position = [self._round(value) for value in relative_first[:3, 3].tolist()]
 			motion_units.append({
 				"index": unit_index,

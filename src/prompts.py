@@ -14,7 +14,6 @@ Camera-coordinate convention:
 
 Input field meanings:
 - "duration_s": duration of the whole video clip.
-- "valid_pose_fraction": fraction of frames in the clip with valid camera poses.
 - "trajectory_length_m": accumulated path length of the camera over the whole clip. This is always non-negative and can be larger than the straight-line translation distance.
 - "translation_right_m": net rightward displacement of the camera from the first pose to the last pose. Positive means moving right; negative means moving left.
 - "translation_down_m": net downward displacement of the camera from the first pose to the last pose. Positive means moving down or lowering; negative means moving up or rising.
