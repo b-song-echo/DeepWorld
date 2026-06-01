@@ -35,8 +35,3 @@ Some code refactors:
 
 
 Whether to use separate LLM and VLM backbones?
-
-
-Improvements:
-- Apply visual quality filters at image captioning stage, reject the ones that are blurry, over-exposed, etc.
-- At caotion wiring stage, it is fine to have similar reference images, the index can be arbitrary. It is necessary to ground video content to the reference images, it is the distillation stage that optionally drops references.

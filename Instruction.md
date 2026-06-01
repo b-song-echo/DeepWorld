@@ -3,9 +3,8 @@ After inspecting some commited samples, I noticed some issues, and want to make 
 When you make changes in implementation, make sure you also consider the documentation and YAML config files.
 
 ### Data Sampling Stage
-- The selction of reference images should take their timestamps into account. Otherwise, a lot of the images are completely irrelavent to the video clip, which is counter-productive for training.
-- Use pyiqa brisque metric to compute visual quality score, apply a filter to reject blurry, over-exposed, or noisy candidates.
-
+- DSLR reference image selection. Spatial transform should be taken into account. The purpose is to increase their relavence to the video clip. Otherwise, there might be a lot of images whose content do not appear in the sampled video clip at all.  It is okay to have some irrelevant images, there is no need to be very strict, try to keep this clever and minimal. Note that the poses of DSLR images and iPhone video frames should be properly aligned to obtain correct results.
+- Use pyiqa brisque metric to compute visual quality score for candidate DSLR images to filter out blurry, over-exposed, or noisy images.
 
 ### Motion Extraction Stage
 - I found that most extracted video clips are shaky, and some are too stationary. Apply more moton quality filters in this stage.
@@ -21,15 +20,15 @@ When you make changes in implementation, make sure you also consider the documen
 - I found out that in one rare occasion, the image index in the produced caption was wrong (the fourth caption said "the first image"), such behavior causes confusion in the caption wiring stage and yields unreliable result. Such violation can be checked in the critic judging stage.
 
 ### Caption Wiring Stage
-
-
-### Caption Rephrasing Stage
-
+- Because an object in the video caption is very likely to appear in more than one reference images, its "wired reference image" can be any one or more of them. For example, if the sofa appears in the first two images, then all of the following expressions are reasonable "the sofa in the first image", "the sofa in the second image", or "the sofa in the first and the second images".
+- Wiring is conpulsory in this stage. If the LLM is certain that something appears in reference images, then it must explicitly cross-refer to them. This may make the wired caption unreadable or super-verbose, this is okay, because it is the DistillationStage's job to produce downstream prompts. This wired caption serve as the "ceiling" version that contains everything that downstream stages need.
 
 ### Critic Judging Stage
 - Currently, the checks do not comprehensively cover essential failure modes and quality rubrics. Some of them are even not appropriate. Based on the refined version of all stages, synergistically design checks.
 - Importantly, bacause a single quality score is a kind of average over all entries, you should make sure that the number of checks for a group should be proportional to the "importance" of that group. For example, if caption wiring is very likely to be invalid, then it should have more entries in the fatal check section; if camera motion quality really matters, then it should have more entries in the quality check section.
 
+### Distillation Stage
+- As mentioned earlier, the original prompt is super-detailed and may be not be natural. This stage will rewrite it into two coarser prompts, optionally ommitting some details such as motion, visuals, references, etc.
 
 
 

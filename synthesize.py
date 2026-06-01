@@ -290,26 +290,21 @@ class DataSamplingStage:
 		rng: random.Random,
 	):
 		self.args = args
-		self.scene_ids = self._load_scene_ids(self.args)
-		self.scene_types = self._load_scene_types(self.args)
+		self.scene_ids = self._load_scene_ids()
+		self.scene_types = self._load_scene_types()
 		self.rng = rng
-		# self.data_root = Path(args.scannetpp_root) / "data"
 		self.data_root = Path(args.scannetpp_root)
 		self.samples_root = output_root(args) / "samples"
 	
-	def _load_scene_types(self, args: Namespace) -> dict[str, str]:
-		"""Load scene-type metadata if it is available."""
-
-		path = Path(args.scannetpp_root) / "metadata" / "scene_types.json"
+	def _load_scene_types(self) -> dict[str, str]:
+		path = Path(self.args.scannetpp_root) / "metadata" / "scene_types.json"
 		if not path.exists():
 			return {}
 		return read_json(path)
 
-	def _load_scene_ids(self, args: Namespace) -> list[str]:
-		"""Load the requested ScanNet++ split scene IDs."""
-
-		split_name = "nvs_sem_train.txt" if args.split == "train" else "nvs_sem_val.txt"
-		path = Path(args.scannetpp_root) / "splits" / split_name
+	def _load_scene_ids(self) -> list[str]:
+		split_name = f"nvs_sem_{self.args.split}.txt"
+		path = Path(self.args.scannetpp_root) / "splits" / split_name
 		if not path.exists():
 			raise FileNotFoundError(f"ScanNet++ split file not found: {path}")
 		with path.open("r", encoding="utf-8") as handle:
@@ -317,66 +312,6 @@ class DataSamplingStage:
 		if len(scene_ids) == 0:
 			raise ValueError(f"ScanNet++ split file is empty: {path}")
 		return scene_ids
-	
-	def _resolve_dslr_image_path(self, scene: ScannetppScene_Release, file_value: str) -> Path | None:
-		"""Resolve one DSLR frame image path across ScanNet++ transform variants."""
-
-		image_path = Path(file_value)
-		candidates = [image_path] if image_path.is_absolute() else [
-			image_path,
-			scene.dslr_dir / image_path,
-			scene.dslr_resized_undistorted_dir / image_path.name,
-		]
-		for candidate in candidates:
-			if candidate.exists():
-				return candidate
-		return None
-
-	def _resolve_dslr_mask_path(
-		self,
-		scene: ScannetppScene_Release,
-		image_path: Path,
-		frame: dict[str, Any],
-	) -> Path | None:
-		"""Resolve an optional DSLR validity mask for one reference image."""
-
-		mask_value = frame.get("mask_path") or frame.get("mask")
-		if mask_value:
-			mask_path = Path(mask_value)
-			candidates = [mask_path] if mask_path.is_absolute() else [
-				mask_path,
-				scene.dslr_dir / mask_path,
-				scene.dslr_resized_undistorted_mask_dir / mask_path.name,
-			]
-			for candidate in candidates:
-				if candidate.exists():
-					return candidate
-
-		default_mask = scene.dslr_resized_undistorted_mask_dir / f"{image_path.stem}.png"
-		return default_mask if default_mask.exists() else None
-
-	def _load_dslr_reference_pool(self, scene: ScannetppScene_Release) -> dict[str, tuple[Path, Path | None]]:
-		"""Load usable DSLR reference images keyed by stable reference ID."""
-
-		transform_path = scene.dslr_nerfstudio_transform_undistorted_path
-		if not transform_path.exists():
-			raise RejectedSample(f"Missing DSLR transforms: {transform_path}")
-		payload = read_json(transform_path)
-		frames = list(payload.get("frames") or []) + list(payload.get("test_frames") or [])
-		candidates: dict[str, tuple[Path, Path | None]] = {}
-		for frame in frames:
-			if frame.get("is_bad", False):
-				continue
-			file_value = frame.get("file_path") or frame.get("image_path") or frame.get("name")
-			if not file_value:
-				continue
-			image_path = self._resolve_dslr_image_path(scene, str(file_value))
-			if image_path is None:
-				continue
-
-			ref_id = f"dslr:{image_path.name}"
-			candidates[ref_id] = (image_path, self._resolve_dslr_mask_path(scene, image_path, frame))
-		return candidates
 
 	def _probe_video(self, ctx: SampleContext) -> None:
 		"""Probe source video stream metadata into the sample context."""
@@ -454,57 +389,25 @@ class DataSamplingStage:
 		ctx.video_num_frames = num_frames
 		ctx.video_duration_s = duration if duration is not None else num_frames / frame_rate
 	
-	def _select_reference_images(
-		self,
-		scene: ScannetppScene_Release,
-		start_frame: int
-	) -> list[RefSource]:
-		"""Select and shuffle start-frame and DSLR reference sources."""
-
-		num_refs = self.rng.randint(1, self.args.max_ref_images)
-		include_start = self.rng.random() < self.args.include_start_frame_prob
-		ref_sources: list[RefSource] = []
-		if include_start:
-			ref_sources.append(RefSource(
-				kind="iphone_start",
-				ref_id=f"iphone_start:f{start_frame:07d}",
-				image_path=None,
-				mask_path=None,
-				is_start_frame=True,
-			))
-		dslr_needed = num_refs - int(include_start)
-		if dslr_needed > 0:
-			candidates = self._load_dslr_reference_pool(scene)
-			if len(candidates) < dslr_needed:
-				raise RejectedSample(
-					f"Scene {scene.scene_id} has {len(candidates)} usable DSLR images, needs {dslr_needed}."
-				)
-			for ref_id in self.rng.sample(sorted(candidates), k=dslr_needed):
-				image_path, mask_path = candidates[ref_id]
-				ref_sources.append(RefSource(
-					kind="dslr",
-					ref_id=ref_id,
-					image_path=image_path,
-					mask_path=mask_path,
-					is_start_frame=False,
-				))
-		self.rng.shuffle(ref_sources)
-		return ref_sources
-	
 	def _prepare_gt_clip(self, ctx: SampleContext) -> None:
 		"""Extract and center-crop one clip while preserving the source FPS."""
 
-		side = "min(iw,ih)"
-		crop_args = (side, side, f"(iw-{side})/2", f"(ih-{side})/2")
-		mask_path = ctx.require_source_video_mask_path()
-		if mask_path.exists():
+		def center_crop_args() -> tuple[str, str, str, str]:
+			side = "min(iw,ih)"
+			return side, side, f"(iw-{side})/2", f"(ih-{side})/2"
+		
+		source_video_path = ctx.require_source_video_path()
+		if not source_video_path.exists():
+			raise RejectedSample(f"Missing iPhone video: {source_video_path}")
+		source_mask_path = ctx.require_source_video_mask_path()
+		if source_mask_path.exists():
 			output_kwargs = {"format": "rawvideo", "pix_fmt": "gray"}
 			process = (
 				ffmpeg.input(
-					str(mask_path),
+					str(source_mask_path),
 					ss=ctx.start_frame / ctx.video_fps, t=self.args.clip_seconds
 				).video
-				.filter_("crop", *crop_args)
+				.filter_("crop", *center_crop_args())
 				.filter_("fps", fps=ctx.video_fps)
 				.filter_("format", "gray")
 				.output("pipe:", **output_kwargs)
@@ -531,13 +434,13 @@ class DataSamplingStage:
 					raise RejectedSample(f"Video valid fraction {video_valid_fraction:.4f} below threshold.")
 
 		try:
-			(
+			process = (
 				ffmpeg
 				.input(
-					str(ctx.require_source_video_path()),
+					str(source_video_path),
 					ss=ctx.start_frame / ctx.video_fps, t=self.args.clip_seconds
 				).video
-				.filter_("crop", *crop_args)
+				.filter_("crop", *center_crop_args())
 				.filter_("fps", fps=ctx.video_fps)
 				.output(
 					str(ctx.gt_clip_path),
@@ -556,64 +459,112 @@ class DataSamplingStage:
 			message = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
 			raise RuntimeError(f"ffmpeg failed while writing {ctx.gt_clip_path}: {message}") from error
 	
-	def _prepare_start_frame(self, ctx: SampleContext, ref_sources: list[RefSource]) -> None:
-		"""Materialize the video start frame so every reference follows one path."""
+	def _prepare_poses(self, ctx: SampleContext) -> None:
+		pass
 
-		if not any(source.is_start_frame for source in ref_sources):
-			return
-		def imread(path: Path, index: int) -> Image.Image:
-			return Image.fromarray(iio.imread(path, index=index))
-		
-		start_image = imread(ctx.gt_clip_path, 0).convert("RGB")
-		start_path = ctx.intermediate_dir / "start_frame.jpg"
-		start_image.save(start_path, quality=95)
-
-		start_mask_path: Path | None = None
-		source_mask_path = ctx.require_source_video_mask_path()
-		if source_mask_path.exists():
-			start_mask = imread(source_mask_path, ctx.start_frame).convert("L")
-			start_mask_path = ctx.intermediate_dir / "start_frame_mask.png"
-			start_mask.save(start_mask_path)
-
-		for source in ref_sources:
-			if source.is_start_frame:
-				source.image_path = start_path
-				source.mask_path = start_mask_path
-
-	def _prepare_reference_images(self, ctx: SampleContext, ref_sources: list[RefSource]) -> None:
+	def _prepare_reference_images(
+		self, ctx: SampleContext,
+		scene: ScannetppScene_Release
+	) -> None:
 		"""Copy selected references into fixed sample order."""
 
-		def crop(image: Image.Image) -> Image.Image:
+		def im_read(video_path: Path, index: int) -> Image.Image:
+			return Image.fromarray(iio.imread(video_path, index=index))
+		
+		def square_crop(image: Image.Image) -> Image.Image:
 			side = min(image.width, image.height)
 			left, top = (image.width - side) // 2, (image.height - side) // 2
 			return image.crop((left, top, left + side, top + side))
-
+		
+		def square_rgb(image: Image.Image) -> Image.Image:
+			return square_crop(image.convert("RGB"))
+		
+		def square_gray(image: Image.Image) -> Image.Image:
+			return square_crop(image.convert("L"))
+		
+		def ensure_valid_fraction(mask: Image.Image):
+			mask = np.asarray(mask)
+			if mask.ndim == 3:
+				mask = np.max(mask[..., :3], axis=-1)
+			valid_fraction = float((mask > 127).mean())
+			if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
+				raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
+		
+		def resolve_dslr_path(file_value: str| None) -> Path | None:
+			if not file_path:
+				return None
+			file_path = Path(file_value)
+			for candidate in [
+				file_path,
+				scene.dslr_dir / file_path,
+				scene.dslr_resized_undistorted_dir / file_path.name,
+			]:
+				if candidate.exists():
+					return candidate
+			return None
+		
+		ref_sources: list[dict[str, Any]] = []
+		include_start = self.rng.random() < self.args.include_start_frame_prob
+		if include_start:
+			start_mask_path = ctx.require_source_video_mask_path()
+			if start_mask_path.exists():
+				start_mask = im_read(start_mask_path, ctx.start_frame)
+				ensure_valid_fraction(square_gray(start_mask))
+			start_image = square_rgb(im_read(ctx.gt_clip_path, 0))
+			ref_sources.append({
+				"image": start_image,
+				"id": f"iphone:{ctx.start_frame:07d}",
+			})
+		
+		dslr_transforms_path = scene.dslr_nerfstudio_transform_undistorted_path
+		if not dslr_transforms_path.exists():
+			raise RejectedSample(f"Missing DSLR transforms: {dslr_transforms_path}")
+		payload = read_json(dslr_transforms_path)
+		dslr_images = list(payload.get("frames", [])) + list(payload.get("test_frames", []))
+		
+		dslr_count = 0
+		self.rng.shuffle(dslr_images)
+		dslr_needed = self.rng.randint(1, self.args.max_ref_images) - int(include_start)
+		while dslr_count < dslr_needed:
+			if not dslr_images:
+				raise RejectedSample(f"Scene {ctx.scene_id} DSLR images not enough.")
+			dslr_image = dslr_images.pop()
+			image_path = resolve_dslr_path(dslr_image.get("file_path"))
+			mask_path = resolve_dslr_path(dslr_image.get("mask_path"))
+			if not image_path or dslr_image.get("is_bad"):
+				continue
+			if mask_path:
+				with Image.open(mask_path) as loaded:
+					ensure_valid_fraction(square_gray(loaded))
+			with Image.open(image_path) as loaded:
+				image = square_rgb(loaded.copy())
+			# TODO: Use the transform information to estimate its relavent to the video clip. Read from disk to get video poses.
+			# TODO: Apply image quality related filters here.
+			ref_sources.append({
+				"image": image,
+				"id": f"dslr:{image_path.name}",
+			})
+			dslr_count += 1
+		
 		ref_dir = ctx.ref_img_dir
 		ref_dir.mkdir(parents=True, exist_ok=True)
+		self.rng.shuffle(ref_sources)
 		metadata: list[dict[str, Any]] = []
 		for index, source in enumerate(ref_sources, start=1):
-			if source.image_path is None:
-				raise RejectedSample("Reference source has no materialized image path.")
-			if source.mask_path is not None and source.mask_path.exists():
-				with Image.open(source.mask_path) as image:
-					mask = np.asarray(crop(image.convert("L")))
-				if mask.ndim == 3:
-					mask = np.max(mask[..., :3], axis=-1)
-				valid_fraction = float((mask > 127).mean())
-				if self.args.filter_pixel_valid_fraction_min is not None and valid_fraction < self.args.filter_pixel_valid_fraction_min:
-					raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
-			
-			output_name = f"ref_{index:02d}.jpg"
-			with Image.open(source.image_path) as loaded:
-				image = crop(loaded.convert("RGB"))
-				image.save(ref_dir / output_name, quality=95)
+			image: Image.Image = source["image"]
+			output_name = f"ref_{index:03d}.jpg"
+			image.save(ref_dir / output_name, quality=95)
 			metadata.append({
 				"index": index,
-				"is_start_frame": bool(source.is_start_frame),
+				"is_start_frame": image["id"].startswith("iphone"),
 				"width": image.width,
 				"height": image.height,
 				"path": f"samples/{ctx.sample_id}/ref_imgs/{output_name}",
 			})
+		
+		payload = "|".join(source["id"] for source in ref_sources)
+		ref_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}__r{ref_hash}"
 		ctx.manifest_entry["ref_imgs"] = metadata
 
 	def __call__(self, ctx: SampleContext) -> None:
@@ -621,8 +572,6 @@ class DataSamplingStage:
 		
 		ctx.scene_id = self.rng.choice(self.scene_ids)
 		scene = ScannetppScene_Release(ctx.scene_id, data_root=self.data_root)
-		if not scene.iphone_video_path.exists():
-			raise RejectedSample(f"Missing iPhone video: {scene.iphone_video_path}")
 		ctx.scene_type = str(self.scene_types.get(ctx.scene_id, "unknown"))
 		ctx.clip_duration_s = self.args.clip_seconds
 		ctx.source_video_path = scene.iphone_video_path
@@ -634,10 +583,6 @@ class DataSamplingStage:
 			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {ctx.source_video_path}")
 		ctx.start_frame = self.rng.randint(0, ctx.video_num_frames - ctx.clip_frames)
 		
-		ref_sources = self._select_reference_images(scene, ctx.start_frame)
-		payload = "|".join(source.ref_id for source in ref_sources)
-		ref_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
-		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}__r{ref_hash}"
 		ctx.tmp_dir = self.samples_root / f".tmp_{ctx.sample_id}"
 		ctx.final_dir = self.samples_root / ctx.sample_id
 		if ctx.final_dir.exists() or ctx.tmp_dir.exists():
@@ -656,8 +601,8 @@ class DataSamplingStage:
 		}
 		try:
 			self._prepare_gt_clip(ctx)
-			self._prepare_start_frame(ctx, ref_sources)
-			self._prepare_reference_images(ctx, ref_sources)
+			self._prepare_poses(ctx)
+			self._prepare_reference_images(ctx, scene)
 		except Exception:
 			cleanup_sample_tmp(ctx)
 			raise
@@ -676,8 +621,8 @@ class MotionExtractionStage:
 	def __init__(self, args: Namespace):
 		self.args = args
 
-	# TODO: This should be a method of DataSamplingStage. It should parse the raw file to a clean python list, where each element is either None or a nested list and can be converted directly to numpy array. Then it store the clip slice to `intermediate/poses.json`, and return the entire sequence.
-	def _prepare_poses(self, ctx: SampleContext) -> list[np.ndarray | None]:
+	# TODO: This should be a method of DataSamplingStage. It should parse the raw file to a clean python list, where each element is either None or a nested list and can be converted directly to numpy array. Then it store the slice to `intermediate/poses.json`.
+	def _prepare_poses(self, ctx: SampleContext) -> None:
 		"""Load aligned iPhone poses from the supported pose JSON layouts."""
 
 		def sort_key(key: Any) -> tuple[int, str]:
@@ -723,11 +668,11 @@ class MotionExtractionStage:
 		) if isinstance(payload, dict) else parse_payload(payload)
 		if not poses:
 			raise RejectedSample(f"No pose records found in {path}")
+		# TODO: Continue implementing.
 		poses = [parse_pose(pose) for pose in poses]
 		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]		
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")	
-		return poses
 
 	def _parse_rotation(self, rotation: np.ndarray) -> tuple[float, float, float]:
 		"""Return approximate yaw, pitch, and roll in degrees for camera axes."""
@@ -782,15 +727,16 @@ class MotionExtractionStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
-		# TODO: clip_poses is obtained by reading `intermediate/poses.json`, then each of its element is converted to numpy array.
+		# TODO: Here, clip_poses is obtained by reading `intermediate/poses.json`, then each of its element is converted to numpy array for downstream computation.
 		all_poses = self._prepare_poses(ctx)	
 		clip_poses = all_poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
-		
 		clip_valid_poses = self._valid_clip_poses(clip_poses)
+		
 		trajectory = self._motion_stats(
 			poses=clip_valid_poses,
 			duration_s=self.args.clip_seconds,
 		)
+		# TODO: More motion filters.
 		trajectory_length = trajectory["trajectory_length_m"]
 		if self.args.filter_camera_trajectory_length_m_min is not None and trajectory_length < self.args.filter_camera_trajectory_length_m_min:
 			raise RejectedSample(f"Trajectory length {trajectory_length:.4f} below minimum.")
