@@ -458,9 +458,59 @@ class DataSamplingStage:
 		except ffmpeg.Error as error:
 			message = error.stderr.decode("utf-8", errors="replace") if error.stderr else str(error)
 			raise RuntimeError(f"ffmpeg failed while writing {ctx.gt_clip_path}: {message}") from error
-	
+
+	# TODO: This method should parse the raw file to a clean python list, where each element is either None or a nested list and can be converted directly to numpy array. Then it store the slice to `intermediate/poses.json`.
 	def _prepare_poses(self, ctx: SampleContext) -> None:
-		pass
+		"""Load aligned iPhone poses from the supported pose JSON layouts."""
+
+		def sort_key(key: Any) -> tuple[int, str]:
+			text = str(key)
+			if text.isdigit():
+				return int(text), text
+			stem = Path(text).stem
+			digits = "".join(character for character in stem if character.isdigit())
+			if digits:
+				return int(digits), text
+			return 10**12, text
+
+		def parse_payload(poses: Any) -> list[Any]:
+			if poses is None:
+				return []
+			if isinstance(poses, dict):				
+				items = sorted(poses.items(), key=lambda item: sort_key(item[0]))
+				return [value for _, value in items]
+			return list(poses)
+		
+		def parse_pose(value: Any) -> np.ndarray | None:
+			if value is None:
+				return None
+			if isinstance(value, dict):
+				fields = ("aligned_pose", "transform_matrix", "pose", "c2w")
+				value = next((value[field] for field in fields if field in value), None)
+			try:
+				array = np.asarray(value, dtype=np.float64)
+			except (TypeError, ValueError):
+				return None
+			if array.shape != (4, 4) or not np.isfinite(array).all():
+				return None
+			return array
+
+		path = ctx.require_source_pose_path()
+		if not path.exists():
+			raise RejectedSample(f"Missing iPhone pose file: {path}")
+		payload = read_json(path)
+		poses = (
+			parse_payload(payload.get("aligned_poses"))
+			or parse_payload(payload.get("poses"))
+			or parse_payload(payload)
+		) if isinstance(payload, dict) else parse_payload(payload)
+		if not poses:
+			raise RejectedSample(f"No pose records found in {path}")
+		# TODO: Continue implementing.
+		poses = [parse_pose(pose) for pose in poses]
+		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]		
+		if len(clip_poses) < ctx.clip_frames:
+			raise RejectedSample("Pose sequence is shorter than the sampled clip.")	
 
 	def _prepare_reference_images(
 		self, ctx: SampleContext,
@@ -621,59 +671,6 @@ class MotionExtractionStage:
 	def __init__(self, args: Namespace):
 		self.args = args
 
-	# TODO: This should be a method of DataSamplingStage. It should parse the raw file to a clean python list, where each element is either None or a nested list and can be converted directly to numpy array. Then it store the slice to `intermediate/poses.json`.
-	def _prepare_poses(self, ctx: SampleContext) -> None:
-		"""Load aligned iPhone poses from the supported pose JSON layouts."""
-
-		def sort_key(key: Any) -> tuple[int, str]:
-			text = str(key)
-			if text.isdigit():
-				return int(text), text
-			stem = Path(text).stem
-			digits = "".join(character for character in stem if character.isdigit())
-			if digits:
-				return int(digits), text
-			return 10**12, text
-
-		def parse_payload(poses: Any) -> list[Any]:
-			if poses is None:
-				return []
-			if isinstance(poses, dict):				
-				items = sorted(poses.items(), key=lambda item: sort_key(item[0]))
-				return [value for _, value in items]
-			return list(poses)
-		
-		def parse_pose(value: Any) -> np.ndarray | None:
-			if value is None:
-				return None
-			if isinstance(value, dict):
-				fields = ("aligned_pose", "transform_matrix", "pose", "c2w")
-				value = next((value[field] for field in fields if field in value), None)
-			try:
-				array = np.asarray(value, dtype=np.float64)
-			except (TypeError, ValueError):
-				return None
-			if array.shape != (4, 4) or not np.isfinite(array).all():
-				return None
-			return array
-
-		path = ctx.require_source_pose_path()
-		if not path.exists():
-			raise RejectedSample(f"Missing iPhone pose file: {path}")
-		payload = read_json(path)
-		poses = (
-			parse_payload(payload.get("aligned_poses"))
-			or parse_payload(payload.get("poses"))
-			or parse_payload(payload)
-		) if isinstance(payload, dict) else parse_payload(payload)
-		if not poses:
-			raise RejectedSample(f"No pose records found in {path}")
-		# TODO: Continue implementing.
-		poses = [parse_pose(pose) for pose in poses]
-		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]		
-		if len(clip_poses) < ctx.clip_frames:
-			raise RejectedSample("Pose sequence is shorter than the sampled clip.")	
-
 	def _parse_rotation(self, rotation: np.ndarray) -> tuple[float, float, float]:
 		"""Return approximate yaw, pitch, and roll in degrees for camera axes."""
 
@@ -684,7 +681,7 @@ class MotionExtractionStage:
 		roll = math.degrees(math.atan2(-down[0], down[1]))
 		return yaw, pitch, roll
 
-	# NOTE: This method should stay in this stage, which is responsible for returning valid poses of a clip or a unit, and reject the sample if the fraction drops bellow the specified threshold. DataSamplingStage does not filter valid fraction for poses.
+	# NOTE: This method should stay in this stage, it is responsible for returning valid poses of a clip or a unit, and reject the sample if the fraction drops bellow the specified threshold. DataSamplingStage does not filter valid fraction for poses.
 	def _valid_clip_poses(self, poses: list[np.ndarray | None]) -> list[np.ndarray]:
 		"""Return valid whole-clip poses."""
 		
@@ -728,8 +725,7 @@ class MotionExtractionStage:
 		"""Compute and save `motion_extraction.json`."""
 
 		# TODO: Here, clip_poses is obtained by reading `intermediate/poses.json`, then each of its element is converted to numpy array for downstream computation.
-		all_poses = self._prepare_poses(ctx)	
-		clip_poses = all_poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
+		clip_poses = []
 		clip_valid_poses = self._valid_clip_poses(clip_poses)
 		
 		trajectory = self._motion_stats(
