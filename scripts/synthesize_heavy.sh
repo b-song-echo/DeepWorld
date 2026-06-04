@@ -47,6 +47,9 @@ python $SCRIPT \
 	--distillation_llm_max_new_tokens 1024 \
 	--filter_pixel_valid_fraction_min 0.95 \
 	--filter_pose_valid_fraction_min 0.90 \
+	--filter_motion_amount_min 0.10 \
+	--filter_motion_amount_max 2.50 \
+	--filter_motion_unsteadiness_max 3.00 \
 	--filter_dslr_brisque_score_max 60.0 \
 	--filter_quality_score_min 0.7 \
 	"$@"

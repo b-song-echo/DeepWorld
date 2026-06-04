@@ -1,7 +1,6 @@
-# TODO: Update this templates to match the implementation in synthesize.py
-MOTION_DIGESTING_TEMPLATE = """You are converting numeric camera-motion extraction into a clear camera-motion caption.
+MOTION_DIGESTING_TEMPLATE = """You are converting numeric camera-motion statistics into a clear camera-motion caption.
 
-The clip is split into motion units. You receive statistics for the overall motion and all motion units. Your goal is to Interpret all  describe the camera path in a way that a later video-captioning VLM can use to understand how the camera moves through time.
+The clip is split into fixed-duration motion units. You receive statistics for the overall motion and for each unit. Interpret the numbers and describe the camera motion in a way that a later video-captioning VLM can use to understand how the camera moves through time.
 
 Return JSON only. Do not include Markdown.
 
@@ -13,32 +12,32 @@ Camera-coordinate convention:
 - +Z means camera-forward.
 - All translations and rotations describe camera motion, not object motion.
 
-Fields with the "local" prefix in each motion unit are computed relative to the first pose of that unit; they describe the local motion within that unit. Fields with the "first_pose" prefix in each motion unit are computed relative to the first pose of the whole clip; they describe where the unit begins within the full motion.
+Camera motion overview:
+- "overall_motion" summarizes the full clip from the first sampled pose to the last sampled pose. Use it to understand the dominant whole-clip displacement, rotation, duration, and whether the path is mostly direct or indirect.
+- "motion_units" is a chronological list of fixed-duration temporal segments. Use it to preserve phase order, direction changes, brief holds, and changes in motion strength over time.
+- Fields beginning with "unit_start_in_clip_start_" describe the where that unit fits in the whole-clip. Use them to connect units into one continuous motion.
+- Fields beginning with "unit_end_in_unit_start_" describe what happens inside that unit. Use them as the main evidence for that unit's local motion.
+- Unless stated otherwise, time is measured in seconds, translation is measured in meters, and rotation is measured in degrees.
 
-Field meanings and units:
-- "duration_s": clip or unit duration, in seconds.
-- "trajectory_length_m": accumulated camera path length, in meters. It is non-negative and can exceed the straight-line translation distance.
-- "translation_right_m": net camera displacement along camera-right, in meters.
-- "translation_down_m": net camera displacement along camera-down, in meters.
-- "translation_forward_m": net camera displacement along camera-forward, in meters.
-- "translation_distance_m": straight-line distance between first and last camera positions, in meters.
-- "delta_yaw_deg": net yaw change, in degrees.
-- "delta_pitch_deg": net pitch change, in degrees.
-- "delta_roll_deg": net roll change, in degrees.
-- "rotation_magnitude_deg": combined yaw, pitch, and roll magnitude, in degrees, if available.
-- "net_rotation_angle_deg": shortest overall orientation change, in degrees, if available.
-- "angular_path_deg": accumulated frame-to-frame rotation, in degrees, if available.
-- "path_linearity": net translation distance divided by trajectory length, if available. Lower values suggest curved, indirect, or back-and-forth motion.
-- "translation_jitter", "rotation_jitter", "direction_reversal_fraction": dimensionless shake or instability indicators, if available.
-- "max_step_distance_m": largest frame-to-frame translation jump, in meters, if available.
-- "max_rotation_step_deg": largest frame-to-frame rotation jump, in degrees, if available.
-- "path_to_translation_distance_ratio": accumulated path length divided by net translation distance, if available.
-- "rotation_path_to_net_ratio": accumulated rotation divided by net rotation, if available.
-- "motion_units": fixed-duration temporal units of the whole clip.
-- "time_range_s": start and end time of a motion unit within the clip, in seconds.
-- "first_pose_position_m": where the unit begins relative to the first pose of the whole clip, as [right, down, forward] in meters.
-- "first_pose_yaw_deg", "first_pose_pitch_deg", "first_pose_roll_deg": camera orientation at the beginning of the unit relative to the first pose of the whole clip, in degrees. These describe the starting state of the unit, not the motion inside the unit.
-- Fields with the "local_" prefix describe only motion within that unit, using the same units and signs as the corresponding overall fields.
+Overall motion fields:
+- "clip_duration_(s)": clip duration, in seconds.
+- "clip_start_to_clip_end_path_length_(m)": accumulated camera path length from clip start to clip end. It is non-negative and can exceed the chord length.
+- "clip_start_to_clip_end_chord_length_(m)": straight-line camera displacement between the clip start and clip end.
+- "clip_end_in_clip_start_right_(m)": net camera displacement along camera-right.
+- "clip_end_in_clip_start_down_(m)": net camera displacement along camera-down.
+- "clip_end_in_clip_start_forward_(m)": net camera displacement along camera-forward.
+- "clip_end_in_clip_start_yaw_(deg)": net yaw change. Positive means pan or turn right; negative means pan or turn left.
+- "clip_end_in_clip_start_pitch_(deg)": net pitch change. Positive means tilt up; negative means tilt down.
+- "clip_end_in_clip_start_roll_(deg)": net roll change. Positive means clockwise roll; negative means counterclockwise roll.
+
+Motion-unit fields:
+- "unit_index": zero-based unit index.
+- "unit_begins_at_clip_(s)" and "unit_duration_(s)": when the unit begins and how long it lasts.
+- "unit_start_in_clip_start_right_(m)", "unit_start_in_clip_start_down_(m)", "unit_start_in_clip_start_forward_(m)": where this unit begins relative to the first pose of the whole clip.
+- "unit_start_in_clip_start_yaw_(deg)", "unit_start_in_clip_start_pitch_(deg)", "unit_start_in_clip_start_roll_(deg)": the unit-start orientation relative to the first pose of the whole clip.
+- "unit_start_to_unit_end_path_length_(m)" and "unit_start_to_unit_end_chord_length_(m)": accumulated and straight-line translation within the unit.
+- "unit_end_in_unit_start_right_(m)", "unit_end_in_unit_start_down_(m)", "unit_end_in_unit_start_forward_(m)": unit-local net translation.
+- "unit_end_in_unit_start_yaw_(deg)", "unit_end_in_unit_start_pitch_(deg)", "unit_end_in_unit_start_roll_(deg)": unit-local net rotation.
 
 Candidate camera-motion vocabulary:
 - move forward, move backward, push in, pull back, dolly in, dolly out,
@@ -72,9 +71,9 @@ Core output principle:
 - Avoid vague motion words when they hide important numeric evidence.
 
 Motion interpretation guidance:
-- Use local fields to describe motion within each unit.
-- Use first_pose fields only to understand how units connect into a continuous path.
-- If accumulated path is much larger than net displacement, interpret conservatively as curved, indirect, back-and-forth, or shaky according to the per-unit sequence.
+- Use unit-local fields to describe motion within each unit.
+- Use unit-start-in-clip-start fields only to understand how units connect into a continuous path.
+- If accumulated path is much larger than net displacement, interpret conservatively as curved, indirect, wavered, back-and-forth, or shaky according to the per-unit sequence.
 - Meaningful translation plus meaningful yaw may be described as an arc, curve, sweep, or veer.
 - Forward motion plus lateral motion may be described as a diagonal move or curved approach.
 - Lateral motion plus yaw in the same general direction may be described as an arc or sweeping move.
@@ -129,7 +128,7 @@ Required JSON schema:
   "motion_caption": "one concise paragraph describing the full camera motion in temporal order, using meaningful rounded quantities only when they help"
 }
 
-Camera motion extraction:
+Camera motion statistics:
 <MOTION_EXTRACTION_JSON>
 """
 
@@ -381,7 +380,6 @@ Quality checks:
 - "aligns_with_motion_caption": true only if the prompt's camera motion aligns with the camera motion caption.
 - "has_temporally_grounded_motion": true only if the prompt preserves major motion phases in temporal order, using approximate seconds or clear beginning/middle/end grounding when supported.
 - "has_quantitative_motion_scale_when_supported": true only if the prompt preserves approximate distances, angles, or relative motion scale from the motion/video captions when those quantities are available.
-- "aligns_with_motion_caption": true only if the prompt's camera motion aligns with the camera motion caption.
 - "aligns_with_video_caption": true only if the prompt's content aligns with the video caption.
 - "preserves_motion_order": true only if the prompt preserves the temporal order of major motion phases.
 - "preserves_motion_phase_boundaries": true only if distinct motion phases in the motion/video captions are not collapsed into an ambiguous single movement.
@@ -436,26 +434,24 @@ Required JSON schema:
     "uses_start_frame_reference_if_available": <bool>,
     "describes_start_view_visually_if_no_start_reference": <bool>,
     "has_meaningful_camera_motion": <bool>,
-		"aligns_with_motion_caption": <bool>,
+    "aligns_with_motion_caption": <bool>,
     "has_temporally_grounded_motion": <bool>,
     "has_quantitative_motion_scale_when_supported": <bool>,
-    "aligns_with_motion_caption": <bool>,
     "aligns_with_video_caption": <bool>,
     "preserves_motion_order": <bool>,
-		"preserves_motion_phase_boundaries": <bool>,
+    "preserves_motion_phase_boundaries": <bool>,
     "preserves_motion_strength": <bool>,
-		"does_not_replace_camera_translation_with_zoom": <bool>,
-		"grounds_camera_motion_to_visible_regions": <bool>,
+    "does_not_replace_camera_translation_with_zoom": <bool>,
+    "grounds_camera_motion_to_visible_regions": <bool>,
     "mentions_relevant_scene_objects": <bool>,
     "objects_are_supported_by_video_caption": <bool>,
     "uses_supported_reference_images_compulsorily": <bool>,
     "reference_image_mentions_are_supported": <bool>,
     "preserves_start_reference_grounding": <bool>,
     "preserves_target_reference_grounding": <bool>,
+    "uses_multiple_references_when_clearly_helpful": <bool>,
     "does_not_overuse_reference_images": <bool>,
-		"uses_multiple_references_when_clearly_helpful": <bool>,
-		"does_not_overuse_reference_images": <bool>,
-		"preserves_video_only_visible_objects_when_needed": <bool>,
+    "preserves_video_only_visible_objects_when_needed": <bool>,
     "captures_revealed_or_emphasized_regions": <bool>,
     "preserves_spatial_layout": <bool>,
     "preserves_static_scene_assumption": <bool>,

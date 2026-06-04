@@ -1,6 +1,5 @@
 from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
-import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -126,14 +125,6 @@ class SampleContext:
 		return self.source_pose_path
 
 
-def rotation_angle_deg(rotation: np.ndarray) -> float:
-	"""Return the axis-angle magnitude of a 3x3 relative rotation in degrees."""
-
-	trace = float(np.trace(rotation))
-	cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
-	return math.degrees(math.acos(cosine))
-
-
 def parse_args() -> Namespace:
 	"""Parse the offline command line."""
 
@@ -177,7 +168,9 @@ def parse_args() -> Namespace:
 	parser.add_argument("--distillation_llm_max_new_tokens", type=int, default=1024)
 	parser.add_argument("--filter_pixel_valid_fraction_min", type=float, default=None)
 	parser.add_argument("--filter_pose_valid_fraction_min", type=float, default=None)
-	# TODO: Add three filters that begin with "filter_". One rejects low motion, one rejects overly higj motion, one rejects overly unsteady motion. Don't forget to update the corresponding YAML configs as well.
+	parser.add_argument("--filter_motion_amount_min", type=float, default=None)
+	parser.add_argument("--filter_motion_amount_max", type=float, default=None)
+	parser.add_argument("--filter_motion_unsteadiness_max", type=float, default=None)
 	parser.add_argument("--filter_dslr_brisque_score_max", type=float, default=None)
 	parser.add_argument("--filter_quality_score_min", type=float, default=None)
 	
@@ -201,11 +194,31 @@ def parse_args() -> Namespace:
 	if args.video_captioning_fps <= 0:
 		raise ValueError("`--video_captioning_fps` must be positive.")
 	for name in (
+		"filter_pixel_valid_fraction_min",
+		"filter_pose_valid_fraction_min",
+		"filter_motion_amount_min",
+		"filter_motion_amount_max",
+		"filter_motion_unsteadiness_max",
 		"filter_dslr_brisque_score_max",
+		"filter_quality_score_min",
 	):
 		value = getattr(args, name)
 		if value is not None and value < 0:
 			raise ValueError(f"`--{name}` must be non-negative when provided.")
+	for name in (
+		"filter_pixel_valid_fraction_min",
+		"filter_pose_valid_fraction_min",
+		"filter_quality_score_min"
+	):
+		value = getattr(args, name)
+		if value is not None and value > 1:
+			raise ValueError(f"`--{name}` must be no greater than 1 when provided.")
+	if (
+		args.filter_motion_amount_min is not None and
+		args.filter_motion_amount_max is not None and
+		args.filter_motion_amount_min > args.filter_motion_amount_max
+	):
+		raise ValueError("`--filter_motion_amount_min` cannot exceed `--filter_motion_amount_max`.")
 	return args
 
 
@@ -284,8 +297,10 @@ def write_jsonl(
 
 
 def parse_pose(
-	self, payload: Any, return_list=False
+	payload: Any, return_list=False
 ) -> list[list[float]] | np.ndarray | None:
+	"""Parse one pose-like JSON payload into a finite 4x4 matrix."""
+
 	if payload is None:
 		return None
 	if isinstance(payload, dict):
@@ -305,13 +320,52 @@ def parse_pose(
 	return [[float(element) for element in row] for row in array]
 
 
+def get_relative_transform(pose: np.ndarray, anchor: np.ndarray) -> dict[str, float]:
+	"""Return `pose` expressed in the local camera coordinates of `anchor`.
+
+	Positive yaw turns right, positive pitch tilts up, and positive roll rotates
+	clockwise in the image plane. Translation is in
+	meters, and rotations are returned in degrees.
+	"""
+
+	M = np.linalg.inv(anchor) @ pose
+	translation = M[:3, 3]
+	right, down, forward = translation
+	yaw = np.arctan2(M[0, 2], M[2, 2])
+	pitch = np.arctan2(-M[1, 2], np.hypot(M[0, 2], M[2, 2]))
+	roll = np.arctan2(M[1, 0], M[1, 1])
+	rotation = np.degrees([yaw, pitch, roll])
+	yaw, pitch, roll = rotation
+	return {
+		"right": float(right), "down": float(down), "forward": float(forward),
+		"distance": float(np.linalg.norm(translation)),
+		"yaw": float(yaw), "pitch": float(pitch), "roll": float(roll),
+		"euler_magnitude": float(np.linalg.norm(rotation)),
+	}
+
+
+def maybe_round_float(value: Any) -> Any:
+		"""Round one numeric motion value for stable JSON output."""
+
+		if isinstance(value, list):
+			return [maybe_round_float(item) for item in value]
+		elif isinstance(value, dict):
+			return {k: maybe_round_float(v) for k, v in value.items()}
+		elif isinstance(value, np.ndarray) and value.size == 1 and np.issubdtype(value.dtype, np.floating):
+			return maybe_round_float(value.item())
+		elif isinstance(value, float):
+			return round(value, 3)
+		else:
+			return value
+
+
 class DataSamplingStage:
 	"""Sample ScanNet++ media and write one candidate artifact.
 
 	This stage owns all filesystem interactions with ScanNet++ scene assets. It
 	selects a split-appropriate scene, extracts the square iPhone clip, prepares
 	a fixed shuffled order of reference images, computes pixel-mask fractions,
-	and writes the sample-local media files under `samples/.tmp_<sample_id>/`.
+	and writes the sample-local media files under a `samples/.tmp_*` directory.
 	Downstream stages only read this self-contained temporary sample directory.
 	"""
 
@@ -523,7 +577,7 @@ class DataSamplingStage:
 		if not raw_poses:
 			raise RejectedSample(f"No pose records found in {path}")
 		poses = [parse_pose(pose, return_list=True) for pose in raw_poses]
-		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]		
+		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
 		write_json(ctx.intermediate_dir / "poses.json", {"poses": clip_poses})
@@ -543,20 +597,16 @@ class DataSamplingStage:
 		return float(score)
 
 	def _ref_image_pose_relevance_score(
-		self, dslr_pose: np.ndarray | None, clip_poses: list[np.ndarray],
+		self, dslr_pose: np.ndarray | None, clip_poses: list[np.ndarray | None],
 	) -> float:
 		"""Score how close a DSLR camera pose is to any pose in the sampled clip."""
 	
 		best_score = float("inf")
 		if dslr_pose is None:
 			return best_score
-		dslr_position = dslr_pose[:3, 3]
-		dslr_rotation = dslr_pose[:3, :3]
-		for clip_pose in [pose for pose in clip_poses if clip_pose]:
-			translation_m = float(np.linalg.norm(dslr_position - clip_pose[:3, 3]))
-			relative_rotation = np.linalg.inv(clip_pose[:3, :3]) @ dslr_rotation
-			angle_deg = rotation_angle_deg(relative_rotation)
-			score = translation_m + angle_deg / 45.0
+		for clip_pose in [pose for pose in clip_poses if pose is not None]:
+			relative = get_relative_transform(dslr_pose, clip_pose)
+			score = relative["distance"] + relative["euler_magnitude"] / 45.0
 			best_score = min(best_score, score)
 		return best_score
 
@@ -589,9 +639,9 @@ class DataSamplingStage:
 		def resolve_dslr_path(value: str | None, roots: list[Path]) -> Path | None:
 			if not value:
 				return None
-			file_path = Path(value)			
+			file_path = Path(value)
 			candidates = [file_path] + [root / file_path for root in roots]
-			return next([path for path in candidates if path.exists()], None)
+			return next((path for path in candidates if path.exists()), None)
 
 		include_start = self.rng.random() < self.args.include_start_frame_prob
 		dslr_path = scene.dslr_nerfstudio_transform_undistorted_path
@@ -600,15 +650,16 @@ class DataSamplingStage:
 		payload = read_json(dslr_path)
 		dslr_frames = list(payload.get("frames", [])) + list(payload.get("test_frames", []))
 		ref_needed = self.rng.randint(1, self.args.max_ref_images)
+		dslr_needed = ref_needed - int(include_start)
 		ref_sources: list[dict[str, Any]] = []
 		
 		if include_start:
 			mask_path = ctx.require_source_video_mask_path()
-			if mask_path.exists() and self.args.filter_pixel_valid_fraction_min:
+			if mask_path.exists() and self.args.filter_pixel_valid_fraction_min is not None:
 				start_mask = im_read(mask_path, ctx.start_frame)
 				fraction = valid_fraction(square_gray(start_mask))
 				if fraction < self.args.filter_pixel_valid_fraction_min:
-					raise RejectedSample(f"Reference valid fraction {valid_fraction:.4f} below threshold.")
+					raise RejectedSample(f"Reference valid fraction {fraction:.4f} below threshold.")
 			image = square_rgb(im_read(ctx.gt_clip_path, 0))
 			ref_sources.append({
 				"id": f"iphone:{ctx.start_frame:07d}",
@@ -623,11 +674,10 @@ class DataSamplingStage:
 			score = self._ref_image_pose_relevance_score(dslr_pose, clip_poses)
 			dslr_candidates.append((score, index))
 		dslr_pooled = dslr_needed * self.args.pose_pool_multiplier
-		dslr_candidates.sort(key=lambda score, _: score)
+		dslr_candidates.sort(key=lambda candidate: candidate[0])
 		dslr_candidates = dslr_candidates[:dslr_pooled]
 		self.rng.shuffle(dslr_candidates)
 		
-		dslr_needed = ref_needed - int(include_start)
 		dslr_sources: list[dict[str, Any]] = []
 		dslr_count = 0
 		while dslr_candidates and dslr_count < dslr_needed:
@@ -643,7 +693,7 @@ class DataSamplingStage:
 				value=frame.get("mask_path"),
 				roots=[scene.dslr_resized_undistorted_mask_dir]
 			)
-			if mask_path and self.args.filter_pixel_valid_fraction_min:
+			if mask_path and self.args.filter_pixel_valid_fraction_min is not None:
 				with Image.open(mask_path) as loaded:
 					fraction = valid_fraction(square_gray(loaded))
 				if fraction < self.args.filter_pixel_valid_fraction_min:
@@ -653,7 +703,7 @@ class DataSamplingStage:
 			if self.args.filter_dslr_brisque_score_max is not None:
 				score = self._ref_image_brisque_score(image)
 				if score > self.args.filter_dslr_brisque_score_max:
-					return None
+					continue
 			dslr_count += 1
 			dslr_sources.append({
 				"id": f"dslr:{image_path.name}",
@@ -666,14 +716,6 @@ class DataSamplingStage:
 
 		ref_dir = ctx.ref_img_dir
 		ref_dir.mkdir(parents=True, exist_ok=True)
-		uuid = "|".join(source["id"] for source in ref_sources)
-		uuid = hashlib.sha1(uuid.encode("utf-8")).hexdigest()[:8]
-		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}__r{uuid}"
-		ctx.manifest_entry["sample_id"] = ctx.sample_id
-		ctx.final_dir = self.samples_root / ctx.sample_id
-		if ctx.final_dir.exists():
-			raise RejectedSample(f"Sample already exists: {ctx.sample_id}")
-		
 		metadata: list[dict[str, Any]] = []
 		for index, source in enumerate(ref_sources, start=1):
 			output_name = f"ref_{index:03d}.jpg"
@@ -689,7 +731,7 @@ class DataSamplingStage:
 		ctx.manifest_entry["ref_imgs"] = metadata
 
 	def __call__(self, ctx: SampleContext) -> None:
-		"""Create one sampled candidate under `samples/.tmp_<sample_id>`."""
+		"""Create one sampled candidate under a temporary sample directory."""
 		
 		ctx.scene_id = self.rng.choice(self.scene_ids)
 		scene = ScannetppScene_Release(ctx.scene_id, data_root=self.data_root)
@@ -703,7 +745,11 @@ class DataSamplingStage:
 		if ctx.clip_frames <= 1 or ctx.video_num_frames <= ctx.clip_frames:
 			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {ctx.source_video_path}")
 		ctx.start_frame = self.rng.randint(0, ctx.video_num_frames - ctx.clip_frames)
-		ctx.tmp_dir = self.samples_root / f".tmp_{os.getpid()}"
+		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}"
+		ctx.final_dir = self.samples_root / ctx.sample_id
+		if ctx.final_dir.exists():
+			raise RejectedSample(f"Sample already exists: {ctx.sample_id}")
+		ctx.tmp_dir = self.samples_root / f".tmp_{ctx.sample_id}__p{os.getpid()}"
 		if ctx.tmp_dir.exists():
 			cleanup_sample_tmp(ctx)
 		ctx.tmp_dir.mkdir(parents=True)
@@ -751,70 +797,73 @@ class MotionExtractionStage:
 			raise RejectedSample(f"Pose valid fraction {valid_fraction:.4f} below threshold.")
 		return valid_poses
 	
-	def _get_relative_transform(self, pose: np.ndarray, anchor: np.ndarray):
-		# TODO: Verify the correctness of this implementation.
-		M = np.linalg.inv(anchor) @ pose
-		# roll = math.degrees(np.arctan2(-M[1, 0], M[1, 1]))?
-		return {
-			"right": float(M[0, 3]),
-			"down": float(M[1, 3]),
-			"forward": float(M[2, 3]),
-			"yaw": math.degrees(np.arctan2(M[0, 2], M[2, 2])),
-			"pitch": math.degrees(np.arctan2(-M[1, 2], np.hypot(M[0, 2], M[2, 2]))),
-			"roll": math.degrees(np.arctan2(M[1, 0], M[1, 1])),
-		}
-	
-	def _round(self, value: float | np.ndarray) -> float:
-		"""Round one numeric motion value for stable JSON output."""
-
-		return round(float(value), 4)
-	
 	def _motion_stats(self, poses: list[np.ndarray]) -> dict[str, float]:
 		"""Compute statistics for poses."""
-		
-		def magnitude(*values) -> float:
-			return math.sqrt(sum(float(x ** 2) for x in values))
 
-		step_lengths: list[float] = []
+		def normalized_variation(values: list[float]) -> float:
+			if len(values) < 2:
+				return 0.0
+			mean = np.mean(values)
+			if mean <= 1e-8:
+				return 0.0
+			return float(np.std(values) / mean)
+
+		step_distances: list[float] = []
+		step_euler_magnitudes: list[float] = []
+		steps: list[np.ndarray] = []
 		for i in range(1, len(poses)):
-			step_tf = self._get_relative_transform(poses[i], poses[i - 1])
-			r, d, f = step_tf["right"], step_tf["down"], step_tf["forward"]
-			step_lengths.append(magnitude(r, d, f))
-		path_length = sum(step_lengths)
-		tf = self._get_relative_transform(poses[-1], poses[0])
-		chord_length = magnitude(tf["right"], tf["down"], tf["forward"])
+			tf = get_relative_transform(poses[i], poses[i - 1])
+			step_distances.append(tf["distance"])
+			step_euler_magnitudes.append(tf["euler_magnitude"])
+			if tf["distance"] > 1e-8:
+				vec = np.array([tf["right"], tf["down"], tf["forward"]])
+				steps.append(vec / tf["distance"])
 
-		# TODO: The following statistics are the most essential ones that should certainly be passed to LLM to digest. Additionally, I two extra statistics to be used for filtering in `__call__` method. I don't know what they should be called or how to compute them, but I can describe vaguely what are they for. The first one measures "the amount of motion", it can be used to filter out nearly static or overly dynamic clips. The second one measures "the smoothness of motion", it gives a sense of how "steady" the motion is, and can be used to filter out shaky or jittery clips.
+		path_length = sum(step_distances)
+		path_curvature = sum(step_euler_magnitudes) / 90.0
+		motion_amount = path_length + path_curvature
+
+		jitter = normalized_variation(step_distances)
+		shaky = normalized_variation(step_euler_magnitudes)
+		turns = [np.dot(*vv) for vv in zip(steps, steps[1:])]
+		neg_turns = [turn for turn in turns if turn < 0.0]
+		neg_turn_fraction = len(neg_turns) / len(turns) if turns else 0.0
+		motion_unsteadiness = (jitter + shaky) / 2.0 + neg_turn_fraction
+		
+		tf = get_relative_transform(poses[-1], poses[0])
 		return {
-			f"path_length": self._round(path_length),
-			f"chord_length": self._round(chord_length),
-			f"right": self._round(tf["right"]),
-			f"down": self._round(tf["down"]),
-			f"forward": self._round(tf["forward"]),
-			f"yaw": self._round(tf["yaw"]),
-			f"pitch": self._round(tf["pitch"]),
-			f"roll": self._round(tf["roll"]),
+			"path_length": path_length,
+			"chord_length": tf["distance"],
+			"right": tf["right"], "down": tf["down"], "forward": tf["forward"],
+			"yaw": tf["yaw"], "pitch": tf["pitch"], "roll": tf["roll"],
+			"motion_amount": motion_amount,
+			"motion_unsteadiness": motion_unsteadiness,
 		}
 
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
 		payload = read_json(ctx.intermediate_dir / "poses.json")
-		clip_poses = [parse_pose(pose) for pose in payload.get("poses", [])]
-		clip_poses = self._valid_clip_poses(clip_poses)
+		raw_clip_poses = [parse_pose(pose) for pose in payload.get("poses", [])]
+		clip_poses = self._valid_clip_poses(raw_clip_poses)
 		stats = self._motion_stats(clip_poses)
-		# TODO: Update the prompt templates for this stage. The fields and hints should match these names. Note that the path length refer to the total length of the trajectory, while chord length is simply the distance between two end points of the trajectory.
-		overall_motion = {
-			"clip_duration_(s)": self._round(self.args.clip_seconds),
+		if self.args.filter_motion_amount_min is not None and stats["motion_amount"] < self.args.filter_motion_amount_min:
+			raise RejectedSample(f"Motion amount {stats['motion_amount']:.4f} below threshold.")
+		if self.args.filter_motion_amount_max is not None and stats["motion_amount"] > self.args.filter_motion_amount_max:
+			raise RejectedSample(f"Motion amount {stats['motion_amount']:.4f} above threshold.")
+		if self.args.filter_motion_unsteadiness_max is not None and stats["motion_unsteadiness"] > self.args.filter_motion_unsteadiness_max:
+			raise RejectedSample(f"Motion unsteadiness {stats['motion_unsteadiness']:.4f} above threshold.")
+		overall_motion = maybe_round_float({
+			"clip_duration_(s)": self.args.clip_seconds,
 			"clip_start_to_clip_end_path_length_(m)": stats["path_length"],
-			"clip_start_to_clip_end_chord_length_(m)": stats["chord_lengtj"],
+			"clip_start_to_clip_end_chord_length_(m)": stats["chord_length"],
 			"clip_end_in_clip_start_right_(m)": stats["right"],
 			"clip_end_in_clip_start_down_(m)": stats["down"],
 			"clip_end_in_clip_start_forward_(m)": stats["forward"],
 			"clip_end_in_clip_start_yaw_(deg)": stats["yaw"],
 			"clip_end_in_clip_start_pitch_(deg)": stats["pitch"],
 			"clip_end_in_clip_start_roll_(deg)": stats["roll"],
-		}
+		})
 		
 		motion_units: list[dict[str, Any]] = []
 		unit_secs = self.args.motion_digesting_unit_seconds
@@ -823,15 +872,15 @@ class MotionExtractionStage:
 			start_time = unit_index * unit_secs
 			end_time = min((unit_index + 1) * unit_secs, self.args.clip_seconds)
 			start_index = int(round(start_time * ctx.video_fps))
-			end_index = min(int(round(end_time * ctx.video_fps)), len(clip_poses))
-			unit_poses = clip_poses[start_index:end_index]
+			end_index = min(int(round(end_time * ctx.video_fps)), len(raw_clip_poses))
+			unit_poses = raw_clip_poses[start_index:end_index]
 			unit_poses = self._valid_clip_poses(unit_poses)
 			stats = self._motion_stats(unit_poses)
-			rel_first = self._motion_stats(unit_poses[0], unit_poses[0])
-			motion_units.append({
+			rel_first = get_relative_transform(unit_poses[0], clip_poses[0])
+			motion_units.append(maybe_round_float({
 				"unit_index": unit_index,
-				"unit_begins_at_clip_(s)": self._round(start_time),
-				"unit_duration_(s)": self._round(end_time - start_time),
+				"unit_begins_at_clip_(s)": start_time,
+				"unit_duration_(s)": end_time - start_time,
 				"unit_start_in_clip_start_right_(m)": rel_first["right"],
 				"unit_start_in_clip_start_down_(m)": rel_first["down"],
 				"unit_start_in_clip_start_forward_(m)": rel_first["forward"],
@@ -846,7 +895,7 @@ class MotionExtractionStage:
 				"unit_end_in_unit_start_yaw_(deg)": stats["yaw"],
 				"unit_end_in_unit_start_pitch_(deg)": stats["pitch"],
 				"unit_end_in_unit_start_roll_(deg)": stats["roll"],
-			})
+			}))
 		write_json(ctx.intermediate_dir / "motion_extraction.json", {
 			"overall_motion": overall_motion,
 			"motion_units": motion_units,

@@ -1,3 +1,0 @@
-First, I have done a lot of refactoring in `synthesize.py`. But I might have broken the code. Second, I have some TODOs regarfing motion extraction and motion related filterings.
-
-Please fix bugs, complete TODOs. Don't make any huge change. Don't change my implementation. When a piece of new logic is not very much, put it in place rather than adding a new function. When a bug can be eradicated, don't patch it.
