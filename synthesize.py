@@ -442,11 +442,13 @@ class DataSamplingStage:
 			except ValueError:
 				return 0
 		
-		path = ctx.require_source_video_path()
-		probe = ffmpeg.probe(str(path), select_streams="v:0")
+		source_video_path = ctx.require_source_video_path()
+		if not source_video_path.exists():
+			raise RejectedSample(f"Missing iPhone video: {source_video_path}")
+		probe = ffmpeg.probe(str(source_video_path), select_streams="v:0")
 		streams = probe.get("streams") or []
 		if not streams:
-			raise RejectedSample(f"No video stream found in {path}")
+			raise RejectedSample(f"No video stream found in {source_video_path}")
 		stream = streams[0]
 
 		duration = (
@@ -460,14 +462,14 @@ class DataSamplingStage:
 			or parse_frame_rate(stream.get("r_frame_rate"))
 		)
 		if frame_rate is None:
-			raise RejectedSample(f"Could not determine FPS for video: {path}")
+			raise RejectedSample(f"Could not determine FPS for video: {source_video_path}")
 			
 		num_frames = (
 			parse_num_frames(stream.get("nb_frames"))
 			or int(round(frame_rate * (duration or 0.0)))
 		)
 		if num_frames <= 0:
-			raise RejectedSample(f"Could not determine frame count for video: {path}")
+			raise RejectedSample(f"Could not determine frame count for video: {source_video_path}")
 
 		ctx.video_width = int(stream["width"])
 		ctx.video_height = int(stream["height"])
