@@ -18,7 +18,8 @@ python $SCRIPT \
 	--split train \
 	--num_samples 100000 \
 	--clip_seconds 5.0 \
-	--max_ref_images 10 \
+	--max_ref_images 5 \
+	--pose_pool_multiplier 4 \
 	--include_start_frame_prob 0.35 \
 	--vlm_backend_path $VLM_BACKBONE_PATH \
 	--llm_backend_path $LLM_BACKBONE_PATH \
@@ -46,7 +47,6 @@ python $SCRIPT \
 	--distillation_llm_max_new_tokens 1024 \
 	--filter_pixel_valid_fraction_min 0.95 \
 	--filter_pose_valid_fraction_min 0.90 \
-	--filter_camera_trajectory_length_m_min 0.15 \
-	--filter_camera_trajectory_length_m_max 4.50 \
+	--filter_dslr_brisque_score_max 60.0 \
 	--filter_quality_score_min 0.7 \
 	"$@"

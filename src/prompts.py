@@ -1,3 +1,4 @@
+# TODO: Update this templates to match the implementation in synthesize.py
 MOTION_DIGESTING_TEMPLATE = """You are converting numeric camera-motion extraction into a clear camera-motion caption.
 
 The clip is split into motion units. You receive statistics for the overall motion and all motion units. Your goal is to Interpret all  describe the camera path in a way that a later video-captioning VLM can use to understand how the camera moves through time.
@@ -27,7 +28,6 @@ Field meanings and units:
 - "rotation_magnitude_deg": combined yaw, pitch, and roll magnitude, in degrees, if available.
 - "net_rotation_angle_deg": shortest overall orientation change, in degrees, if available.
 - "angular_path_deg": accumulated frame-to-frame rotation, in degrees, if available.
-- "motion_quality": smoothness, stationarity, jitter, and indirectness statistics for the whole clip.
 - "path_linearity": net translation distance divided by trajectory length, if available. Lower values suggest curved, indirect, or back-and-forth motion.
 - "translation_jitter", "rotation_jitter", "direction_reversal_fraction": dimensionless shake or instability indicators, if available.
 - "max_step_distance_m": largest frame-to-frame translation jump, in meters, if available.
