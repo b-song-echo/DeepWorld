@@ -1128,7 +1128,7 @@ class TextGenerationBackend:
 				raise RejectedSample("Model response could not be decoded as JSON after one deterministic repair.") from error
 	
 	def json_to_str(self, value: Any) -> str:
-		return json.dumps(read_json(path), ensure_ascii=False, indent=2)
+		return json.dumps(value, ensure_ascii=False, indent=2)
 	
 	def json_by_key(self, payload: Any, key: str) -> Any:
 		"""Return one required generated-JSON value or reject the sample."""
@@ -1340,7 +1340,6 @@ class ImageCaptioningStage:
 		"""Save `image_captions.json`."""
 		captions: list[dict[str, Any]] = []
 		for ref in ctx.manifest_entry["ref_imgs"]:
-			index = 
 			result = self.vlm.generate_json(
 				IMAGE_CAPTIONING_TEMPLATE,
 				temperature=self.args.image_captioning_vlm_temperature,
@@ -1379,7 +1378,7 @@ class CaptionWiringStage:
 
 		path = ctx.intermediate_dir / "video_caption.json"
 		video_caption_json = self.llm.json_to_str(read_json(path))
-		path = tx.intermediate_dir / "image_captions.json"
+		path = ctx.intermediate_dir / "image_captions.json"
 		image_captions_json = self.llm.json_to_str(read_json(path))
 		prompt = (
 			CAPTION_WIRING_TEMPLATE
