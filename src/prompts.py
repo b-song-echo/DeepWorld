@@ -147,19 +147,20 @@ C. an approximate timeline for the frames sampled by the video-language model.
 
 Return JSON only. Do not include Markdown.
 
-Use the video as visual evidence and the motion caption as guidance. Prioritize camera motion, visible scene layout, and object grounding over generic visual captioning.
+Use the video as visual evidence and the motion caption as guidance. Prioritize fine-grained camera-motion control over visual inventory; reference images will carry most scene appearance later.
 
 Source usage:
 - Use the video frames as the source of truth for visible objects, room layout, and visual details.
-- Use the camera-motion caption as the source of truth for the camera-motion direction, magnitude, and temporal order.
+- Use the camera-motion caption as the source of truth for the camera-motion direction, rounded quantities, magnitude, and temporal order.
 - Use the sampled-frame timeline to identify where each visible frame sits in the entire clip. Refer to motion phases by approximate seconds when the evidence supports it.
 - Ground the camera motion to visible objects or regions when the video clearly supports it.
 - Do not describe objects or regions that are not visible.
+- Do not drop camera-motion quantities from the motion caption. The video caption must carry those meters/degrees forward for the final user prompt.
 
 Describe:
 1. the initial viewpoint,
-2. the camera motion over time, with approximate timestamps or phases,
-3. the major static objects and room layout,
+2. the camera motion over time, with approximate timestamps or phases and concrete rounded amounts from the motion caption,
+3. only the major static objects and layout anchors needed to ground the camera path,
 4. objects or regions the camera approaches, leaves, reveals, passes by, or turns toward.
 
 Rules:
@@ -168,9 +169,11 @@ Rules:
 - Do not describe object motion unless it is clearly visible.
 - Treat the scene as static unless the video clearly shows otherwise.
 - Do not introduce lighting changes, time-of-day changes, weather, or environment changes.
-- You may use approximate natural quantities such as "about 45 degrees", "about 90 degrees", or "roughly one meter" only when supported by the motion caption.
+- Use approximate natural quantities such as "about 0.3 meters left", "roughly one meter backward", "about 45 degrees", or "about 90 degrees" when supported by the motion caption.
 - Tie visible changes to time when possible, such as "at the start", "around 2 seconds", "during the third second", or equivalent phase wording when describing visible changes.
-- Preserve rounded motion quantities from the camera-motion caption when they clarify camera control.
+- Each meaningful temporal phase should state the camera-motion amount or scale when the motion caption provides one.
+- Preserve the dominant whole-clip motion scale and the main per-phase quantities. Do not replace them with only timestamp marks or vague motion verbs.
+- Keep visual description concise. Mention scene objects primarily as anchors for where the camera starts, moves, turns, approaches, passes, or reveals.
 - Do not mention hidden metadata, camera poses, trajectory statistics, implementation details, or dataset internals.
 - Focus on what a user would need to prompt a video generator.
 
@@ -186,7 +189,7 @@ Required JSON schema:
   ],
   "scene_objects": ["string", "..."],
   "revealed_or_emphasized_objects": ["string", "..."],
-  "video_caption": "single detailed paragraph with approximate temporal grounding"
+  "video_caption": "single paragraph that preserves concrete rounded camera-motion amounts and uses visual details only as grounding anchors"
 }
 
 Camera-motion caption:
@@ -239,7 +242,7 @@ B. structured captions of all reference images, including their reference indice
 
 Return JSON only. Do not include Markdown.
 
-Rewrite the video caption so it is wired up to the reference images in a way that a user could naturally prompt a video generator.
+Rewrite the video caption so it is wired up to the reference images in a way that a user could naturally prompt a video generator. Keep the result camera-control rich, not visual-description heavy.
 
 Source hierarchy:
 - The video caption is the source of truth for the generated video's visual content, camera motion, and temporal order.
@@ -250,7 +253,8 @@ Source hierarchy:
 
 Rules:
 - Preserve all important video motion.
-- Preserve quantitative motion scale and temporal phase boundaries when the video caption or motion-guided caption supports them.
+- Preserve quantitative motion scale and temporal phase boundaries when the video caption supports them.
+- Do not remove rounded distances, angles, or phase timing while adding reference-image links.
 - Preserve objects visible in the video even if they are absent from the reference images.
 - If a visible object or area appears in multiple reference images, any supported single reference or supported set of references is acceptable, e.g. "the first image", "the second image", or "the first and second images".
 - Prefer wiring to all clearly useful reference images for start views, target objects, revealed regions, and distinctive landmarks, even if the caption becomes verbose.
@@ -259,10 +263,12 @@ Rules:
 - If the first frame is not present, describe the starting viewpoint visually instead.
 - Do not claim an object appears in a reference image unless the reference caption supports it.
 - Do not force unrelated reference images into the caption. Use every reference that clearly helps identify the start view, target objects, emphasized regions, or spatial layout.
+- Use reference images to identify visual anchors, but keep camera-motion amounts prominent.
 - Do not introduce environment changes such as nighttime, lights on/off, weather, or new objects unless the video caption supports them.
 - Do not mention "caption", "metadata", "dataset", "camera poses", or "motion caption".
 - Keep this as a descriptive intermediate caption, not yet an imperative user prompt.
-- Preserve a natural reading order: start view first, then camera motion, then revealed or emphasized regions.
+- Preserve a natural reading order: start view first, then quantified camera motion, then revealed or emphasized regions.
+- The wired caption should not become an exhaustive room description. Include only visual facts that ground the start view, motion targets, revealed regions, or reference links.
 - Verbosity is acceptable.
 
 Required JSON schema:
@@ -295,23 +301,24 @@ CAPTION_REPHRASING_TEMPLATE = """You are rephrasing a wired video caption of a s
 
 Return JSON only. Do not include Markdown.
 
-The prompt should sound like a real user instructing a model to generate a video from reference images.
+The prompt should sound like a real user instructing a model to generate a video from reference images. Its main value is fine-grained camera control; the reference images already communicate most scene appearance.
 
 Rules:
 - Use imperative phrasing.
 - Mention the starting viewpoint clearly.
-- Describe camera movement over <CLIP_SECONDS>.
+- Describe camera movement over <CLIP_SECONDS> seconds with concrete rounded meters/degrees and phase timing when the wired caption provides them.
 - Preserve supported image cross-references from the wired caption when they identify the start view, target objects, emphasized regions, or spatial layout.
 - Preserve the exact start-frame reference when the wired caption identifies one, such as "start from the second image".
-- Preserve meaningful rounded distances, angles, and phase timing from the wired caption.
+- Preserve meaningful rounded distances, angles, and phase timing from the wired caption. Do not reduce quantified motion into only "pan", "move", "slide", or timestamp words.
 - Preserve scene geometry and object layout.
 - Preserve objects or regions that the camera approaches, leaves, reveals, passes by, or turns toward.
+- Keep visual description concise and anchor-focused; do not spend prompt budget re-describing objects already clear in the reference images.
 - Do not mention hidden metadata, numeric poses, captions, datasets, manifests, or internal fields.
 - Do not add visual content not supported by the wired caption.
 - Do not introduce lighting changes, time-of-day changes, weather, scene transitions, or new objects.
 - Do not overfit to dataset language.
 - Avoid overly technical phrasing; make it sound like a natural user request.
-- Keep the prompt detailed enough to guide generation, but not cluttered with redundant wording.
+- Keep the prompt detailed enough to guide camera generation, but not cluttered with redundant visual wording.
 
 Required JSON schema:
 {
@@ -338,7 +345,7 @@ The prompt was synthesized from multiple sources using large models. Check wheth
 Source hierarchy:
 - The camera-motion caption is the main source of truth for camera motion.
 - The video caption is the main source of truth for visible scene content, layout, and what the camera approaches, leaves, reveals, or turns toward.
-- The reference image captions are the only source of truth for claims about what appears in each reference image. Additionally, they are ordered.
+- The structured reference image entries provide each reference index and start-frame flag. The caption text inside each entry is only the source of truth for visible content in that image.
 - The synthesized prompt is the candidate output to validate.
 - A claim is supported only if it is clearly implied by one or more of the provided sources.
 
@@ -358,8 +365,8 @@ Validation rules:
 
 Fatal checks:
 - "valid_json_inputs_understood": true only if the provided inputs are understandable and sufficient for validation.
-- "reference_captions_have_correct_indices": true only if each reference-image caption correctly refers to its own image number or ordinal, which is the order it appears in the captions text.
-- "reference_captions_have_no_conflicting_start_frame_claims": true only if the image captions do not make conflicting claims about which reference image is the video start frame.
+- "reference_captions_have_correct_indices": true only if each structured reference-image entry has a valid reference index and no duplicate reference index.
+- "reference_captions_have_no_conflicting_start_frame_claims": true only if the structured reference-image entries do not mark more than one image as the video start frame.
 - "prompt_is_non_empty_instruction": true only if the synthesized prompt is non-empty and written as a user instruction.
 - "no_hallucinated_new_objects": true only if the prompt does not introduce objects, furniture, people, animals, text, screens, decorations, or regions unsupported by the video caption or reference captions.
 - "no_hallucinated_environment_change": true only if the prompt does not invent lighting changes, time-of-day changes, weather, scene transitions, object movement, room transformations, or new objects appearing/disappearing.
@@ -498,8 +505,8 @@ Rules:
 - Preserve the starting viewpoint when the original prompt establishes one.
 - Preserve the exact start-frame reference image when the original prompt uses one; this is a crucial fact, not a trivial detail.
 - Preserve dominant camera direction, dominant scale, and the main target objects or regions. Omit only tiny motion components, secondary visual details, or redundant wording.
-- The medium prompt should keep the dominant camera motion and the main visual grounding, but may omit fine-grained timing, small motion components, or secondary references.
-- The coarse prompt may omit secondary reference-image details, exact minor motion quantities, minor objects, and temporal specifics when they are not essential to stay consistent.
+- The medium prompt should keep the dominant camera-motion quantities, phase order, and main visual grounding, but may omit tiny motion components or secondary references.
+- The coarse prompt may omit secondary reference-image details, exact minor motion quantities, minor objects, and temporal specifics when they are not essential to stay consistent. It should still preserve the dominant motion scale when the original prompt states one.
 - Keep image cross-references when they are essential for understanding the start view or target object.
 - The coarse prompt should sound like a normal short user request, not a dataset annotation or a compressed checklist.
 - Do not mention hidden metadata, captions, datasets, manifests, or internal fields.
