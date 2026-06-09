@@ -1,32 +1,15 @@
-I got this error:
+I have put two generated samples under `_generated` folder. Note that I didn't run and generate using this machine, but copied the partial content of two committed samples to this source code repo for you to examine, upon which you can improve the existing data synthesis pipeline. The sample examples do not contain video, images, and poses.
 
-```text
-(main) [hadoop-intelligence-studio@set-zw04-mlp-codelab-pc344 scripts]$ bash synthesize_light.sh --restart_fresh
-[worker 0] loading VLM ...
-Loading weights: 100%|███████████████████████████████████████████████████████████████████████| 750/750 [00:01<00:00, 435.76it/s]
-[worker 0] loading LLM ...
-[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
-Loading weights: 100%|███████████████████████████████████████████████████████████████████████| 427/427 [00:02<00:00, 148.88it/s]
-True /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf/8890d0a267/iphone/rgb.mkv
-qwen-vl-utils using torchvision to read video.
-[worker 0] committed 8890d0a267__f0001467 (1/100000)
-False /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/tuzihao/data/scannetpp_hf/d807fb583b/iphone/rgb.mkv
-Traceback (most recent call last):
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 1664, in <module>
-    main()
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 1646, in main
-    run_worker(args, worker_index=0)
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 1625, in run_worker
-    run_stages(stages, ctx)
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 1557, in run_stages
-    stages[index](ctx)
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 744, in __call__
-    self._probe_video(ctx)
-  File "/home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/code/synthesize.py", line 447, in _probe_video
-    probe = ffmpeg.probe(str(path), select_streams="v:0")
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hadoop-intelligence-studio/.local/lib/python3.12/site-packages/ffmpeg/_probe.py", line 23, in probe
-    raise Error('ffprobe', out, err)
-```
+I have spotted a few noticeable issues:
 
-It sample was successfully committed, but the probing throws a runtime error at the second sample.
+- Motion caption:
+  - It is not quantative enough, there are barely any concrete numbers, the downstream world model requires fine-grained control over camera motion.
+  - Some tiny momement they are not well-distinguished from dominant ones. It should put more emphasis on major motion, ignore tiny movements.
+- Wired caption:
+  - It sometimes lacks lacks explicit start frame Designation. What's more, there are barely any cross-references in it.
+- Distilled captions:
+  - They should not omit crucial facts when the detailed prompt supports it, such as start frame designation. It is the trivial details (the model can infer or imagine) that can be discarded. 
+
+Please refine the prompts, try to mitigate these issues.
+
+Additionally, change the implementation so that the clip length should not tied to 5 second, but is determined by `clip_seconds`. The duration should not be hard coded into the prompt templates. Make sure the pipeline works with any reasonable `clip_seconds` such as 10.0, 30.0. When `motion_digesting_unit_seconds` and `video_captioning_fps` are specified, the longer `clip_seconds` is, the more compute LLM/VLM require because there are more frames and units.

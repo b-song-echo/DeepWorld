@@ -1,3 +1,4 @@
+# TODO: The prompt template has inconsistent wordings, for example, in "Signed-value interpretation", the terminologies do not match the actual fields.
 MOTION_DIGESTING_TEMPLATE = """You are converting numeric camera-motion statistics into a clear camera-motion caption.
 
 The clip is split into fixed-duration motion units. You receive statistics for the overall motion and for each unit. Interpret the numbers and describe the camera motion in a way that a later video-captioning VLM can use to understand how the camera moves through time.

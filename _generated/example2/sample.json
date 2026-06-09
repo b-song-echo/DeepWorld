@@ -1,0 +1,28 @@
+{
+  "sample_id": "076c822ecc__f0002032",
+  "scene_id": "076c822ecc",
+  "scene_type": "conference room",
+  "split": "train",
+  "ref_imgs": [
+    {
+      "index": 1,
+      "width": 1440,
+      "height": 1440,
+      "path": "samples/076c822ecc__f0002032/ref_imgs/ref_001.jpg",
+      "is_start_frame": true
+    }
+  ],
+  "gt_clip": {
+    "fps": 60.0,
+    "duration_sec": 5.0,
+    "width": 1440,
+    "height": 1440,
+    "path": "samples/076c822ecc__f0002032/gt_clip.mp4"
+  },
+  "synthesized_prompt": "Start with a close-up, upward view of the white ceiling featuring structural beams, a long fluorescent light, and a translucent white roller blind, with a cylindrical column and window blinds visible at the bottom. Over the first two seconds, move the camera backward and slightly upward while panning left to gradually reveal more of the ceiling and the top of the window. Then, tilt the camera downward while continuing to move backward and to the right, revealing the full window with translucent blinds, a long metal-framed table in front of it, and a white cabinet along the right wall. In the final three seconds, slide the camera left, pan right, and tilt down sharply to bring the table, cabinet, and dark floor into clearer view, ending with a slight forward and rightward slide while maintaining the downward tilt.",
+  "distilled_prompts": {
+    "medium": "Start with a close-up upward view of a white ceiling with beams and a fluorescent light. Move backward and upward while panning left to reveal more ceiling, then tilt down and move back-right to show a window with translucent blinds, a metal-framed table, and a white cabinet. Finally, slide left and pan right while tilting down sharply to focus on the table, cabinet, and dark floor.",
+    "coarse": "Camera starts looking up at a ceiling with beams and lights, then pulls back and pans to reveal a room with a window, a metal table, and a white cabinet, ending with a downward tilt to show the floor."
+  }
+}
+

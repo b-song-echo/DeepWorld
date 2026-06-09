@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
+from __future__ import annotations
 
 import ffmpeg
 import imageio.v3 as iio
@@ -123,6 +124,69 @@ class SampleContext:
 		if self.source_pose_path is None:
 			raise RuntimeError("Source pose path is not initialized.")
 		return self.source_pose_path
+
+
+# TODO: Make sure this class is correctly implemented, and its usage in this file has no bugs. Additionally, generate docs for this class.
+class Pose:
+	def __init__(self, array: np.ndarray):
+		self.array = array
+	
+	def __call__(self) -> np.ndarray:
+		return self.array
+	
+	def serialized(self) -> list[list[float]]:
+		return self.array.tolist()
+	
+	@classmethod
+	def from_payload(cls, payload: Any) -> Pose | None:
+		if payload is None:
+			return None
+		if isinstance(payload, dict):
+			for field in (
+				"transform_matrix",
+				"aligned_pose", "pose",
+				"camera_to_world", "c2w"
+			):
+				if field in payload:
+					return cls.from_payload(payload[field])
+		try:
+			array = np.asarray(payload, dtype=np.float64)
+		except (TypeError, ValueError):
+			return None
+		if array.shape == (16,):
+			array = array.reshape(4, 4)
+		if array.shape != (4, 4) or not np.isfinite(array).all():
+			return None
+		return cls(array)	
+	
+	def yz_flipped(self):
+		return Pose(self() @ np.diag([1, -1, -1, 1]))
+
+	def relative_to(self, pose: Pose)	-> Pose:
+		return Pose(np.linalg.inv(pose() @ self()))
+	
+	def translation(self) -> np.ndarray:
+		return self()[:3, 3]
+	
+	def look_direction(self) -> np.ndarray:
+		v = self()[:3, 2]
+		return v / np.maximum(np.linalg.norm(v) / 1e-8)
+	
+	def rotation(self) -> np.ndarray:
+		return self()[:3, :3]
+	
+	def euler_angle(self) -> np.ndarray:
+		R = self.rotation()
+		yaw = np.arctan2(R[0, 2], R[2, 2])
+		pitch = np.arctan2(-R[1, 2], np.hypot(R[0, 2], R[2, 2]))
+		roll = np.arctan2(R[1, 0], R[1, 1])
+		return np.degrees([yaw, pitch, roll])
+	
+	# TODO: To measure "the amount of rotation", use this the physically meaningful rotation angle, rather than the heuristic enler angle magnitude. Check this codebase to make sure this is used correctly.
+	def theta(self) -> np.ndarray:
+		R = self.rotation()
+		cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+		return np.degrees(np.arccos(cos_theta))
 
 
 def parse_args() -> Namespace:
@@ -294,54 +358,6 @@ def write_jsonl(
 			f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 		f.flush()
 		os.fsync(f.fileno())
-
-
-def parse_pose(
-	payload: Any, return_list=False
-) -> list[list[float]] | np.ndarray | None:
-	"""Parse one pose-like JSON payload into a finite 4x4 matrix."""
-
-	if payload is None:
-		return None
-	if isinstance(payload, dict):
-		for field in ("transform_matrix", "aligned_pose", "pose"):
-			if field in payload:
-				return parse_pose(payload[field], return_list=return_list)
-	try:
-		array = np.asarray(payload, dtype=np.float64)
-	except (TypeError, ValueError):
-		return None
-	if array.shape == (16,):
-		array = array.reshape(4, 4)
-	if array.shape != (4, 4) or not np.isfinite(array).all():
-		return None
-	if not return_list:
-		return array
-	return [[float(element) for element in row] for row in array]
-
-
-def get_relative_transform(pose: np.ndarray, anchor: np.ndarray) -> dict[str, float]:
-	"""Return `pose` expressed in the local camera coordinates of `anchor`.
-
-	Positive yaw turns right, positive pitch tilts up, and positive roll rotates
-	clockwise in the image plane. Translation is in
-	meters, and rotations are returned in degrees.
-	"""
-
-	M = np.linalg.inv(anchor) @ pose
-	translation = M[:3, 3]
-	right, down, forward = translation
-	yaw = np.arctan2(M[0, 2], M[2, 2])
-	pitch = np.arctan2(-M[1, 2], np.hypot(M[0, 2], M[2, 2]))
-	roll = np.arctan2(M[1, 0], M[1, 1])
-	rotation = np.degrees([yaw, pitch, roll])
-	yaw, pitch, roll = rotation
-	return {
-		"right": float(right), "down": float(down), "forward": float(forward),
-		"distance": float(np.linalg.norm(translation)),
-		"yaw": float(yaw), "pitch": float(pitch), "roll": float(roll),
-		"euler_magnitude": float(np.linalg.norm(rotation)),
-	}
 
 
 def maybe_round_float(value: Any) -> Any:
@@ -560,13 +576,13 @@ class DataSamplingStage:
 				return int(digits), text
 			return float(10**12), text
 
-		def parse_sequence_payload(payload: Any) -> list[Any]:
+		def parse_payload_to_sequence(payload: Any) -> list[Any]:
 			if payload is None:
 				return []
 			if isinstance(payload, dict):
 				for field in ("aligned_poses", "poses", "frames"):
 					if field in payload:
-						return parse_sequence_payload(payload[field])
+						return parse_payload_to_sequence(payload[field])
 				items = sorted(payload.items(), key=lambda item: sort_key(item[0]))
 				return [value for _, value in items]
 			return list(payload)
@@ -574,15 +590,17 @@ class DataSamplingStage:
 		path = ctx.require_source_pose_path()
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
-		payload = read_json(path)
-		raw_poses = parse_sequence_payload(payload)
-		if not raw_poses:
+		raw_payload = read_json(path)
+		payload_sequence = parse_payload_to_sequence(raw_payload)
+		if not payload_sequence:
 			raise RejectedSample(f"No pose records found in {path}")
-		poses = [parse_pose(pose, return_list=True) for pose in raw_poses]
+		poses = [Pose.from_payload(p) for p in payload_sequence]
 		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
-		write_json(ctx.intermediate_dir / "poses.json", {"poses": clip_poses})
+		write_json(ctx.intermediate_dir / "poses.json", {
+			"poses": [pose.serialized() for pose in clip_poses]
+		})
 
 	def _ref_image_brisque_score(self, image: Image.Image) -> float:
 		"""Return the BRISQUE no-reference quality score for one RGB image."""
@@ -599,16 +617,31 @@ class DataSamplingStage:
 		return float(score)
 
 	def _ref_image_pose_relevance_score(
-		self, dslr_pose: np.ndarray | None, clip_poses: list[np.ndarray | None],
+		self, dslr_pose: Pose | None, clip_poses: list[Pose | None],
 	) -> float:
 		"""Score how close a DSLR camera pose is to any pose in the sampled clip."""
 	
+		# TODO: For this method, please fix flawed logic, if there are any.
 		best_score = float("inf")
 		if dslr_pose is None:
 			return best_score
-		for clip_pose in [pose for pose in clip_poses if pose is not None]:
-			relative = get_relative_transform(dslr_pose, clip_pose)
-			score = relative["distance"] + relative["euler_magnitude"] / 45.0
+		# TODO: DSLR pose (OpenGL like) and clip pose (OpenCV like) have different camera coordinate convention. Shouldn't you cnovert DSLR pose first using right-multiplication?
+		# dslr_pose = dslr_pose.yz_flipped() 
+		depth, m_sigma, deg_sigma = 3.0, 1.0, 45.0
+		dslr_pos = dslr_pose.translation()
+		dslr_look_direction = dslr_pose.look_direction()
+		dslr_focus = dslr_pos + dslr_look_direction * depth
+		for clip_pose in [p for p in clip_poses if p is not None]:
+			clip_pos = clip_pose.translation()
+			clip_look_direction = clip_pose.look_direction()
+			clip_focus = clip_pos + clip_look_direction * depth
+			focus_distance = np.linalg.norm(clip_focus - dslr_focus)
+			distance_score = np.exp(-0.5 * (focus_distance / m_sigma) ** 2)
+			cos_look_angle = np.dot(clip_look_direction, dslr_look_direction)
+			cos_look_angle = np.clip(cos_look_angle, -1.0, 1.0)
+			look_angle = np.degrees(np.arccos(cos_look_angle))
+			angle_score = np.exp(-0.5 * (look_angle / deg_sigma) ** 2)
+			score = distance_score * angle_score
 			best_score = min(best_score, score)
 		return best_score
 
@@ -668,11 +701,12 @@ class DataSamplingStage:
 				"image": image,
 			})
 		
-		payload = read_json(ctx.intermediate_dir / "poses.json")
-		clip_poses = [parse_pose(pose) for pose in payload.get("poses", [])]
+		raw_payload = read_json(ctx.intermediate_dir / "poses.json")
+		payload_sequence = raw_payload.get("poses", [])
+		clip_poses = [Pose.from_payload(p) for p in payload_sequence]
 		dslr_candidates: list[tuple[float, int]] = []
 		for index, frame in enumerate(dslr_frames):
-			dslr_pose = parse_pose(frame)
+			dslr_pose = Pose.from_payload(frame)
 			score = self._ref_image_pose_relevance_score(dslr_pose, clip_poses)
 			dslr_candidates.append((score, index))
 		dslr_pooled = dslr_needed * self.args.pose_pool_multiplier
@@ -788,7 +822,7 @@ class MotionExtractionStage:
 	def __init__(self, args: Namespace):
 		self.args = args
 
-	def _valid_clip_poses(self, poses: list[np.ndarray | None]) -> list[np.ndarray]:
+	def _valid_clip_poses(self, poses: list[Pose | None]) -> list[Pose]:
 		"""Return valid poses and enforce the configured valid-pose fraction."""
 		
 		valid_poses = [pose for pose in poses if pose is not None]
@@ -798,8 +832,8 @@ class MotionExtractionStage:
 		if self.args.filter_pose_valid_fraction_min is not None and valid_fraction < self.args.filter_pose_valid_fraction_min:
 			raise RejectedSample(f"Pose valid fraction {valid_fraction:.4f} below threshold.")
 		return valid_poses
-	
-	def _motion_stats(self, poses: list[np.ndarray]) -> dict[str, float]:
+		
+	def _path_stats(self, poses: list[Pose]) -> dict[str, float]:
 		"""Compute statistics for poses."""
 
 		def normalized_variation(values: list[float]) -> float:
@@ -810,61 +844,65 @@ class MotionExtractionStage:
 				return 0.0
 			return float(np.std(values) / mean)
 
-		step_distances: list[float] = []
-		step_euler_magnitudes: list[float] = []
-		steps: list[np.ndarray] = []
+		distances: list[float] = []
+		thetas: list[float] = []
+		directions: list[np.ndarray] = []
 		for i in range(1, len(poses)):
-			tf = get_relative_transform(poses[i], poses[i - 1])
-			step_distances.append(tf["distance"])
-			step_euler_magnitudes.append(tf["euler_magnitude"])
-			if tf["distance"] > 1e-8:
-				vec = np.array([tf["right"], tf["down"], tf["forward"]])
-				steps.append(vec / tf["distance"])
+			direction = poses[i].translation() - poses[i - 1].translation()
+			distances.append(float(np.linalg.norm(direction)))
+			directions.append(directions)
+			rel_pose = poses[i].relative_to(poses[i - 1])
+			thetas.append(float(rel_pose.theta()))
 
-		path_length = sum(step_distances)
-		path_curvature = sum(step_euler_magnitudes) / 90.0
-		motion_amount = path_length + path_curvature
-
-		jitter = normalized_variation(step_distances)
-		shaky = normalized_variation(step_euler_magnitudes)
-		turns = [np.dot(*vv) for vv in zip(steps, steps[1:])]
-		neg_turns = [turn for turn in turns if turn < 0.0]
-		neg_turn_fraction = len(neg_turns) / len(turns) if turns else 0.0
-		motion_unsteadiness = (jitter + shaky) / 2.0 + neg_turn_fraction
-		
-		tf = get_relative_transform(poses[-1], poses[0])
+		path_length = sum(distances)
+		path_curvature = sum(thetas) / 90.0
+		jitter = normalized_variation(distances)
+		shaky = normalized_variation(thetas)
+		turns = [np.dot(*vv) for vv in zip(directions, directions[1:])]
+		reverses = [turn for turn in turns if turn < 0.0]
+		reverse_fraction = len(reverses) / len(turns) if turns else 0.0
+		motion_unsteadiness = (jitter + shaky) / 2.0 + reverse_fraction
 		return {
 			"path_length": path_length,
-			"chord_length": tf["distance"],
-			"right": tf["right"], "down": tf["down"], "forward": tf["forward"],
-			"yaw": tf["yaw"], "pitch": tf["pitch"], "roll": tf["roll"],
-			"motion_amount": motion_amount,
+			"motion_amount": path_length + path_curvature,
 			"motion_unsteadiness": motion_unsteadiness,
+		}
+	
+	def _relative_stats(self, start: Pose, end: Pose) -> dict[str, float]:
+		rel_pose = end.relative_to(start)
+		right, down, forward = [float(v) for v in rel_pose.translation()]
+		yaw, pitch, roll = [float(v) for v in rel_pose.euler_angle().e]
+		return {
+			"chord_length": float(np.linalg.norm(rel_pose.translation())),
+			"right": right, "down": down, "forward": forward,
+			"yaw": yaw, "pitch": pitch, "roll": roll,
 		}
 
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
-		payload = read_json(ctx.intermediate_dir / "poses.json")
-		raw_clip_poses = [parse_pose(pose) for pose in payload.get("poses", [])]
+		raw_payload = read_json(ctx.intermediate_dir / "poses.json")
+		payload_sequence = raw_payload.get("poses", [])
+		raw_clip_poses = [Pose.from_payload(p) for p in payload_sequence]
 		clip_poses = self._valid_clip_poses(raw_clip_poses)
-		stats = self._motion_stats(clip_poses)
-		if self.args.filter_motion_amount_min is not None and stats["motion_amount"] < self.args.filter_motion_amount_min:
-			raise RejectedSample(f"Motion amount {stats['motion_amount']:.4f} below threshold.")
-		if self.args.filter_motion_amount_max is not None and stats["motion_amount"] > self.args.filter_motion_amount_max:
-			raise RejectedSample(f"Motion amount {stats['motion_amount']:.4f} above threshold.")
-		if self.args.filter_motion_unsteadiness_max is not None and stats["motion_unsteadiness"] > self.args.filter_motion_unsteadiness_max:
-			raise RejectedSample(f"Motion unsteadiness {stats['motion_unsteadiness']:.4f} above threshold.")
+		path_stats = self._path_stats(clip_poses)
+		clip_stats = self._relative_stats(clip_poses[0], clip_poses[-1])
+		if self.args.filter_motion_amount_min is not None and path_stats["motion_amount"] < self.args.filter_motion_amount_min:
+			raise RejectedSample(f"Motion amount {path_stats['motion_amount']:.4f} below threshold.")
+		if self.args.filter_motion_amount_max is not None and path_stats["motion_amount"] > self.args.filter_motion_amount_max:
+			raise RejectedSample(f"Motion amount {path_stats['motion_amount']:.4f} above threshold.")
+		if self.args.filter_motion_unsteadiness_max is not None and path_stats["motion_unsteadiness"] > self.args.filter_motion_unsteadiness_max:
+			raise RejectedSample(f"Motion unsteadiness {path_stats['motion_unsteadiness']:.4f} above threshold.")
 		overall_motion = maybe_round_float({
 			"clip_duration_(s)": self.args.clip_seconds,
-			"clip_start_to_clip_end_path_length_(m)": stats["path_length"],
-			"clip_start_to_clip_end_chord_length_(m)": stats["chord_length"],
-			"clip_end_in_clip_start_right_(m)": stats["right"],
-			"clip_end_in_clip_start_down_(m)": stats["down"],
-			"clip_end_in_clip_start_forward_(m)": stats["forward"],
-			"clip_end_in_clip_start_yaw_(deg)": stats["yaw"],
-			"clip_end_in_clip_start_pitch_(deg)": stats["pitch"],
-			"clip_end_in_clip_start_roll_(deg)": stats["roll"],
+			"clip_start_to_clip_end_path_length_(m)": path_stats["path_length"],
+			"clip_start_to_clip_end_chord_length_(m)": clip_stats["chord_length"],
+			"clip_end_in_clip_start_right_(m)": clip_stats["right"],
+			"clip_end_in_clip_start_down_(m)": clip_stats["down"],
+			"clip_end_in_clip_start_forward_(m)": clip_stats["forward"],
+			"clip_end_in_clip_start_yaw_(deg)": clip_stats["yaw"],
+			"clip_end_in_clip_start_pitch_(deg)": clip_stats["pitch"],
+			"clip_end_in_clip_start_roll_(deg)": clip_stats["roll"],
 		})
 		
 		motion_units: list[dict[str, Any]] = []
@@ -875,28 +913,30 @@ class MotionExtractionStage:
 			end_time = min((unit_index + 1) * unit_secs, self.args.clip_seconds)
 			start_index = int(round(start_time * ctx.video_fps))
 			end_index = min(int(round(end_time * ctx.video_fps)), len(raw_clip_poses))
-			unit_poses = raw_clip_poses[start_index:end_index]
-			unit_poses = self._valid_clip_poses(unit_poses)
-			stats = self._motion_stats(unit_poses)
-			rel_first = get_relative_transform(unit_poses[0], clip_poses[0])
+			raw_unit_poses = raw_clip_poses[start_index:end_index]
+			unit_poses = self._valid_clip_poses(raw_unit_poses)
+
+			anchor_stats = self._relative_stats(clip_poses[0], unit_poses[0])
+			path_stats = self._path_stats(unit_poses)
+			unit_stats = self._relative_stats(unit_poses[0], unit_poses[-1])
 			motion_units.append(maybe_round_float({
 				"unit_index": unit_index,
 				"unit_begins_at_clip_(s)": start_time,
 				"unit_duration_(s)": end_time - start_time,
-				"unit_start_in_clip_start_right_(m)": rel_first["right"],
-				"unit_start_in_clip_start_down_(m)": rel_first["down"],
-				"unit_start_in_clip_start_forward_(m)": rel_first["forward"],
-				"unit_start_in_clip_start_yaw_(deg)": rel_first["yaw"],
-				"unit_start_in_clip_start_pitch_(deg)": rel_first["pitch"],
-				"unit_start_in_clip_start_roll_(deg)": rel_first["roll"],
-				"unit_start_to_unit_end_path_length_(m)": stats["path_length"],
-				"unit_start_to_unit_end_chord_length_(m)": stats["chord_length"],
-				"unit_end_in_unit_start_right_(m)": stats["right"],
-				"unit_end_in_unit_start_down_(m)": stats["down"],
-				"unit_end_in_unit_start_forward_(m)": stats["forward"],
-				"unit_end_in_unit_start_yaw_(deg)": stats["yaw"],
-				"unit_end_in_unit_start_pitch_(deg)": stats["pitch"],
-				"unit_end_in_unit_start_roll_(deg)": stats["roll"],
+				"unit_start_in_clip_start_right_(m)": anchor_stats["right"],
+				"unit_start_in_clip_start_down_(m)": anchor_stats["down"],
+				"unit_start_in_clip_start_forward_(m)": anchor_stats["forward"],
+				"unit_start_in_clip_start_yaw_(deg)": anchor_stats["yaw"],
+				"unit_start_in_clip_start_pitch_(deg)": anchor_stats["pitch"],
+				"unit_start_in_clip_start_roll_(deg)": anchor_stats["roll"],
+				"unit_start_to_unit_end_path_length_(m)": path_stats["path_length"],
+				"unit_start_to_unit_end_chord_length_(m)": unit_stats["chord_length"],
+				"unit_end_in_unit_start_right_(m)": unit_stats["right"],
+				"unit_end_in_unit_start_down_(m)": unit_stats["down"],
+				"unit_end_in_unit_start_forward_(m)": unit_stats["forward"],
+				"unit_end_in_unit_start_yaw_(deg)": unit_stats["yaw"],
+				"unit_end_in_unit_start_pitch_(deg)": unit_stats["pitch"],
+				"unit_end_in_unit_start_roll_(deg)": unit_stats["roll"],
 			}))
 		write_json(ctx.intermediate_dir / "motion_extraction.json", {
 			"overall_motion": overall_motion,

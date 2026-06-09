@@ -13,7 +13,7 @@ export TOKENIZERS_PARALLELISM=false
 python $SCRIPT \
 	--scannetpp_root $SCANNETPP_ROOT \
 	--output_root $OUTPUT_ROOT \
-	--num_processes 1 \
+	--num_processes 2 \
 	--seed 20021021 \
 	--split train \
 	--num_samples 100000 \
@@ -47,8 +47,9 @@ python $SCRIPT \
 	--distillation_llm_max_new_tokens 1024 \
 	--filter_pixel_valid_fraction_min 0.95 \
 	--filter_pose_valid_fraction_min 0.90 \
-	--filter_motion_amount_min 0.10 \
-	--filter_motion_amount_max 2.50 \
+	# TODO: Based on how the motion metrics are calculated, update the following three values to be reasonable.
+	--filter_motion_amount_min 1.0 \
+	--filter_motion_amount_max 3.0 \
 	--filter_motion_unsteadiness_max 3.00 \
 	--filter_dslr_brisque_score_max 60.0 \
 	--filter_quality_score_min 0.7 \
