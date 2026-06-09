@@ -187,7 +187,7 @@ class Pose:
 	def relative_to(self, pose: Pose) -> Pose:
 		"""Return this pose expressed in another pose's local camera frame."""
 
-		return Pose(np.linalg.inv(pose()) @ self())
+		return Pose(np.linalg.inv(pose()) @ self()) 
 	
 	def translation(self) -> np.ndarray:
 		"""Return the camera center in world or relative coordinates."""
@@ -197,8 +197,8 @@ class Pose:
 	def look_direction(self) -> np.ndarray:
 		"""Return the normalized +Z camera-forward direction."""
 
-		vector = self()[:3, 2]
-		return vector / max(float(np.linalg.norm(vector)), 1e-8)
+		direction = self()[:3, 2]
+		return direction / max(float(np.linalg.norm(direction)), 1e-8)
 	
 	def rotation(self) -> np.ndarray:
 		"""Return the 3x3 rotation block."""
@@ -218,12 +218,10 @@ class Pose:
 		roll = np.arctan2(R[1, 0], R[1, 1])
 		return np.degrees([yaw, pitch, roll])
 	
-	def theta(self) -> float:
+	def rotation_angle(self) -> float:
 		"""Return the intrinsic rotation angle in degrees."""
-
-		R = self.rotation()
-		cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
-		return float(np.degrees(np.arccos(cos_theta)))
+		cos_angle = ((np.trace(self.rotation()) - 1.0) / 2.0).clip(-1.0, 1.0)
+		return float(np.degrees(np.arccos(cos_angle)))
 
 
 def parse_args() -> Namespace:
@@ -658,7 +656,7 @@ class DataSamplingStage:
 			focus_distance = np.linalg.norm(clip_focus - dslr_focus)
 			distance_score = np.exp(-0.5 * (focus_distance / m_sigma) ** 2)
 			cos_look_angle = np.dot(clip_look_direction, dslr_look_direction)
-			cos_look_angle = np.clip(cos_look_angle, -1.0, 1.0)
+			cos_look_angle = cos_look_angle.clip(-1.0, 1.0)
 			look_angle = np.degrees(np.arccos(cos_look_angle))
 			angle_score = np.exp(-0.5 * (look_angle / deg_sigma) ** 2)
 			score = distance_score * angle_score
@@ -801,13 +799,9 @@ class DataSamplingStage:
 		if ctx.clip_frames <= 1 or ctx.video_num_frames <= ctx.clip_frames:
 			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {ctx.source_video_path}")
 		ctx.start_frame = self.rng.randint(0, ctx.video_num_frames - ctx.clip_frames)
+		# TODO: The sample id should be generated purely from current time.
 		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}"
 		ctx.final_dir = self.samples_root / ctx.sample_id
-		if ctx.final_dir.exists():
-			raise RejectedSample(f"Sample already exists: {ctx.sample_id}")
-		ctx.tmp_dir = self.samples_root / f".tmp_{ctx.sample_id}__p{os.getpid()}"
-		if ctx.tmp_dir.exists():
-			cleanup_sample_tmp(ctx)
 		ctx.tmp_dir.mkdir(parents=True)
 		ctx.intermediate_dir.mkdir()
 		ctx.manifest_entry = {
@@ -865,24 +859,25 @@ class MotionExtractionStage:
 			return float(np.std(values) / mean)
 
 		distances: list[float] = []
-		angles: list[float] = []
-		directions: list[np.ndarray] = []
+		rot_angles: list[float] = []
+		trans_angles: list[float] = []
 		for i in range(1, len(poses)):
-			direction = poses[i].translation() - poses[i - 1].translation()
-			distance = float(np.linalg.norm(direction))
+			rel_pose = poses[i].relative_to(poses[i - 1])
+			rot_angles.append(rel_pose.rotation_angle())
+			translation = rel_pose.translation()
+			distance = float(np.linalg.norm(translation))
 			distances.append(distance)
 			if distance > 1e-8:
-				directions.append(direction / distance)
-			rel_pose = poses[i].relative_to(poses[i - 1])
-			angles.append(float(rel_pose.theta()))
+				trans_angle = np.degrees(np.arccos(translation[2] / distance))
+				trans_angles.append(float(trans_angle))
 
 		path_length = sum(distances)
-		motion_amount = path_length + sum(angles) / 90.0
-		turns = [float(np.dot(*vv))for vv in zip(directions, directions[1:])]
+		motion_amount = path_length + sum(rot_angles) / 90.0
 		motion_unsteadiness = (
-			((normalized_std(distances) + normalized_std(angles)) / 2.0)
-			+ (sum(x < 0 for x in turns) / len(turns) if turns else 0.0)
-		)
+			normalized_std(distances)
+			+ normalized_std(rot_angles)
+			+ normalized_std(trans_angles)
+		) / 3.0
 		return {
 			"path_length": path_length,
 			"motion_amount": motion_amount,

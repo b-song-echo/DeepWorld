@@ -50,6 +50,6 @@ python "$SCRIPT" \
 	--filter_motion_amount_min 0.8 \
 	--filter_motion_amount_max 4.0 \
 	--filter_motion_unsteadiness_max 2.0 \
-	--filter_dslr_brisque_score_max 60.0 \
+	--filter_dslr_brisque_score_max 50.0 \
 	--filter_quality_score_min 0.7 \
 	"$@"
