@@ -799,8 +799,9 @@ class DataSamplingStage:
 		if ctx.clip_frames <= 1 or ctx.video_num_frames <= ctx.clip_frames:
 			raise RejectedSample(f"Video too short for {self.args.clip_seconds}s clip: {ctx.source_video_path}")
 		ctx.start_frame = self.rng.randint(0, ctx.video_num_frames - ctx.clip_frames)
-		# TODO: The sample id should be generated purely from current time.
-		ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}"
+		# ctx.sample_id = f"{ctx.scene_id}__f{ctx.start_frame:07d}_a{os.getpgid()}"
+		ctx.sample_id = f"{self.rng.getrandbits(32):08x}"
+		ctx.tmp_dir = self.samples_root / f".tmp_{ctx.sample_id}"
 		ctx.final_dir = self.samples_root / ctx.sample_id
 		ctx.tmp_dir.mkdir(parents=True)
 		ctx.intermediate_dir.mkdir()
