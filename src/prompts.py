@@ -199,8 +199,6 @@ Sampled frame timeline:
 
 IMAGE_CAPTIONING_TEMPLATE = """You are captioning one reference image for a scene-grounded video generation dataset.
 
-The index of this image is <REF_INDEX>, and it <IS_VIDEO_START_CLAUSE> the start frame of the video. Explicitly mention these two facts in the caption.
-
 Return JSON only. Do not include Markdown.
 
 Use this image as visual evidence only. Describe what is visible in the image, especially details that are useful for cross-referencing this reference image from a later video-generation prompt.
@@ -217,17 +215,12 @@ Rules:
 - Do not invent objects.
 - Be specific about object identity and position.
 - Avoid vague phrases like "some furniture" when objects are identifiable.
-- Refer to this image by its index, such as "the first image", "the third image", "image 6", "image 12", etc. But avoid using the word "index" directly.
-- Do not refer to this image as a different ordinal or number.
-- Always mention whether this image is the start frame of the video.
 - If the room type is unclear, use "unknown" rather than guessing.
 - Do not describe camera motion; this is a single still reference image.
 - Do not mention hidden metadata, file names, implementation details, or dataset internals.
 
 Required JSON schema:
 {
-  "reference_index": <int>,
-  "is_video_start_frame": <bool>,
   "room_type": "string_or_unknown",
   "viewpoint": "string",
   "major_objects": ["string", "..."],

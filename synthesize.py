@@ -1260,13 +1260,13 @@ class MotionDigestingStage:
 			.replace("<UNIT_SECONDS>", unit_seconds)
 			.replace("<MOTION_EXTRACTION_JSON>", motion_extraction_json)
 		)
-		out = self.llm.generate_json(
+		result = self.llm.generate_json(
 			prompt,
 			temperature=self.args.motion_digesting_llm_temperature,
 			max_new_tokens=self.args.motion_digesting_llm_max_new_tokens,
 		)
 		write_json(ctx.intermediate_dir / "motion_caption.json", {
-			"motion_caption": self.llm.json_by_key(out, "motion_caption"),
+			"motion_caption": self.llm.json_by_key(result, "motion_caption"),
 		})
 
 
@@ -1327,10 +1327,9 @@ class VideoCaptioningStage:
 class ImageCaptioningStage:
 	"""Caption each ordered reference image independently with a VLM.
 
-	Reference order is already fixed by sampling. Captions therefore explicitly
-	name the first, second, and later images so downstream text-only stages can
-	safely wire video objects and start-frame references to the correct input
-	image indices.
+	Reference order and start-frame flags are fixed by sampling and stored
+	separately from each VLM caption so the wiring stage can use those facts
+	without making each still-image caption mention hidden metadata.
 	"""
 
 	def __init__(self, args: Namespace, vlm: VisionLanguageBackend):
@@ -1339,30 +1338,22 @@ class ImageCaptioningStage:
 
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `image_captions.json`."""
-
 		captions: list[dict[str, Any]] = []
 		for ref in ctx.manifest_entry["ref_imgs"]:
-			index = ref["index"]
-			# TODO: Maybe this can be simplified since each captioning does not care about index or start frame.
-			is_video_start_clause = "is" if ref["is_start_frame"] else "is not"
-			prompt = (
-				IMAGE_CAPTIONING_TEMPLATE
-				.replace("<REF_INDEX>", str(index))
-				.replace("<IS_VIDEO_START_CLAUSE>", is_video_start_clause)
-			)
+			index = 
 			result = self.vlm.generate_json(
-				prompt,
+				IMAGE_CAPTIONING_TEMPLATE,
 				temperature=self.args.image_captioning_vlm_temperature,
 				max_new_tokens=self.args.image_captioning_vlm_max_new_tokens,
 				media=[{
 					"type": "image",
-					"path": str(ctx.ref_img_dir / f"ref_{index:03d}.jpg"),
+					"path": str(ctx.ref_img_dir / f"ref_{ref["index"]:03d}.jpg"),
 					"resized_width": self.args.image_captioning_width,
 					"resized_height": self.args.image_captioning_height,
 				}],
 			)
 			captions.append({
-				"reference_index": index,
+				"reference_index": ref["index"],
 				"is_video_start_frame": bool(ref["is_start_frame"]),
 				"caption": self.vlm.json_by_key(result, "image_caption"),
 			})
