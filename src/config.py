@@ -30,7 +30,7 @@ class DatasetConfig:
 		num_samples: Optional deterministic per-epoch sample cap. `0` means all records.
 		video_width: Spatial width used for GT video training clips and square reference preprocessing.
 		video_height: Spatial height used for GT video training clips and square reference preprocessing.
-		video_fps: Uniform FPS used to sample frames from each curated 5-second GT clip.
+		video_fps: Uniform FPS used to sample frames from each curated GT clip.
 		video_duration: Duration in seconds represented by the curated clip.
 		prompt_rich_prob: Probability of using the full synthesized prompt.
 		prompt_medium_prob: Probability of using the medium distilled prompt.

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
 import json
@@ -11,7 +13,6 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
-from __future__ import annotations
 
 import ffmpeg
 import imageio.v3 as iio
@@ -126,19 +127,38 @@ class SampleContext:
 		return self.source_pose_path
 
 
-# TODO: Make sure this class is correctly implemented, and its usage in this file has no bugs. Additionally, generate docs for this class.
 class Pose:
+	"""Camera-to-world pose matrix with helpers for local camera motion.
+
+	The ScanNet++ iPhone poses used by the clip pipeline follow the OpenCV-like
+	camera convention used in the prompts: +X points right, +Y points down, and
+	+Z points forward. Relative transforms therefore use
+	`inv(start_camera_to_world) @ end_camera_to_world`, which expresses the end
+	camera pose in the starting camera's local coordinate system.
+	"""
+
 	def __init__(self, array: np.ndarray):
+		"""Store one finite 4x4 camera-to-world transform."""
+
+		array = np.asarray(array, dtype=np.float64)
+		if array.shape != (4, 4) or not np.isfinite(array).all():
+			raise ValueError("Pose expects a finite 4x4 matrix.")
 		self.array = array
 	
 	def __call__(self) -> np.ndarray:
+		"""Return the raw 4x4 camera-to-world matrix."""
+
 		return self.array
 	
 	def serialized(self) -> list[list[float]]:
+		"""Return the pose as JSON-serializable nested lists."""
+
 		return self.array.tolist()
 	
 	@classmethod
 	def from_payload(cls, payload: Any) -> Pose | None:
+		"""Parse a pose from common ScanNet++ and Nerfstudio payload shapes."""
+
 		if payload is None:
 			return None
 		if isinstance(payload, dict):
@@ -159,34 +179,51 @@ class Pose:
 			return None
 		return cls(array)	
 	
-	def yz_flipped(self):
+	def yz_flipped(self) -> Pose:
+		"""Convert an OpenGL-style camera-to-world pose to the OpenCV-style axes."""
+
 		return Pose(self() @ np.diag([1, -1, -1, 1]))
 
-	def relative_to(self, pose: Pose)	-> Pose:
-		return Pose(np.linalg.inv(pose() @ self()))
+	def relative_to(self, pose: Pose) -> Pose:
+		"""Return this pose expressed in another pose's local camera frame."""
+
+		return Pose(np.linalg.inv(pose()) @ self())
 	
 	def translation(self) -> np.ndarray:
+		"""Return the camera center in world or relative coordinates."""
+
 		return self()[:3, 3]
 	
 	def look_direction(self) -> np.ndarray:
-		v = self()[:3, 2]
-		return v / np.maximum(np.linalg.norm(v) / 1e-8)
+		"""Return the normalized +Z camera-forward direction."""
+
+		vector = self()[:3, 2]
+		return vector / max(float(np.linalg.norm(vector)), 1e-8)
 	
 	def rotation(self) -> np.ndarray:
+		"""Return the 3x3 rotation block."""
+
 		return self()[:3, :3]
 	
-	def euler_angle(self) -> np.ndarray:
+	def euler_angle(self) -> tuple[float, float, float]:
+		"""Return yaw, pitch, and roll deltas in degrees.
+
+		Positive yaw pans right, positive pitch tilts up, and positive roll rotates
+		clockwise in the OpenCV-like camera coordinate frame.
+		"""
+
 		R = self.rotation()
 		yaw = np.arctan2(R[0, 2], R[2, 2])
 		pitch = np.arctan2(-R[1, 2], np.hypot(R[0, 2], R[2, 2]))
 		roll = np.arctan2(R[1, 0], R[1, 1])
 		return np.degrees([yaw, pitch, roll])
 	
-	# TODO: To measure "the amount of rotation", use this the physically meaningful rotation angle, rather than the heuristic enler angle magnitude. Check this codebase to make sure this is used correctly.
-	def theta(self) -> np.ndarray:
+	def theta(self) -> float:
+		"""Return the intrinsic rotation angle in degrees."""
+
 		R = self.rotation()
 		cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
-		return np.degrees(np.arccos(cos_theta))
+		return float(np.degrees(np.arccos(cos_theta)))
 
 
 def parse_args() -> Namespace:
@@ -358,21 +395,6 @@ def write_jsonl(
 			f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 		f.flush()
 		os.fsync(f.fileno())
-
-
-def maybe_round_float(value: Any) -> Any:
-		"""Round one numeric motion value for stable JSON output."""
-
-		if isinstance(value, list):
-			return [maybe_round_float(item) for item in value]
-		elif isinstance(value, dict):
-			return {k: maybe_round_float(v) for k, v in value.items()}
-		elif isinstance(value, np.ndarray) and value.size == 1 and np.issubdtype(value.dtype, np.floating):
-			return maybe_round_float(value.item())
-		elif isinstance(value, float):
-			return round(value, 3)
-		else:
-			return value
 
 
 class DataSamplingStage:
@@ -598,8 +620,8 @@ class DataSamplingStage:
 		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
-		write_json(ctx.intermediate_dir / "poses.json", {
-			"poses": [pose.serialized() for pose in clip_poses]
+		write_json(ctx.intermediate_dir / "poses.json", {"poses":
+			[p.serialized() if p is not None else None for p in clip_poses]
 		})
 
 	def _ref_image_brisque_score(self, image: Image.Image) -> float:
@@ -619,14 +641,12 @@ class DataSamplingStage:
 	def _ref_image_pose_relevance_score(
 		self, dslr_pose: Pose | None, clip_poses: list[Pose | None],
 	) -> float:
-		"""Score how close a DSLR camera pose is to any pose in the sampled clip."""
+		"""Return the best DSLR-to-clip pose relevance score in [0, 1]."""
 	
-		# TODO: For this method, please fix flawed logic, if there are any.
-		best_score = float("inf")
+		best_score = 0.0
 		if dslr_pose is None:
 			return best_score
-		# TODO: DSLR pose (OpenGL like) and clip pose (OpenCV like) have different camera coordinate convention. Shouldn't you cnovert DSLR pose first using right-multiplication?
-		# dslr_pose = dslr_pose.yz_flipped() 
+		dslr_pose = dslr_pose.yz_flipped()
 		depth, m_sigma, deg_sigma = 3.0, 1.0, 45.0
 		dslr_pos = dslr_pose.translation()
 		dslr_look_direction = dslr_pose.look_direction()
@@ -642,7 +662,7 @@ class DataSamplingStage:
 			look_angle = np.degrees(np.arccos(cos_look_angle))
 			angle_score = np.exp(-0.5 * (look_angle / deg_sigma) ** 2)
 			score = distance_score * angle_score
-			best_score = min(best_score, score)
+			best_score = max(best_score, float(score))
 		return best_score
 
 	def _prepare_reference_images(
@@ -710,7 +730,7 @@ class DataSamplingStage:
 			score = self._ref_image_pose_relevance_score(dslr_pose, clip_poses)
 			dslr_candidates.append((score, index))
 		dslr_pooled = dslr_needed * self.args.pose_pool_multiplier
-		dslr_candidates.sort(key=lambda candidate: candidate[0])
+		dslr_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
 		dslr_candidates = dslr_candidates[:dslr_pooled]
 		self.rng.shuffle(dslr_candidates)
 		
@@ -834,9 +854,9 @@ class MotionExtractionStage:
 		return valid_poses
 		
 	def _path_stats(self, poses: list[Pose]) -> dict[str, float]:
-		"""Compute statistics for poses."""
+		"""Compute translation, rotation, and steadiness statistics for poses."""
 
-		def normalized_variation(values: list[float]) -> float:
+		def normalized_std(values: list[float]) -> float:
 			if len(values) < 2:
 				return 0.0
 			mean = np.mean(values)
@@ -845,33 +865,36 @@ class MotionExtractionStage:
 			return float(np.std(values) / mean)
 
 		distances: list[float] = []
-		thetas: list[float] = []
+		angles: list[float] = []
 		directions: list[np.ndarray] = []
 		for i in range(1, len(poses)):
 			direction = poses[i].translation() - poses[i - 1].translation()
-			distances.append(float(np.linalg.norm(direction)))
-			directions.append(directions)
+			distance = float(np.linalg.norm(direction))
+			distances.append(distance)
+			if distance > 1e-8:
+				directions.append(direction / distance)
 			rel_pose = poses[i].relative_to(poses[i - 1])
-			thetas.append(float(rel_pose.theta()))
+			angles.append(float(rel_pose.theta()))
 
 		path_length = sum(distances)
-		path_curvature = sum(thetas) / 90.0
-		jitter = normalized_variation(distances)
-		shaky = normalized_variation(thetas)
-		turns = [np.dot(*vv) for vv in zip(directions, directions[1:])]
-		reverses = [turn for turn in turns if turn < 0.0]
-		reverse_fraction = len(reverses) / len(turns) if turns else 0.0
-		motion_unsteadiness = (jitter + shaky) / 2.0 + reverse_fraction
+		motion_amount = path_length + sum(angles) / 90.0
+		turns = [float(np.dot(*vv))for vv in zip(directions, directions[1:])]
+		motion_unsteadiness = (
+			((normalized_std(distances) + normalized_std(angles)) / 2.0)
+			+ (sum(x < 0 for x in turns) / len(turns) if turns else 0.0)
+		)
 		return {
 			"path_length": path_length,
-			"motion_amount": path_length + path_curvature,
+			"motion_amount": motion_amount,
 			"motion_unsteadiness": motion_unsteadiness,
 		}
 	
 	def _relative_stats(self, start: Pose, end: Pose) -> dict[str, float]:
+		"""Compute net local translation and signed yaw/pitch/roll from start to end."""
+
 		rel_pose = end.relative_to(start)
 		right, down, forward = [float(v) for v in rel_pose.translation()]
-		yaw, pitch, roll = [float(v) for v in rel_pose.euler_angle().e]
+		yaw, pitch, roll = [float(v) for v in rel_pose.euler_angle()]
 		return {
 			"chord_length": float(np.linalg.norm(rel_pose.translation())),
 			"right": right, "down": down, "forward": forward,
@@ -881,19 +904,24 @@ class MotionExtractionStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Compute and save `motion_extraction.json`."""
 
+		def round_stats(stats: dict[str, float]) -> dict[str, float]:
+			return {k: round(v, 1) for k, v in stats.items()}
+
 		raw_payload = read_json(ctx.intermediate_dir / "poses.json")
 		payload_sequence = raw_payload.get("poses", [])
 		raw_clip_poses = [Pose.from_payload(p) for p in payload_sequence]
 		clip_poses = self._valid_clip_poses(raw_clip_poses)
 		path_stats = self._path_stats(clip_poses)
 		clip_stats = self._relative_stats(clip_poses[0], clip_poses[-1])
+		
 		if self.args.filter_motion_amount_min is not None and path_stats["motion_amount"] < self.args.filter_motion_amount_min:
 			raise RejectedSample(f"Motion amount {path_stats['motion_amount']:.4f} below threshold.")
 		if self.args.filter_motion_amount_max is not None and path_stats["motion_amount"] > self.args.filter_motion_amount_max:
 			raise RejectedSample(f"Motion amount {path_stats['motion_amount']:.4f} above threshold.")
 		if self.args.filter_motion_unsteadiness_max is not None and path_stats["motion_unsteadiness"] > self.args.filter_motion_unsteadiness_max:
 			raise RejectedSample(f"Motion unsteadiness {path_stats['motion_unsteadiness']:.4f} above threshold.")
-		overall_motion = maybe_round_float({
+		
+		overall_motion = round_stats({
 			"clip_duration_(s)": self.args.clip_seconds,
 			"clip_start_to_clip_end_path_length_(m)": path_stats["path_length"],
 			"clip_start_to_clip_end_chord_length_(m)": clip_stats["chord_length"],
@@ -915,11 +943,11 @@ class MotionExtractionStage:
 			end_index = min(int(round(end_time * ctx.video_fps)), len(raw_clip_poses))
 			raw_unit_poses = raw_clip_poses[start_index:end_index]
 			unit_poses = self._valid_clip_poses(raw_unit_poses)
-
 			anchor_stats = self._relative_stats(clip_poses[0], unit_poses[0])
 			path_stats = self._path_stats(unit_poses)
 			unit_stats = self._relative_stats(unit_poses[0], unit_poses[-1])
-			motion_units.append(maybe_round_float({
+			
+			motion_units.append(round_stats({
 				"unit_index": unit_index,
 				"unit_begins_at_clip_(s)": start_time,
 				"unit_duration_(s)": end_time - start_time,
@@ -1099,7 +1127,10 @@ class TextGenerationBackend:
 			except Exception as error:
 				raise RejectedSample("Model response could not be decoded as JSON after one deterministic repair.") from error
 	
-	def get_json_key(self, payload: Any, key: str) -> Any:
+	def json_to_str(self, value: Any) -> str:
+		return json.dumps(read_json(path), ensure_ascii=False, indent=2)
+	
+	def json_by_key(self, payload: Any, key: str) -> Any:
 		"""Return one required generated-JSON value or reject the sample."""
 
 		if not isinstance(payload, dict):
@@ -1219,21 +1250,23 @@ class MotionDigestingStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `motion_caption.json`."""
 
-		motion_extraction_json = json.dumps(
-			read_json(ctx.intermediate_dir / "motion_extraction.json"),
-			ensure_ascii=False, indent=2
-		)
+		clip_seconds = f"{ctx.clip_duration_s:g}"
+		unit_seconds = f"{self.args.motion_digesting_unit_seconds:g}"
+		path = ctx.intermediate_dir / "motion_extraction.json"
+		motion_extraction_json = self.llm.json_to_str(read_json(path))
 		prompt = (
 			MOTION_DIGESTING_TEMPLATE
+			.replace("<CLIP_SECONDS>", clip_seconds)
+			.replace("<UNIT_SECONDS>", unit_seconds)
 			.replace("<MOTION_EXTRACTION_JSON>", motion_extraction_json)
 		)
-		result = self.llm.generate_json(
+		out = self.llm.generate_json(
 			prompt,
 			temperature=self.args.motion_digesting_llm_temperature,
 			max_new_tokens=self.args.motion_digesting_llm_max_new_tokens,
 		)
 		write_json(ctx.intermediate_dir / "motion_caption.json", {
-			"motion_caption": self.llm.get_json_key(result, "motion_caption"),
+			"motion_caption": self.llm.json_by_key(out, "motion_caption"),
 		})
 
 
@@ -1249,40 +1282,28 @@ class VideoCaptioningStage:
 		self.args = args
 		self.vlm = vlm
 
-	def _sampled_frame_timeline(self, ctx: SampleContext) -> list[dict[str, Any]]:
+	def _get_timeline(self, ctx: SampleContext) -> list[dict[str, Any]]:
 		"""Describe the frame times implied by the configured VLM video sampling rate."""
 
-		frame_count = max(1, int(math.floor(ctx.clip_duration_s * self.args.video_captioning_fps)) + 1)
-		times = [
-			min(index / self.args.video_captioning_fps, ctx.clip_duration_s)
-			for index in range(frame_count)
-		]
-		if times[-1] < ctx.clip_duration_s:
-			times.append(ctx.clip_duration_s)
-		return [
-			{
-				"sampled_frame_index": index + 1,
-				"time_s": round(time_s, 3),
-				"position_in_clip": (
-					"start" if index == 0 else
-					"end" if index == len(times) - 1 else
-					"middle"
-				),
-			}
-			for index, time_s in enumerate(times)
-		]
+		fps = self.args.video_captioning_fps
+		duration = ctx.clip_duration_s
+		frame_count = int(math.floor( duration* fps)) + 1
+		return [{
+			"index": i + 1,
+			"frame_timestamp_(s)": round(min(i / fps, duration), 1),
+		} for i in range(frame_count)]
+		
 
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `video_caption.json`."""
 
-		motion_caption_json = json.dumps(
-			read_json(ctx.intermediate_dir / "motion_caption.json"),
-			ensure_ascii=False, indent=2
-		)
-		frame_timeline = self._sampled_frame_timeline(ctx)
-		frame_timeline_json = json.dumps(frame_timeline, ensure_ascii=False, indent=2)
+		clip_seconds = f"{ctx.clip_duration_s:g}"
+		path = ctx.intermediate_dir / "motion_caption.json"
+		motion_caption_json = self.vlm.json_to_str(read_json(path))
+		frame_timeline_json = self.vlm.json_to_str(self._get_timeline(ctx))
 		prompt = (
 			VIDEO_CAPTIONING_TEMPLATE
+			.replace("<CLIP_SECONDS>", clip_seconds)
 			.replace("<MOTION_CAPTION_JSON>", motion_caption_json)
 			.replace("<VIDEO_FRAME_TIMELINE_JSON>", frame_timeline_json)
 		)
@@ -1299,7 +1320,7 @@ class VideoCaptioningStage:
 			}],
 		)
 		write_json(ctx.intermediate_dir / "video_caption.json", {
-			"video_caption": self.vlm.get_json_key(result, "video_caption"),
+			"video_caption": self.vlm.json_by_key(result, "video_caption"),
 		})
 
 
@@ -1319,9 +1340,10 @@ class ImageCaptioningStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `image_captions.json`."""
 
-		captions: list[str] = []
+		captions: list[dict[str, Any]] = []
 		for ref in ctx.manifest_entry["ref_imgs"]:
 			index = ref["index"]
+			# TODO: Maybe this can be simplified since each captioning does not care about index or start frame.
 			is_video_start_clause = "is" if ref["is_start_frame"] else "is not"
 			prompt = (
 				IMAGE_CAPTIONING_TEMPLATE
@@ -1339,7 +1361,11 @@ class ImageCaptioningStage:
 					"resized_height": self.args.image_captioning_height,
 				}],
 			)
-			captions.append(self.vlm.get_json_key(result, "image_caption"))
+			captions.append({
+				"reference_index": index,
+				"is_video_start_frame": bool(ref["is_start_frame"]),
+				"caption": self.vlm.json_by_key(result, "image_caption"),
+			})
 		write_json(ctx.intermediate_dir / "image_captions.json", {
 			"image_captions": captions,
 		})
@@ -1360,14 +1386,10 @@ class CaptionWiringStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `wired_caption.json`."""
 
-		video_caption_json = json.dumps(
-			read_json(ctx.intermediate_dir / "video_caption.json"),
-			ensure_ascii=False, indent=2
-		)
-		image_captions_json = json.dumps(
-			read_json(ctx.intermediate_dir / "image_captions.json"),
-			ensure_ascii=False, indent=2
-		)
+		path = ctx.intermediate_dir / "video_caption.json"
+		video_caption_json = self.llm.json_to_str(read_json(path))
+		path = tx.intermediate_dir / "image_captions.json"
+		image_captions_json = self.llm.json_to_str(read_json(path))
 		prompt = (
 			CAPTION_WIRING_TEMPLATE
 			.replace("<VIDEO_CAPTION_JSON>", video_caption_json)
@@ -1379,7 +1401,7 @@ class CaptionWiringStage:
 			max_new_tokens=self.args.caption_wiring_llm_max_new_tokens,
 		)
 		write_json(ctx.intermediate_dir / "wired_caption.json", {
-			"wired_caption": self.llm.get_json_key(result, "wired_caption"),
+			"wired_caption": self.llm.json_by_key(result, "wired_caption"),
 		})
 
 
@@ -1398,12 +1420,12 @@ class CaptionRephrasingStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Update the manifest entry with `synthesized_prompt`."""
 
-		wired_caption_json = json.dumps(
-			read_json(ctx.intermediate_dir / "wired_caption.json"),
-			ensure_ascii=False, indent=2
-		)
+		clip_seconds = f"{ctx.clip_duration_s:g}"
+		path = ctx.intermediate_dir / "wired_caption.json"
+		wired_caption_json = self.llm.json_to_str(read_json(path))
 		prompt = (
 			CAPTION_REPHRASING_TEMPLATE
+			.replace("<CLIP_SECONDS>", clip_seconds)
 			.replace("<WIRED_CAPTION_JSON>", wired_caption_json)
 		)
 		result = self.llm.generate_json(
@@ -1411,7 +1433,7 @@ class CaptionRephrasingStage:
 			temperature=self.args.caption_rephrasing_llm_temperature,
 			max_new_tokens=self.args.caption_rephrasing_llm_max_new_tokens,
 		)
-		synthesized_prompt = self.llm.get_json_key(result, "synthesized_prompt")
+		synthesized_prompt = self.llm.json_by_key(result, "synthesized_prompt")
 		ctx.manifest_entry["synthesized_prompt"] = synthesized_prompt
 
 
@@ -1430,18 +1452,12 @@ class CriticJudgingStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `llm_validation.json` and reject invalid prompt candidates."""
 
-		motion_caption_json = json.dumps(read_json(
-			ctx.intermediate_dir / "motion_caption.json"),
-			ensure_ascii=False, indent=2
-		)
-		video_caption_json = json.dumps(read_json(
-			ctx.intermediate_dir / "video_caption.json"),
-			ensure_ascii=False, indent=2
-		)
-		image_captions_json = json.dumps(read_json(
-			ctx.intermediate_dir / "image_captions.json"),
-			ensure_ascii=False, indent=2
-		)
+		path = ctx.intermediate_dir / "motion_caption.json"
+		motion_caption_json = self.llm.json_to_str(read_json(path))
+		path = ctx.intermediate_dir / "video_caption.json"
+		video_caption_json = self.llm.json_to_str(read_json(path))
+		path = ctx.intermediate_dir / "image_captions.json"
+		image_captions_json = self.llm.json_to_str(read_json(path))
 		synthesized_prompt = ctx.manifest_entry["synthesized_prompt"]
 		prompt = (
 			CRITIC_JUDGING_TEMPLATE
@@ -1455,8 +1471,8 @@ class CriticJudgingStage:
 			temperature=self.args.critic_judging_llm_temperature,
 			max_new_tokens=self.args.critic_judging_llm_max_new_tokens,
 		)
-		fatal_checks = self.llm.get_json_key(result, "fatal_checks") or {}
-		quality_checks = self.llm.get_json_key(result, "quality_checks") or {}
+		fatal_checks = self.llm.json_by_key(result, "fatal_checks") or {}
+		quality_checks = self.llm.json_by_key(result, "quality_checks") or {}
 		fatal_passed = all(bool(value) for value in fatal_checks.values()) and len(fatal_checks) > 0
 		quality_values = [bool(value) for value in quality_checks.values()]
 		quality_score = sum(quality_values) / len(quality_values) if quality_values else 0.0
@@ -1494,8 +1510,8 @@ class DistillationStage:
 			max_new_tokens=self.args.distillation_llm_max_new_tokens,
 		)
 		ctx.manifest_entry["distilled_prompts"] = {
-			"medium": self.llm.get_json_key(result, "medium_prompt"),
-			"coarse": self.llm.get_json_key(result, "coarse_prompt"),
+			"medium": self.llm.json_by_key(result, "medium_prompt"),
+			"coarse": self.llm.json_by_key(result, "coarse_prompt"),
 		}
 
 

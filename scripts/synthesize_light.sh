@@ -10,9 +10,9 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
-python $SCRIPT \
-	--scannetpp_root $SCANNETPP_ROOT \
-	--output_root $OUTPUT_ROOT \
+python "$SCRIPT" \
+	--scannetpp_root "$SCANNETPP_ROOT" \
+	--output_root "$OUTPUT_ROOT" \
 	--num_processes 2 \
 	--seed 20021021 \
 	--split train \
@@ -21,8 +21,8 @@ python $SCRIPT \
 	--max_ref_images 5 \
 	--pose_pool_multiplier 4 \
 	--include_start_frame_prob 0.35 \
-	--vlm_backend_path $VLM_BACKBONE_PATH \
-	--llm_backend_path $LLM_BACKBONE_PATH \
+	--vlm_backend_path "$VLM_BACKBONE_PATH" \
+	--llm_backend_path "$LLM_BACKBONE_PATH" \
 	--video_captioning_width 720 \
 	--video_captioning_height 720 \
 	--video_captioning_fps 2 \
@@ -45,10 +45,9 @@ python $SCRIPT \
 	--distillation_llm_max_new_tokens 1024 \
 	--filter_pixel_valid_fraction_min 0.95 \
 	--filter_pose_valid_fraction_min 0.90 \
-	# TODO: Based on how the motion metrics are calculated, update the following three values to be reasonable.
-	--filter_motion_amount_min 1.0 \
-	--filter_motion_amount_max 3.0 \
-	--filter_motion_unsteadiness_max 3.00 \
+	--filter_motion_amount_min 0.8 \
+	--filter_motion_amount_max 4.0 \
+	--filter_motion_unsteadiness_max 2.0 \
 	--filter_dslr_brisque_score_max 60.0 \
 	--filter_quality_score_min 0.7 \
 	"$@"
