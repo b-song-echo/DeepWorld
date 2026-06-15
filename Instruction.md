@@ -1,4 +1,0 @@
-Adter inspecting some committed samples, they are certainly better than before, but there are still issues. First, motion captions have become quantative, but the video captions still lacks concrete motion amount. They only mention timestamp marks, which is not enough. The synthesized prompt should be rich in fine-grained camera-motion control. The emphasis is not visual description because the scene is largely conveyed by reference images. Update prompt templates. Note that you may delete redundant or useless stuff when the prompt gets too verbose, otherwise the LLM may lose sight of key points.
-
-
-Temperature may have a huge impact on the output quality. Each stage has unique role, therefore the ideal sampling temperature may differ. Based on your knowledge, suggest the most appropriate temperatures and update them in the two bash scripts.

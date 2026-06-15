@@ -18,7 +18,7 @@ python "$SCRIPT" \
 	--split train \
 	--num_samples 10000 \
 	--clip_seconds 20.0 \
-	--max_ref_images 7 \
+	--max_ref_images 5 \
 	--pose_pool_multiplier 4 \
 	--include_start_frame_prob 0.35 \
 	--vlm_backend_path "$VLM_BACKBONE_PATH" \
@@ -48,8 +48,8 @@ python "$SCRIPT" \
 	--filter_pixel_valid_fraction_min 0.95 \
 	--filter_pose_valid_fraction_min 0.90 \
 	--filter_motion_amount_min 4.0 \
-	--filter_motion_amount_max 16.0 \
+	--filter_motion_amount_max 20.0 \
 	--filter_motion_unsteadiness_max 2.0 \
-	--filter_dslr_brisque_score_max 40.0 \
+	--filter_dslr_brisque_score_max 50.0 \
 	--filter_quality_score_min 0.7 \
 	"$@"

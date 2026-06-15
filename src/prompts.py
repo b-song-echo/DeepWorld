@@ -1,12 +1,3 @@
-"""Hybrid prompt templates for scene-grounded video prompt synthesis.
-
-These templates combine the compactness of `prompts_pruned.py` with the
-reference-grounding and validation safeguards from `prompts.py`. The intended
-output is a training prompt that gives the model enough camera-control signal
-without turning small pose statistics into noisy, over-specified instructions.
-"""
-
-
 MOTION_DIGESTING_TEMPLATE = """You are converting numeric camera-motion statistics of a <CLIP_SECONDS>-second video clip into a clear camera-motion caption.
 
 The clip is split into chronological motion units of <UNIT_SECONDS> seconds. Use the overall statistics for the dominant full-clip motion, and use motion units only to preserve meaningful phase order, direction changes, brief holds, and changes in motion strength.
@@ -18,7 +9,6 @@ Camera-coordinate convention:
 - Relative motion is expressed in the local camera coordinate system of the starting pose.
 - +X means camera-right, +Y means camera-down, and +Z means camera-forward.
 - All translations and rotations describe physical camera motion, not object motion.
-- Do not mention scene objects, room type, furniture, doors, windows, people, or other visual content.
 
 Field interpretation:
 - "overall_motion" summarizes the full clip from first sampled pose to last sampled pose. Use it for dominant net translation, dominant net rotation, duration, and whether the path is direct or indirect.
@@ -28,14 +18,15 @@ Field interpretation:
 - Times are seconds, translations are meters, and rotations are degrees.
 
 Signed-value interpretation:
-- Right translation: positive means slide/truck/track right; negative means slide/truck/track left.
-- Down translation: positive means lower or move down; negative means rise or move up.
-- Forward translation: positive means move forward, push in, or approach; negative means move backward, pull back, or retreat.
-- Yaw delta: positive means pan or turn right; negative means pan or turn left.
-- Pitch delta: positive means tilt up; negative means tilt down.
-- Roll delta: positive means roll clockwise; negative means roll counterclockwise.
+- Right: positive means slide/truck/track right; negative means slide/truck/track left.
+- Down: positive means lower or move down; negative means rise or move up.
+- Forward: positive means move forward, push in, or approach; negative means move backward, pull back, or retreat.
+- Yaw: positive means pan or turn right; negative means pan or turn left.
+- Pitch: positive means tilt up; negative means tilt down.
+- Roll: positive means roll clockwise; negative means roll counterclockwise.
 
 Writing policy:
+- Do not mention scene objects, room type, furniture, doors, windows, people, or other visual content.
 - Preserve temporal order and meaningful phase boundaries.
 - Quantify dominant motion with natural rounded values. Include meters/degrees for meaningful whole-clip motion and for unit phases above about 0.10 m or 5 degrees.
 - Omit tiny components unless they mark a real direction change or disambiguate the path. Treat units below about 0.05 m and 2 degrees as nearly still.
@@ -83,7 +74,7 @@ C. an approximate timeline for the frames sampled by the video-language model.
 
 Return JSON only. Do not include Markdown.
 
-Use the video as visual evidence and the motion caption as guidance. Prioritize camera-motion grounding over visual inventory; reference images will carry most scene appearance later.
+Use the video as visual evidence and the motion caption as guidance. Prioritize camera-motion grounding over visual inventory.
 
 Source usage:
 - Use the video frames as the source of truth for visible objects, room layout, and visual details.
@@ -91,7 +82,7 @@ Source usage:
 - Use the sampled-frame timeline to identify where each visible frame sits in the clip. Refer to approximate seconds only when they make a phase easier to understand.
 - Ground camera motion to visible objects or regions when the video clearly supports it.
 - Do not describe objects or regions that are not visible.
-- Do not drop dominant camera-motion quantities from the motion caption. Carry meaningful meters/degrees forward for the final user prompt.
+- Do not drop dominant camera-motion quantities from the motion caption. Carry meaningful meters/degrees forward for the video caption.
 
 Describe:
 1. the initial viewpoint,
@@ -107,7 +98,7 @@ Rules:
 - Do not introduce lighting changes, time-of-day changes, weather, or environment changes.
 - Use approximate natural quantities such as "about 0.3 meters left", "roughly one meter backward", "about 45 degrees", or "about 90 degrees" only when supported by the motion caption.
 - Preserve the dominant whole-clip motion scale and the main per-phase quantities. Do not replace them with only timestamp marks or vague motion verbs.
-- Mention only enough scene detail to make the camera path spatially clear. Do not inventory every visible object.
+- Keep visual description concise. Mention only enough scene detail to make the camera path spatially clear. Do not inventory every visible object.
 - Prefer clear phase wording such as "at the start", "around 2 seconds", "then", and "in the final second" over dense pose-stat phrasing.
 - Do not mention hidden metadata, camera poses, trajectory statistics, implementation details, or dataset internals.
 
@@ -138,7 +129,7 @@ IMAGE_CAPTIONING_TEMPLATE = """You are captioning one reference image for a scen
 
 Return JSON only. Do not include Markdown.
 
-Use this image as visual evidence only. Describe what is visible in the image, especially details useful for cross-referencing this reference image from a later video-generation prompt.
+Use this image as visual evidence only. Describe what is visible in the image, especially details useful for cross-referencing this image from a later video-generation prompt.
 
 Describe:
 1. the room type, if apparent,
@@ -154,7 +145,8 @@ Rules:
 - Avoid vague phrases like "some furniture" when objects are identifiable.
 - If the room type is unclear, use "unknown" rather than guessing.
 - Do not describe camera motion; this is a single still reference image.
-- Do not mention image index/order, start-frame status, file names, metadata, implementation details, or dataset internals.
+- Do not mention hidden metadata, file names, implementation details, or dataset internals.
+
 
 Required JSON schema:
 {
@@ -232,14 +224,12 @@ The prompt should sound like a real user instructing a model to generate a video
 
 Rules:
 - Use imperative phrasing.
-- Establish the starting viewpoint clearly. Preserve the exact start-frame reference when provided, such as "start from the second image".
+- Establish the starting viewpoint clearly. Preserve the exact start-frame reference when provided.
 - Describe camera movement over <CLIP_SECONDS> seconds with rounded meters/degrees and phase timing from the wired caption.
+- Preserve supported reference-image links for the start view, target regions, emphasized regions, and layout anchors.
 - Preserve meaningful rounded distances, angles, and phase timing. Do not reduce quantified motion into only "pan", "move", "slide", or timestamp words.
 - Preserve the dominant camera direction, dominant scale, major direction changes, and main target objects or regions.
-- Preserve supported reference-image links for the start view, target regions, emphasized regions, and layout anchors when they help identify the intended view.
-- Use no more reference-image mentions than needed. If several references support the same object, name the clearest one or concise set once.
-- Keep visual description concise and anchor-focused. Mention scene objects primarily when the camera starts from, approaches, reveals, passes, or emphasizes them.
-- Do not copy every tiny camera component into the prompt. Fold minor jitter or small corrective motion into natural wording.
+- Keep visual description concise and anchor-focused.
 - Avoid phrases that sound like raw pose-stat summaries, such as "net displacement", "totaling", "execute a complex curved camera path", or long lists of left/right/up/down corrections.
 - Do not add unsupported objects, environment changes, scene transitions, object motion, hidden metadata, or dataset language.
 - Avoid overly technical phrasing; make it sound like a natural user request.
@@ -275,10 +265,10 @@ Source hierarchy:
 
 Important distinction:
 - It is acceptable for the synthesized prompt to mention objects visible in the video even if they are not visible in the reference images.
+- It is acceptable to compress tiny camera components when the dominant motion, phase order, and target regions remain correct.
 - It is not acceptable to claim that an object appears in a specific reference image unless that reference image caption supports it.
 - It is acceptable to paraphrase motion or visual content.
 - It is not acceptable to reverse motion direction, invent objects, invent environment changes, or introduce hidden metadata.
-- It is acceptable to compress tiny camera components when the dominant motion, phase order, and target regions remain correct.
 
 Validation rules:
 - Do not judge whether the prompt is stylish or beautiful.
@@ -432,11 +422,9 @@ Rules:
 - Preserve the exact start-frame reference image when the original prompt uses one; this is a crucial fact, not a trivial detail.
 - Preserve dominant camera direction, dominant scale, and the main target objects or regions.
 - Omit tiny motion components, secondary visual details, repeated reference links, and redundant wording.
-- The medium prompt should keep the dominant camera-motion quantities, phase order, and main visual grounding. It should usually be about half to two-thirds the length of the original prompt.
-- The medium prompt must not simply copy the original prompt unless the original is already very short.
-- The coarse prompt should usually be one sentence. It may omit secondary reference-image details, exact minor motion quantities, minor objects, and temporal specifics when they are not essential to stay consistent.
-- The coarse prompt should preserve the dominant motion scale when the original states one clearly, especially large translations or rotations.
-- Keep image cross-references when they are essential for understanding the start view or target object. Otherwise, prefer a concise visual phrase.
+- The medium prompt should keep dominant camera-motion quantities, phase order, and main visual grounding, but may omit tiny motion components or secondary references.
+- The coarse prompt may omit secondary reference-image details, exact minor motion quantities, minor objects, and temporal specifics when they are not essential to stay consistent. It should still preserve the dominant motion scale when the original prompt states one.
+- Keep image cross-references when they are essential for understanding the start view or target object.
 - The coarse prompt should sound like a normal short user request, not a dataset annotation or a compressed checklist.
 - Do not mention hidden metadata, captions, datasets, manifests, or internal fields.
 
