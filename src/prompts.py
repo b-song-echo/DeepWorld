@@ -224,7 +224,7 @@ The prompt should sound like a real user instructing a model to generate a video
 
 Rules:
 - Use imperative phrasing.
-- Establish the starting viewpoint clearly. Preserve the exact start-frame reference when provided.
+- Establish the starting viewpoint clearly without hallucination. Preserve the exact start-frame reference when the wired caption supports it. Otherwise, describe the viewpoint visually instead.
 - Describe camera movement over <CLIP_SECONDS> seconds with rounded meters/degrees and phase timing from the wired caption.
 - Preserve supported reference-image links for the start view, target regions, emphasized regions, and layout anchors.
 - Preserve meaningful rounded distances, angles, and phase timing. Do not reduce quantified motion into only "pan", "move", "slide", or timestamp words.
@@ -289,8 +289,8 @@ Fatal checks:
 - "no_invalid_reference_index": true only if every referenced image index exists in the reference image captions.
 - "no_unverified_reference_claim": true only if every claim about a specific reference image is supported by that reference image caption.
 - "no_reference_claim_without_specific_index": true only if claims about reference images name the specific image index or indices instead of vaguely saying "the reference image" when multiple references exist.
-- "no_missing_start_frame_reference": true only if a start-frame reference is available and the prompt uses the correct image as the starting viewpoint, or if no start-frame reference is available and the prompt describes the starting viewpoint visually.
-- "no_start_frame_reference_error": true only if the prompt does not incorrectly identify which reference image is the video start frame.
+- "no_missing_start_frame_reference": true only if a start-frame reference is available and the prompt uses the correct image as the starting viewpoint, or if no start-frame reference is available and the prompt describes the starting viewpoint visually without designating any reference image as the start.
+- "no_start_frame_reference_error": true only if the prompt does not incorrectly identify which reference image is the video start frame, and does not hallucinate one as the video start frame when none exists among all reference images.
 - "no_contradictory_camera_motion": true only if the prompt does not contradict the camera-motion caption or video caption in direction, order, scale, or type of motion.
 - "no_opposite_motion_direction": true only if the prompt does not reverse any important motion direction, such as left versus right, forward versus backward, up versus down, pan left versus pan right, or tilt up versus tilt down.
 - "no_invalid_zoom_claim": true only if the prompt does not describe pose-derived forward/backward camera motion as optical zoom unless the video caption explicitly supports zoom.
@@ -301,7 +301,7 @@ Fatal checks:
 Quality checks:
 - "has_clear_start_viewpoint": true only if the prompt clearly establishes the initial view of the generated video.
 - "uses_start_frame_reference_if_available": true if no first-frame reference is available, or if it is available and the prompt correctly uses it as the starting viewpoint.
-- "describes_start_view_visually_if_no_start_reference": true if a first-frame reference is available, or if none is available and the prompt instead describes the starting viewpoint visually.
+- "describes_start_view_visually_if_no_start_reference": true if a first-frame reference is available, or if none is available and the prompt instead describes the starting viewpoint visually without saying the video starts from any reference image.
 - "has_meaningful_camera_motion": true only if the prompt contains a clear camera movement rather than only describing a static scene.
 - "aligns_with_motion_caption": true only if the prompt's camera motion aligns with the camera motion caption.
 - "has_temporally_grounded_motion": true only if the prompt preserves major motion phases in temporal order, using approximate seconds or clear beginning/middle/end grounding when supported.
@@ -316,7 +316,7 @@ Quality checks:
 - "objects_are_supported_by_video_caption": true only if objects mentioned as part of the generated video are supported by the video caption.
 - "uses_supported_reference_images_compulsorily": true only if the prompt cross-refers to reference images for visible objects, start views, target regions, or layout anchors when the reference captions clearly support those links.
 - "reference_image_mentions_are_supported": true only if every reference image mention is supported by the corresponding reference image caption.
-- "preserves_start_reference_grounding": true only if the prompt preserves the start-frame reference or visual start-view description from the inputs.
+- "preserves_start_reference_grounding": true only if the prompt preserves the start-frame reference when one exists, or preserves a visual start-view description without inventing a start-frame reference when none exists.
 - "preserves_target_reference_grounding": true only if objects or regions approached, revealed, passed, or turned toward are wired to supporting reference images when such images exist.
 - "uses_reference_images_when_helpful": true only if the prompt uses reference images naturally when they help identify the start view, target object, emphasized region, or layout.
 - "uses_multiple_references_when_clearly_helpful": true only if the prompt uses multiple reference images when that materially improves grounding of the start view, target object, or layout.
