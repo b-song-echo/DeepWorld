@@ -13,13 +13,13 @@ export TOKENIZERS_PARALLELISM=false
 python "$SCRIPT" \
 	--scannetpp_root "$SCANNETPP_ROOT" \
 	--output_root "$OUTPUT_ROOT" \
-	--num_processes 1 \
+	--num_processes 2 \
 	--seed 20021021 \
 	--split train \
 	--num_samples 10000 \
-	--clip_seconds 20.0 \
-	--max_ref_images 5 \
-	--pose_pool_multiplier 4 \
+	--clip_seconds 10.0 \
+	--max_ref_images 4 \
+	--pose_pool_multiplier 5 \
 	--include_start_frame_prob 0.35 \
 	--vlm_backend_path "$VLM_BACKBONE_PATH" \
 	--llm_backend_path "$LLM_BACKBONE_PATH" \
@@ -45,11 +45,11 @@ python "$SCRIPT" \
 	--critic_judging_llm_max_new_tokens 1024 \
 	--distillation_llm_temperature 0.15 \
 	--distillation_llm_max_new_tokens 1024 \
-	--filter_pixel_valid_fraction_min 0.95 \
-	--filter_pose_valid_fraction_min 0.90 \
-	--filter_motion_amount_min 4.0 \
-	--filter_motion_amount_max 20.0 \
-	--filter_motion_unsteadiness_max 2.0 \
+	--filter_pixel_valid_fraction_min 0.9 \
+	--filter_pose_valid_fraction_min 0.9 \
+	--filter_motion_amount_min 2.0 \
+	--filter_motion_amount_max 10.0 \
+	--filter_motion_unsteadiness_max 1.6 \
 	--filter_dslr_brisque_score_max 50.0 \
-	--filter_quality_score_min 0.7 \
+	--filter_quality_score_min 0.8 \
 	"$@"
