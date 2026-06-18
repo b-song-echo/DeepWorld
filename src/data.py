@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 
 from src.config import DatasetConfig
 from src.utils import (
+	center_crop_and_resize,
 	center_crop_to_aspect,
 	load_image,
 	load_video_frames,
@@ -208,8 +209,9 @@ def build_dataset(config: DatasetConfig) -> Dataset:
 	return WorldDataset(config)
 
 
-class WorldModelBatchCollator:
-	"""Collate raw samples into the three model-specific input views.
+# TODO: For DeepWorldQW, you can also assume that the batch size will always be one, then perhaps the logic can be simplified a lot, and the two collators can even share some logic (subclassing a shared base collator or using exactly the same collator),
+class DeepWorldQWBatchCollator:
+	"""Collate raw samples into the Qwen/Wan model-specific input views.
 
 	The collator prepares:
 
@@ -220,7 +222,7 @@ class WorldModelBatchCollator:
 	"""
 
 	def __init__(self, dataset_config: DatasetConfig, tokenizer, image_processor, geo_patch_size: int):
-		"""Create the collator.
+		"""Create the QW collator.
 
 		Args:
 			dataset_config: Dataset section of the root config.
@@ -330,6 +332,120 @@ class WorldModelBatchCollator:
 			"vis_ref_counts": vis_ref_counts,
 			"geo_images": geo_images,
 			"reference_mask": reference_mask,
+			"videos": videos,
+			"video_frame_counts": frame_counts,
+		}
+
+
+class DeepWorldHYBatchCollator:
+	"""Collate curated samples for the Hunyuan/VGGT three-stream world model.
+
+	The Hunyuan path keeps reference-image views separate because each frozen
+	encoder has different resolution and value-range expectations:
+
+	- `semantic_ref_images`: SigLIP-sized tensors in `[0, 1]`,
+	- `geo_images`: VGGT-sized tensors in `[0, 1]`,
+	- `reference_vae_images`: Hunyuan-VAE-sized tensors in `[-1, 1]`.
+
+	Local batch size is expected to be 1 for training, but the collator pads the
+	reference-image dimension so evaluation and smoke tests can still build
+	rectangular tensors.
+	"""
+
+	def __init__(self, dataset_config: DatasetConfig, geo_patch_size: int):
+		"""Create the Hunyuan collator.
+
+		Args:
+			dataset_config: Dataset section of the root config.
+			geo_patch_size: VGGT patch size used to validate geometry image resolution.
+		"""
+
+		self.dataset_config = dataset_config
+		self.geo_patch_size = geo_patch_size
+		self.geo_image_size = resolve_geo_image_size(dataset_config, geo_patch_size)
+
+	def _build_reference_views(
+		self,
+		samples: list[WorldModelSample],
+	) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+		"""Prepare padded reference-image tensors for all frozen encoders.
+
+		Args:
+			samples: Batch of raw samples.
+
+		Returns:
+			A tuple containing semantic, geometry, VAE, mask, and per-sample count tensors.
+		"""
+
+		max_refs = max(len(sample.reference_images) for sample in samples)
+		batch_size = len(samples)
+		vis_size = self.dataset_config.vis_image_size
+		geo_size = self.geo_image_size
+		vae_height = self.dataset_config.video_height
+		vae_width = self.dataset_config.video_width
+
+		semantic_ref_images = torch.zeros(batch_size, max_refs, 3, vis_size, vis_size, dtype=torch.float32)
+		geo_images = torch.zeros(batch_size, max_refs, 3, geo_size, geo_size, dtype=torch.float32)
+		reference_vae_images = torch.zeros(batch_size, max_refs, 3, vae_height, vae_width, dtype=torch.float32)
+		reference_mask = torch.zeros(batch_size, max_refs, dtype=torch.bool)
+		reference_counts = torch.zeros(batch_size, dtype=torch.long)
+
+		for batch_index, sample in enumerate(samples):
+			reference_counts[batch_index] = len(sample.reference_images)
+			for ref_index, image in enumerate(sample.reference_images):
+				semantic_image = center_crop_and_resize(image, vis_size, vis_size)
+				geo_image = center_crop_and_resize(image, geo_size, geo_size)
+				vae_image = center_crop_and_resize(image, vae_height, vae_width)
+
+				semantic_ref_images[batch_index, ref_index] = pil_to_tensor(
+					semantic_image,
+					normalize_to_neg_one=False,
+				)
+				geo_images[batch_index, ref_index] = pil_to_tensor(
+					geo_image,
+					normalize_to_neg_one=False,
+				)
+				reference_vae_images[batch_index, ref_index] = pil_to_tensor(
+					vae_image,
+					normalize_to_neg_one=True,
+				)
+				reference_mask[batch_index, ref_index] = True
+
+		return semantic_ref_images, geo_images, reference_vae_images, reference_mask, reference_counts
+
+	def _pad_videos(self, samples: list[WorldModelSample]) -> tuple[Tensor, Tensor]:
+		"""Pad variable-length videos to the longest clip in the batch."""
+
+		max_frames = max(sample.video.size(0) for sample in samples)
+		height = samples[0].video.size(-2)
+		width = samples[0].video.size(-1)
+		videos = torch.zeros(len(samples), 3, max_frames, height, width, dtype=torch.float32)
+		frame_counts = torch.zeros(len(samples), dtype=torch.long)
+
+		for batch_index, sample in enumerate(samples):
+			video = sample.video
+			num_frames = video.size(0)
+			frame_counts[batch_index] = num_frames
+			videos[batch_index, :, :num_frames] = video.permute(1, 0, 2, 3)
+			if num_frames < max_frames:
+				videos[batch_index, :, num_frames:] = video[-1:].permute(1, 0, 2, 3)
+
+		return videos, frame_counts
+
+	def __call__(self, samples: list[WorldModelSample]) -> dict[str, Tensor | list[str]]:
+		"""Collate raw samples into the Hunyuan world-model training batch."""
+
+		semantic_ref_images, geo_images, reference_vae_images, reference_mask, reference_counts = self._build_reference_views(samples)
+		videos, frame_counts = self._pad_videos(samples)
+
+		return {
+			"sample_ids": [sample.sample_id for sample in samples],
+			"prompts": [sample.prompt for sample in samples],
+			"semantic_ref_images": semantic_ref_images,
+			"geo_images": geo_images,
+			"reference_vae_images": reference_vae_images,
+			"reference_mask": reference_mask,
+			"reference_counts": reference_counts,
 			"videos": videos,
 			"video_frame_counts": frame_counts,
 		}

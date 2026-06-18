@@ -1,0 +1,85 @@
+# TODO: Based on the officially recommended training configurations, and my specific model architecture and data/task, update the configs to the most recommended values.
+dataset:
+  manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/DeepWorld/manifest_train.jsonl
+  eval_manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/DeepWorld/manifest_val.jsonl
+  data_root: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/DeepWorld
+  num_samples: 0
+  video_width: 480
+  video_height: 480
+  video_fps: 24
+  video_duration: 10.0
+  prompt_rich_prob: 0.5
+  prompt_medium_prob: 0.3
+  prompt_coarse_prob: 0.2
+  vis_image_size: 384
+  geo_image_size: 448
+  max_text_length: 512
+  shuffle: true
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+optimizer:
+  learning_rate: 1.0e-05
+  lr_schedule: cosine
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  max_grad_norm: 1.0
+  warmup_steps: 500
+  transformer_learning_rate: 1.0e-05
+  geometry_learning_rate: 5.0e-05
+  projector_learning_rate: 5.0e-05
+training:
+  output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/hunyuan_world
+  seed: 20021021
+  max_total_epochs: 30
+  max_total_steps: null
+  per_device_batch_size: 1
+  sequence_parallel_size: 8
+  data_parallel_replicate: 1
+  gradient_accumulation_steps: 4
+  log_every: 10
+  save_every: 1000
+  eval_num_samples: 0
+  mixed_precision: bf16
+  use_fsdp: true
+  gradient_checkpointing: true
+  pretrained_model_path: null
+flow_matching:
+  num_train_timesteps: 1000
+  train_timestep_shift: 3.0
+  validation_timestep_shift: 5.0
+  snr_type: lognorm
+model:
+  checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/HunyuanVideo-1.5
+  transformer_version: 480p_i2v
+  transformer_dtype: bfloat16
+  vae_dtype: float16
+  vggt_checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/VGGT-1B
+  vggt_dtype: null
+  attention_mode: flash
+  condition_dropout_prob: 0.1
+  use_reference_vae_tokens: true
+  use_siglip_tokens: true
+  use_geometry_tokens: true
+  use_text_tokens: true
+  lora_rank: 16
+  lora_alpha: null
+  lora_dropout: 0.05
+  lora_target_modules:
+  - img_attn_q
+  - img_attn_k
+  - img_attn_v
+  - img_attn_proj
+  - txt_attn_q
+  - txt_attn_k
+  - txt_attn_v
+  - txt_attn_proj
+  - linear1_q
+  - linear1_k
+  - linear1_v
+  geo_stream_init: copy_image
+  guidance: 6016.0

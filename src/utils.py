@@ -1,11 +1,16 @@
+import json
 import os
 import random
 import tempfile
+import warnings
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from typing import Any, TextIO
 
 import imageio.v3 as iio
 import numpy as np
 import torch
+import yaml
 from PIL import Image
 from torch import Tensor
 
@@ -20,6 +25,116 @@ def get_world_size() -> int:
 	if torch.distributed.is_available() and torch.distributed.is_initialized():
 		return max(int(torch.distributed.get_world_size()), 1)
 	return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
+
+
+def configure_offline_runtime() -> None:
+	"""Apply process-wide defaults for offline, CUDA-oriented training runs."""
+
+	# TODO: Since these are set here, there is no need to set them repeatedly in the bash script. Check the entire codebase for redundant code and remove them. For example, if the configuration values are checked at data class post initialization, there is no need to recheck them again and again when using them. This can also be used in `synthesize.py`, then these environment variables do not need to be set in bash scripts.
+	os.environ.setdefault("HF_HUB_OFFLINE", "1")
+	os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+	os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+	os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+	warnings.filterwarnings("ignore")
+	try:
+		from diffusers.utils import logging
+		logging.set_verbosity_error()
+	except Exception:
+		pass
+
+	torch.multiprocessing.set_sharing_strategy("file_system")
+	if torch.cuda.is_available():
+		torch.backends.cuda.matmul.allow_tf32 = True
+		torch.backends.cudnn.allow_tf32 = True
+		torch.backends.cudnn.benchmark = False
+		torch.backends.cudnn.deterministic = False
+
+
+def seed_python_and_torch(seed: int) -> None:
+	"""Seed Python and torch RNGs for a single process."""
+
+	random.seed(seed)
+	torch.manual_seed(seed)
+	if torch.cuda.is_available():
+		torch.cuda.manual_seed_all(seed)
+
+
+def save_config_yaml(config: Any, output_dir: str | Path, filename: str = "configs.yaml") -> None:
+	"""Write a dataclass or mapping config snapshot into a run directory."""
+
+	output_dir = Path(output_dir)
+	output_dir.mkdir(parents=True, exist_ok=True)
+	payload = asdict(config) if is_dataclass(config) else config
+	with (output_dir / filename).open("w", encoding="utf-8") as handle:
+		yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def open_rank0_jsonl_log(output_dir: str | Path, is_main_process: bool) -> TextIO | None:
+	"""Open the rank-0 JSONL metrics log, returning `None` on non-main ranks."""
+
+	if not is_main_process:
+		return None
+	output_dir = Path(output_dir)
+	output_dir.mkdir(parents=True, exist_ok=True)
+	return (output_dir / "logs.jsonl").open("a", encoding="utf-8", buffering=1)
+
+
+def write_jsonl_log(handle: TextIO | None, payload: dict[str, Any]) -> None:
+	"""Append one JSONL metrics event and force it to disk."""
+
+	if handle is None:
+		return
+	handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+	handle.flush()
+	os.fsync(handle.fileno())
+
+
+def read_json_file(path: str | Path) -> Any:
+	"""Read one JSON file."""
+
+	with Path(path).open("r", encoding="utf-8") as handle:
+		return json.load(handle)
+
+
+def write_json_file(path: str | Path, payload: Any) -> None:
+	"""Write one formatted JSON file."""
+
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("w", encoding="utf-8") as handle:
+		json.dump(payload, handle, indent=2, ensure_ascii=False)
+		handle.write("\n")
+
+
+def read_jsonl_file(path: str | Path, require_objects: bool = True) -> list[dict[str, Any]]:
+	"""Read one JSONL file into entry dictionaries."""
+
+	path = Path(path)
+	if not path.exists():
+		return []
+	entries: list[dict[str, Any]] = []
+	with path.open("r", encoding="utf-8") as handle:
+		for line_index, line in enumerate(handle, start=1):
+			if not line.strip():
+				continue
+			entry = json.loads(line)
+			if require_objects and not isinstance(entry, dict):
+				raise ValueError(f"JSONL entry {path}:{line_index} is not a JSON object.")
+			entries.append(entry)
+	return entries
+
+
+def write_jsonl_file(path: str | Path, *payload: dict[str, Any], append: bool = True) -> None:
+	"""Write or append JSONL entries and force them to disk."""
+
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("a" if append else "w", encoding="utf-8", buffering=1) as handle:
+		for entry in payload:
+			handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+		handle.flush()
+		os.fsync(handle.fileno())
 
 
 def resolve_torch_dtype(name: str | None) -> torch.dtype | None:

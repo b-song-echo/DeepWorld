@@ -39,6 +39,13 @@ from src.prompts import (
 	MOTION_DIGESTING_TEMPLATE,
 	VIDEO_CAPTIONING_TEMPLATE,
 )
+# TODO: Why not simply use the original names?
+from src.utils import (
+	read_json_file as read_json,
+	read_jsonl_file as read_jsonl,
+	write_json_file as write_json,
+	write_jsonl_file as write_jsonl,
+)
 
 
 class RejectedSample(Exception):
@@ -345,54 +352,6 @@ def exclusive_lock(args: Namespace) -> FileLock:
 	path = output_root(args) / "runtime_lock.lock"
 	path.parent.mkdir(parents=True, exist_ok=True)
 	return FileLock(str(path))
-
-
-def read_json(path: Path) -> Any:
-	"""Read one JSON file."""
-
-	with path.open("r", encoding="utf-8") as handle:
-		return json.load(handle)
-
-
-def write_json(path: Path, payload: Any) -> None:
-	"""Write one formatted JSON file."""
-
-	path.parent.mkdir(parents=True, exist_ok=True)
-	with path.open("w", encoding="utf-8") as f:
-		json.dump(payload, f, indent=2, ensure_ascii=False)
-		f.write("\n")
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-	"""Read one JSONL into entry dictionaries."""
-
-	if not path.exists():
-		return []
-	entries: list[dict[str, Any]] = []
-	with path.open("r", encoding="utf-8") as f:
-		for i, line in enumerate(f, start=1):
-			if not line.strip():
-				continue
-			entry = json.loads(line)
-			if not isinstance(entry, dict):
-				raise ValueError(f"Manifest entry {path}:{i} is not a JSON object.")
-			entries.append(entry)
-	return entries
-
-
-def write_jsonl(
-	path: Path,
-	*payload: dict[str, Any],
-	append=True
-) -> None:
-	"""Write/append JSONL entries and fsync it."""
-
-	path.parent.mkdir(parents=True, exist_ok=True)
-	with path.open("a" if append else "w", encoding="utf-8", buffering=1) as f:
-		for entry in payload:
-			f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
-		f.flush()
-		os.fsync(f.fileno())
 
 
 class DataSamplingStage:

@@ -5,45 +5,15 @@ from typing import Any, Dict, List, Type, TypeVar
 import yaml
 
 
-def _resolve_lora_alpha(alpha: int | None, rank: int) -> int:
-	"""Resolve a LoRA alpha value, defaulting to `2 * rank` when omitted.
-
-	Args:
-		alpha: Optional configured LoRA alpha value.
-		rank: LoRA rank used by the same adapter.
-
-	Returns:
-		The explicit alpha value, or the conventional `2 * rank` default.
-	"""
+def resolve_lora_alpha(alpha: int | None, rank: int) -> int:
+	"""Resolve a LoRA alpha value, defaulting to `2 * rank` when omitted."""
 
 	return 2 * rank if alpha is None else int(alpha)
 
 
 @dataclass
 class DatasetConfig:
-	"""Dataset and dataloader settings for world-model training.
-
-	Attributes:
-		manifest_path: JSONL manifest describing the generated training split.
-		eval_manifest_path: JSONL manifest describing the generated validation split.
-		data_root: Optional root used to resolve relative sample paths. If omitted, the manifest directory is used.
-		num_samples: Optional deterministic per-epoch sample cap. `0` means all records.
-		video_width: Spatial width used for GT video training clips and square reference preprocessing.
-		video_height: Spatial height used for GT video training clips and square reference preprocessing.
-		video_fps: Uniform FPS used to sample frames from each curated GT clip.
-		video_duration: Duration in seconds represented by the curated clip.
-		prompt_rich_prob: Probability of using the full synthesized prompt.
-		prompt_medium_prob: Probability of using the medium distilled prompt.
-		prompt_coarse_prob: Probability of using the coarse distilled prompt.
-		vis_image_size: Square reference-image size used for Qwen's visual encoder.
-		geo_image_size: Optional square reference-image size used for VGGT. If omitted, it is derived from `vis_image_size` by rounding down to a multiple of VGGT's patch size.
-		max_text_length: Maximum prompt token length after tokenization.
-		shuffle: Whether to use randomized temporal clips during training.
-		num_workers: Number of dataloader workers.
-		prefetch_factor: Number of batches loaded in advance by each worker.
-		pin_memory: Whether to enable pinned-memory dataloader buffers.
-		persistent_workers: Whether worker processes should stay alive across epochs.
-	"""
+	"""Dataset and dataloader settings shared by all world models."""
 
 	manifest_path: str = ""
 	eval_manifest_path: str = ""
@@ -71,7 +41,10 @@ class DatasetConfig:
 		if self.num_samples < 0:
 			raise ValueError(f"`dataset.num_samples` must be non-negative, got {self.num_samples}.")
 		if self.video_width <= 0 or self.video_height <= 0:
-			raise ValueError(f"`dataset.width` and `dataset.height` must be positive, got {(self.video_width, self.video_height)}.")
+			raise ValueError(
+				"`dataset.video_width` and `dataset.video_height` must be positive, "
+				f"got {(self.video_width, self.video_height)}."
+			)
 		if self.video_fps <= 0:
 			raise ValueError(f"`dataset.video_fps` must be positive, got {self.video_fps}.")
 		if self.video_duration <= 0:
@@ -90,34 +63,72 @@ class DatasetConfig:
 
 	@property
 	def video_num_frames(self) -> int:
-		"""Return the Wan-aligned endpoint-inclusive frame count for the clip."""
+		"""Return the endpoint-inclusive frame count for the configured clip."""
 
 		return int(round(self.video_fps * self.video_duration)) + 1
 
 
 @dataclass
-class OptimizerConfig:
-	"""Optimizer and LR-schedule hyperparameters.
+class TrainingConfig:
+	"""Training orchestration shared by all world models."""
 
-	Attributes:
-		learning_rate: Base learning rate used by AdamW.
-		brain_language_model_learning_rate: Learning rate for trainable Qwen language-model parameters. If omitted, defaults to `learning_rate`.
-		brain_others_learning_rate: Learning rate for other trainable brain parameters. If omitted, defaults to `brain_language_model_learning_rate`.
-		renderer_transformer_learning_rate: Learning rate for trainable Wan transformer parameters. If omitted, defaults to `learning_rate`.
-		renderer_others_learning_rate: Learning rate for other trainable renderer parameters. If omitted, defaults to `renderer_transformer_learning_rate`.
-		lr_schedule: Learning-rate schedule after warmup, either `cosine` or `constant`.
-		weight_decay: Weight decay coefficient.
-		betas: Adam beta coefficients.
-		eps: Adam epsilon.
-		max_grad_norm: Gradient clipping threshold applied after accumulation.
-		warmup_steps: Number of warmup steps before the requested post-warmup schedule.
-	"""
+	output_dir: str = "outputs/world_model"
+	seed: int = 42
+	max_total_epochs: int | None = 10
+	max_total_steps: int | None = None
+	per_device_batch_size: int = 1
+	sequence_parallel_size: int = 1
+	data_parallel_replicate: int = 1
+	gradient_accumulation_steps: int = 1
+	log_every: int = 10
+	save_every: int = 1000
+	eval_num_samples: int = 0
+	mixed_precision: str = "bf16"
+	use_fsdp: bool = True
+	gradient_checkpointing: bool = True
+	pretrained_model_path: str | None = None
+	
+	def __post_init__(self) -> None:
+		"""Validate bounded stopping and distributed orchestration settings."""
+
+		if self.max_total_epochs is None and self.max_total_steps is None:
+			raise ValueError("At least one of `training.max_total_epochs` or `training.max_total_steps` must be set.")
+		if self.max_total_epochs is not None and self.max_total_epochs <= 0:
+			raise ValueError(
+				f"`training.max_total_epochs` must be positive when set, got {self.max_total_epochs}."
+			)
+		if self.max_total_steps is not None and self.max_total_steps <= 0:
+			raise ValueError(
+				f"`training.max_total_steps` must be positive when set, got {self.max_total_steps}."
+			)
+		if self.per_device_batch_size < 1:
+			raise ValueError(
+				f"`training.per_device_batch_size` must be at least 1, got {self.per_device_batch_size}."
+			)
+		if self.sequence_parallel_size < 1:
+			raise ValueError(
+				"`training.sequence_parallel_size` must be at least 1, "
+				f"got {self.sequence_parallel_size}."
+			)
+		if self.data_parallel_replicate < 1 and self.data_parallel_replicate != -1:
+			raise ValueError(
+				"`training.data_parallel_replicate` must be positive or -1, "
+				f"got {self.data_parallel_replicate}."
+			)
+		if self.gradient_accumulation_steps < 1:
+			raise ValueError(
+				"`training.gradient_accumulation_steps` must be at least 1, "
+				f"got {self.gradient_accumulation_steps}."
+			)
+		if self.eval_num_samples < 0:
+			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
+
+
+@dataclass
+class OptimizerConfig:
+	"""Optimizer and LR-schedule settings shared by all world models."""
 
 	learning_rate: float = 2e-5
-	brain_language_model_learning_rate: float | None = None
-	brain_others_learning_rate: float | None = None
-	renderer_transformer_learning_rate: float | None = None
-	renderer_others_learning_rate: float | None = None
 	lr_schedule: str = "cosine"
 	weight_decay: float = 1e-2
 	betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
@@ -134,89 +145,29 @@ class OptimizerConfig:
 
 
 @dataclass
-class TrainingConfig:
-	"""Top-level training loop configuration.
+class DeepWorldQWOptimizerConfig(OptimizerConfig):
+	"""Optimizer settings specific to the Qwen/Wan DeepWorld variant."""
 
-	Attributes:
-		output_dir: Directory used for logs and checkpoints.
-		seed: Global random seed.
-		max_total_epochs: Optional maximum number of epochs to train.
-		max_total_steps: Optional maximum number of optimizer steps to train.
-		per_device_batch_size: Batch size on each process/GPU.
-		renderer_batch_multiplier: Number of independent diffusion timesteps to train per encoded video.
-		gradient_accumulation_steps: Number of steps to accumulate before optimizer update.
-		log_every: Logging interval in optimizer steps.
-		save_every: Checkpoint interval in optimizer steps.
-		eval_num_samples: Number of training-set samples to generate before each checkpoint save. `0` disables evaluation generation.
-		mixed_precision: Accelerate precision mode such as `bf16`.
-		use_fsdp: Whether multi-process training should use FSDP instead of DDP.
-		gradient_checkpointing: Whether model submodules enable checkpointing when supported.
-		pretrained_model_path: Optional path to a saved `model.pt` state dict to load before training.
-	"""
-
-	output_dir: str = "outputs/world_model"
-	seed: int = 42
-	max_total_epochs: int | None = 10
-	max_total_steps: int | None = None
-	per_device_batch_size: int = 1
-	renderer_batch_multiplier: int = 1
-	gradient_accumulation_steps: int = 1
-	log_every: int = 10
-	save_every: int = 1000
-	eval_num_samples: int = 0
-	mixed_precision: str = "bf16"
-	use_fsdp: bool = True
-	gradient_checkpointing: bool = True
-	pretrained_model_path: str | None = None
-
-	def __post_init__(self) -> None:
-		"""Validate training-loop settings and bounded stopping criteria."""
-
-		if self.max_total_epochs is None and self.max_total_steps is None:
-			raise ValueError("At least one of `training.max_total_epochs` or `training.max_total_steps` must be set.")
-		if self.max_total_epochs is not None and self.max_total_epochs <= 0:
-			raise ValueError(
-				f"`training.max_total_epochs` must be positive when set, got {self.max_total_epochs}."
-			)
-		if self.max_total_steps is not None and self.max_total_steps <= 0:
-			raise ValueError(
-				f"`training.max_total_steps` must be positive when set, got {self.max_total_steps}."
-			)
-		if self.per_device_batch_size < 1:
-			raise ValueError(
-				f"`training.per_device_batch_size` must be at least 1, got {self.per_device_batch_size}."
-			)
-		if self.renderer_batch_multiplier < 1:
-			raise ValueError(
-				f"`training.renderer_batch_multiplier` must be at least 1, got {self.renderer_batch_multiplier}."
-			)
-		if self.gradient_accumulation_steps < 1:
-			raise ValueError(
-				"`training.gradient_accumulation_steps` must be at least 1, "
-				f"got {self.gradient_accumulation_steps}."
-			)
-		if self.eval_num_samples < 0:
-			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
+	brain_language_model_learning_rate: float | None = None
+	brain_others_learning_rate: float | None = None
+	renderer_transformer_learning_rate: float | None = None
+	renderer_others_learning_rate: float | None = None
 
 
 @dataclass
-class QwenBrainConfig:
-	"""Configuration for the Qwen brain branch.
+class DeepWorldHYOptimizerConfig(OptimizerConfig):
+	"""Optimizer settings specific to the Hunyuan DeepWorld variant."""
 
-	Attributes:
-		checkpoint_path: Local path to the Qwen3-VL checkpoint directory.
-		transformer_dtype: Requested Qwen language/vision load dtype. If omitted, the checkpoint default is used.
-		vggt_checkpoint_path: Local path to the VGGT checkpoint directory.
-		vggt_dtype: Optional dtype applied to VGGT after loading. If omitted, the checkpoint default is used.
-		lora_rank: LoRA rank used for language-model attention projections.
-		lora_alpha: Optional LoRA scaling factor. If omitted, defaults to `2 * lora_rank`.
-		lora_dropout: LoRA dropout probability.
-		lora_target_modules: Linear module names that should receive LoRA adapters.
-		routed_ffn_mode: Training mode for the three modality FFNs, either `full` or `lora`.
-		routed_ffn_lora_rank: LoRA rank used when `routed_ffn_mode=lora`.
-		routed_ffn_lora_alpha: Optional LoRA scaling factor for routed FFNs. If omitted, defaults to `2 * routed_ffn_lora_rank`.
-		routed_ffn_lora_dropout: LoRA dropout probability for routed FFNs.
-	"""
+	# TODO: This should be called `adapter_learning_rate`
+	transformer_learning_rate: float | None = None
+	# TODO: This should be called `geo_stream_learning_rate`
+	geometry_learning_rate: float | None = None
+	projector_learning_rate: float | None = None
+
+
+@dataclass
+class DeepWorldQWBrainConfig:
+	"""Configuration for the DeepWorldQW Qwen/VGGT conditioning branch."""
 
 	checkpoint_path: str = "checkpoints/Qwen3-VL-8B-Instruct"
 	transformer_dtype: str | None = "bfloat16"
@@ -232,29 +183,15 @@ class QwenBrainConfig:
 	routed_ffn_lora_dropout: float = 0.05
 
 	def __post_init__(self) -> None:
-		self.lora_alpha = _resolve_lora_alpha(self.lora_alpha, self.lora_rank)
-		self.routed_ffn_lora_alpha = _resolve_lora_alpha(self.routed_ffn_lora_alpha, self.routed_ffn_lora_rank)
+		"""Resolve default LoRA scaling values."""
+
+		self.lora_alpha = resolve_lora_alpha(self.lora_alpha, self.lora_rank)
+		self.routed_ffn_lora_alpha = resolve_lora_alpha(self.routed_ffn_lora_alpha, self.routed_ffn_lora_rank)
 
 
 @dataclass
-class WanRendererConfig:
-	"""Configuration for the Wan renderer branch.
-
-	Attributes:
-		checkpoint_path: Local path to the Wan diffusers checkpoint directory.
-		transformer_dtype: Requested Wan transformer load dtype. If omitted, the checkpoint default is used.
-		vae_dtype: Optional Wan VAE load dtype. If omitted, the checkpoint default is used.
-		vae_enable_slicing: Whether to enable diffusers VAE slicing for lower memory use.
-		vae_enable_tiling: Whether to enable diffusers VAE tiling for lower memory use.
-		vae_sample_posterior: Whether the frozen VAE samples from the latent posterior during training instead of using its mode.
-		condition_injection_mode: How Qwen states condition Wan, either `input_addition` or `cross_attention`.
-		condition_proj_init: Initialization strategy for Qwen-to-Wan conditioning projection, either `zero`, `normal`, or `default`.
-		condition_proj_init_std: Optional standard deviation used when `condition_proj_init=normal`. If omitted, defaults to `1e-3`.
-		condition_dropout_prob: Per-renderer-sample probability of replacing all conditioning tokens with the learned null condition during training.
-		train_scheduler_steps: Number of training diffusion timesteps. If omitted,
-			inferred from the checkpoint scheduler config when available.
-		inference_steps: Default number of denoising steps during sampling.
-	"""
+class DeepWorldQWRendererConfig:
+	"""Configuration for the DeepWorldQW Wan renderer branch."""
 
 	checkpoint_path: str = "checkpoints/Wan2.2-TI2V-5B-Diffusers"
 	transformer_dtype: str | None = "bfloat16"
@@ -268,6 +205,7 @@ class WanRendererConfig:
 	condition_dropout_prob: float = 0.1
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
+	batch_multiplier: int = 1
 
 	def __post_init__(self) -> None:
 		"""Validate Wan renderer training and initialization settings."""
@@ -275,53 +213,150 @@ class WanRendererConfig:
 		self.condition_injection_mode = self.condition_injection_mode.lower()
 		if self.condition_injection_mode not in {"input_addition", "cross_attention"}:
 			raise ValueError(
-				"`wan_renderer.condition_injection_mode` must be `input_addition` or `cross_attention`, "
+				"`renderer.condition_injection_mode` must be `input_addition` or `cross_attention`, "
 				f"got {self.condition_injection_mode!r}."
 			)
 		self.condition_proj_init = self.condition_proj_init.lower()
 		if self.condition_proj_init not in {"zero", "normal", "default"}:
 			raise ValueError(
-				"`wan_renderer.condition_proj_init` must be `zero`, `normal`, or `default`, "
+				"`renderer.condition_proj_init` must be `zero`, `normal`, or `default`, "
 				f"got {self.condition_proj_init!r}."
 			)
 		if self.condition_proj_init == "normal" and self.condition_proj_init_std is None:
 			self.condition_proj_init_std = 1e-3
 		if self.condition_proj_init_std is not None and self.condition_proj_init_std <= 0:
 			raise ValueError(
-				"`wan_renderer.condition_proj_init_std` must be positive, "
+				"`renderer.condition_proj_init_std` must be positive, "
 				f"got {self.condition_proj_init_std}."
 			)
 		if not 0.0 <= self.condition_dropout_prob <= 1.0:
 			raise ValueError(
-				"`wan_renderer.condition_dropout_prob` must be in [0, 1], "
+				"`renderer.condition_dropout_prob` must be in [0, 1], "
 				f"got {self.condition_dropout_prob}."
+			)
+		if self.batch_multiplier < 1:
+			raise ValueError(
+				"`renderer.batch_multiplier` must be at least 1, "
+				f"got {self.batch_multiplier}."
 			)
 
 
 @dataclass
-class WorldModelConfig:
-	"""Root configuration object used by the prototype."""
+class DeepWorldHYFlowMatchingConfig:
+	"""Flow-matching schedule used by DeepWorldHY training."""
+
+	# TODO: This is part of the model configuration. There is no need for a separate config class.
+	num_train_timesteps: int = 1000
+	train_timestep_shift: float = 3.0
+	validation_timestep_shift: float = 5.0
+	snr_type: str = "lognorm"
+
+	def __post_init__(self) -> None:
+		"""Validate flow-matching schedule settings."""
+
+		self.snr_type = self.snr_type.lower()
+		if self.num_train_timesteps <= 0:
+			raise ValueError(
+				"`flow_matching.num_train_timesteps` must be positive, "
+				f"got {self.num_train_timesteps}."
+			)
+		if self.train_timestep_shift <= 0:
+			raise ValueError(
+				"`flow_matching.train_timestep_shift` must be positive, "
+				f"got {self.train_timestep_shift}."
+			)
+		if self.validation_timestep_shift <= 0:
+			raise ValueError(
+				"`flow_matching.validation_timestep_shift` must be positive, "
+				f"got {self.validation_timestep_shift}."
+			)
+		if self.snr_type not in {"uniform", "lognorm", "mix", "mode"}:
+			raise ValueError(
+				"`flow_matching.snr_type` must be one of `uniform`, `lognorm`, `mix`, or `mode`, "
+				f"got {self.snr_type!r}."
+			)
+
+
+@dataclass
+class DeepWorldHYModelConfig:
+	"""Model architecture and checkpoint settings for DeepWorldHY."""
+
+	checkpoint_path: str = "checkpoints/HunyuanVideo-1.5"
+	transformer_version: str = "480p_i2v"
+	transformer_dtype: str | None = "bfloat16"
+	vae_dtype: str | None = "float16"
+	vggt_checkpoint_path: str = "checkpoints/VGGT-1B"
+	vggt_dtype: str | None = None
+	attention_mode: str = "flash"
+	condition_dropout_prob: float = 0.1
+	# TODO: Call the following configs as `use_vae_tokens`, `use_vis_tokens`, `use_geo_tokens`, `use_txt_tokens` respectively.
+	use_reference_vae_tokens: bool = True
+	use_siglip_tokens: bool = True
+	use_geometry_tokens: bool = True
+	use_text_tokens: bool = True
+	lora_rank: int = 16
+	lora_alpha: int | None = None
+	lora_dropout: float = 0.05
+	lora_target_modules: List[str] = field(default_factory=lambda: [
+		"img_attn_q", "img_attn_k", "img_attn_v", "img_attn_proj",
+		"txt_attn_q", "txt_attn_k", "txt_attn_v", "txt_attn_proj",
+		"linear1_q", "linear1_k", "linear1_v",
+	])
+	geo_stream_init: str = "copy_image"
+	guidance: float = 6016.0
+
+	def __post_init__(self) -> None:
+		"""Validate DeepWorldHY model settings."""
+
+		self.lora_alpha = resolve_lora_alpha(self.lora_alpha, self.lora_rank)
+		self.attention_mode = self.attention_mode.lower()
+		self.geo_stream_init = self.geo_stream_init.lower()
+		if self.attention_mode == "flex-block-attn":
+			raise ValueError(
+				"`model.attention_mode=flex-block-attn` is not supported because "
+				"reference and geometry tokens break the pretrained 3D sparse mask layout."
+			)
+		if not 0.0 <= self.condition_dropout_prob <= 1.0:
+			raise ValueError(
+				"`model.condition_dropout_prob` must be in [0, 1], "
+				f"got {self.condition_dropout_prob}."
+			)
+		if self.lora_rank <= 0:
+			raise ValueError(f"`model.lora_rank` must be positive, got {self.lora_rank}.")
+		if self.geo_stream_init not in {"copy_image", "fresh"}:
+			raise ValueError(
+				"`model.geo_stream_init` must be either `copy_image` or `fresh`, "
+				f"got {self.geo_stream_init!r}."
+			)
+
+
+@dataclass
+class DeepWorldQWConfig:
+	"""Final composed config for the Qwen/Wan DeepWorld variant."""
 
 	dataset: DatasetConfig = field(default_factory=DatasetConfig)
-	optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+	optimizer: DeepWorldQWOptimizerConfig = field(default_factory=DeepWorldQWOptimizerConfig)
 	training: TrainingConfig = field(default_factory=TrainingConfig)
-	qwen_brain: QwenBrainConfig = field(default_factory=QwenBrainConfig)
-	wan_renderer: WanRendererConfig = field(default_factory=WanRendererConfig)
+	brain: DeepWorldQWBrainConfig = field(default_factory=DeepWorldQWBrainConfig)
+	renderer: DeepWorldQWRendererConfig = field(default_factory=DeepWorldQWRendererConfig)
+
+
+@dataclass
+class DeepWorldHYConfig:
+	"""Final composed config for the Hunyuan DeepWorld variant."""
+
+	dataset: DatasetConfig = field(default_factory=DatasetConfig)
+	optimizer: DeepWorldHYOptimizerConfig = field(default_factory=DeepWorldHYOptimizerConfig)
+	training: TrainingConfig = field(default_factory=TrainingConfig)
+	flow_matching: DeepWorldHYFlowMatchingConfig = field(default_factory=DeepWorldHYFlowMatchingConfig)
+	model: DeepWorldHYModelConfig = field(default_factory=DeepWorldHYModelConfig)
 
 
 T = TypeVar("T")
 
 
-def _dataclass_from_dict(cls: Type[T], payload: Dict[str, Any]) -> T:
-	"""Instantiate a dataclass directly from a plain mapping.
-
-	Args:
-		cls: Dataclass type to instantiate.
-		payload: Field-value mapping loaded from YAML.
-
-	Returns:
-		An instance of `cls`.
-	"""
+def dataclass_from_dict(cls: Type[T], payload: Dict[str, Any]) -> T:
+	"""Instantiate a dataclass directly from a plain mapping."""
 
 	valid_fields = {field.name for field in fields(cls)}
 	unknown_fields = sorted(set(payload) - valid_fields)
@@ -330,26 +365,48 @@ def _dataclass_from_dict(cls: Type[T], payload: Dict[str, Any]) -> T:
 	return cls(**payload)
 
 
-def load_config(path: str | Path) -> WorldModelConfig:
-	"""Load the YAML config file used by training and model construction.
-
-	Args:
-		path: Path to a YAML config file.
-
-	Returns:
-		A fully constructed `WorldModelConfig` with nested dataclass sections.
-	"""
+def load_yaml_config(path: str | Path) -> dict[str, Any]:
+	"""Load a YAML file into a plain dictionary."""
 
 	with Path(path).open("r", encoding="utf-8") as handle:
-		payload = yaml.safe_load(handle) or {}
-	valid_sections = {field.name for field in fields(WorldModelConfig)}
+		return yaml.safe_load(handle) or {}
+
+
+def load_config_from_sections(path: str | Path, config_cls: Type[T], section_types: dict[str, Type[Any]]) -> T:
+	"""Load a composed config dataclass from known YAML sections."""
+
+	payload = load_yaml_config(path)
+	valid_sections = {field.name for field in fields(config_cls)}
 	unknown_sections = sorted(set(payload) - valid_sections)
 	if unknown_sections:
 		raise ValueError(f"Unknown root config section(s): {', '.join(unknown_sections)}")
-	return WorldModelConfig(
-		dataset=_dataclass_from_dict(DatasetConfig, payload.get("dataset", {})),
-		optimizer=_dataclass_from_dict(OptimizerConfig, payload.get("optimizer", {})),
-		training=_dataclass_from_dict(TrainingConfig, payload.get("training", {})),
-		qwen_brain=_dataclass_from_dict(QwenBrainConfig, payload.get("qwen_brain", {})),
-		wan_renderer=_dataclass_from_dict(WanRendererConfig, payload.get("wan_renderer", {})),
-	)
+	section_values = {
+		section: dataclass_from_dict(section_types[section], payload.get(section, {}))
+		for section in valid_sections
+	}
+	return config_cls(**section_values)
+
+
+def load_qw_config(path: str | Path) -> DeepWorldQWConfig:
+	"""Load a DeepWorldQW YAML config."""
+
+	return load_config_from_sections(path, DeepWorldQWConfig, {
+		"dataset": DatasetConfig,
+		"optimizer": DeepWorldQWOptimizerConfig,
+		"training": TrainingConfig,
+		"brain": DeepWorldQWBrainConfig,
+		"renderer": DeepWorldQWRendererConfig,
+	})
+
+
+def load_hy_config(path: str | Path) -> DeepWorldHYConfig:
+	"""Load a DeepWorldHY YAML config."""
+
+	return load_config_from_sections(path, DeepWorldHYConfig, {
+		"dataset": DatasetConfig,
+		"optimizer": DeepWorldHYOptimizerConfig,
+		"training": TrainingConfig,
+		"flow_matching": DeepWorldHYFlowMatchingConfig,
+		"model": DeepWorldHYModelConfig,
+	})
+
