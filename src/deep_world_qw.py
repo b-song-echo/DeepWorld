@@ -1090,7 +1090,7 @@ class DeepWorldQW(nn.Module):
 		self,
 		batch: dict[str, Any],
 		return_auxiliary: bool = False,
-		generate_samples: bool = False,
+		generate_sample: bool = False,
 		generator: torch.Generator | None = None,
 	) -> dict[str, Tensor]:
 		"""Run one training forward pass and return latent-space denoising loss.
@@ -1105,11 +1105,11 @@ class DeepWorldQW(nn.Module):
 			A dictionary containing the scalar loss, generated videos, or optional auxiliary tensors.
 		"""
 
-		if generate_samples:
-			return {"videos": self.generate(batch, generator=generator)}
+		if generate_sample:
+			return {"video": self.generate(batch, generator=generator)}
 
-		videos = batch["videos"].unsqueeze(0).to(device=next(self.parameters()).device, non_blocking=True)
-		latents = self.renderer.encode_videos(videos, sample_posterior=self.config.renderer.vae_sample_posterior)
+		video = batch["video"].unsqueeze(0).to(device=next(self.parameters()).device, non_blocking=True)
+		latents = self.renderer.encode_videos(video, sample_posterior=self.config.renderer.vae_sample_posterior)
 		latent_patch_grid = self.renderer.latent_patch_grid(latents)
 
 		brain_outputs = self.brain(batch, latent_patch_grid=latent_patch_grid)

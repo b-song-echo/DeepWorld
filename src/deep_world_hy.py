@@ -1,5 +1,4 @@
 import math
-import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -382,7 +381,7 @@ class DeepWorldHY(nn.Module):
 			"txt": nn.Parameter(torch.empty(1, 1, self.transformer.hidden_size, dtype=trainable_dtype)),
 		})
 		for embedding in self.modality_embeddings.values():
-			nn.init.normal_(embedding, std=0.02)
+			nn.init.zeros_(embedding)
 		self._set_frozen_modules_eval()
 
 	def _set_frozen_modules_eval(self) -> None:
@@ -993,17 +992,17 @@ class DeepWorldHY(nn.Module):
 		self,
 		batch: dict[str, Any],
 		return_auxiliary: bool = False,
-		generate_samples: bool = False,
+		generate_sample: bool = False,
 		generator: torch.Generator | None = None,
 	) -> dict[str, Tensor]:
 		"""Run one Hunyuan/VGGT world-model training or generation step."""
 
-		if generate_samples:
-			return {"videos": self.generate(batch, generator=generator)}
+		if generate_sample:
+			return {"video": self.generate(batch, generator=generator)}
 
 		device = next(self.transformer.parameters()).device
-		videos = batch["videos"].unsqueeze(0).to(device=device, non_blocking=True)
-		latents = self.encode_vae(videos, sample_posterior=False)
+		video = batch["video"].unsqueeze(0).to(device=device, non_blocking=True)
+		latents = self.encode_vae(video, sample_posterior=False)
 
 		noise = torch.randn_like(latents)
 		timesteps = self._sample_timestep(device=latents.device)

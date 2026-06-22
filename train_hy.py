@@ -1,7 +1,6 @@
 import argparse
 import math
 import os
-import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -260,7 +259,7 @@ def evaluate(
 					dtype=torch.bfloat16,
 					enabled=torch.cuda.is_available() and config.training.mixed_precision == "bf16",
 				):
-					outputs = model(batch, generate_samples=True, generator=generator)
+					outputs = model(batch, generate_sample=True, generator=generator)
 
 			video = outputs["video"].detach().cpu()
 			if can_write:
