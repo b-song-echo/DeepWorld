@@ -625,7 +625,7 @@ class DeepWorldHY(nn.Module):
 			text_outputs = self.txt_encoder.encode(text_inputs, data_type="video", device=device)
 		return text_outputs.hidden_state.to(device=device, dtype=dtype), text_outputs.attention_mask.to(device)
 
-	def _encode_vis(self, vis_ref_images: Tensor) -> tuple[Tensor, int]:
+	def _encode_vis_refs(self, vis_ref_images: Tensor) -> tuple[Tensor, int]:
 		"""Encode reference images with frozen SigLIP and project them to Hunyuan hidden size."""
 
 		if not self.hy_config.use_vis_tokens:
@@ -643,7 +643,8 @@ class DeepWorldHY(nn.Module):
 		vis_tokens = vis_tokens.view(1, -1, vis_tokens.size(-1))
 		return vis_tokens, int(vision_states.size(1))
 
-	def _encode_geo(self, geo_ref_images: Tensor) -> tuple[Tensor, tuple[int, int, int]]:
+	# TODO: Add empty-reference guard.
+	def _encode_geo_refs(self, geo_ref_images: Tensor) -> tuple[Tensor, tuple[int, int, int]]:
 		"""Encode reference images with frozen VGGT and project geometry tokens."""
 
 		if not self.hy_config.use_geo_tokens:
@@ -764,7 +765,7 @@ class DeepWorldHY(nn.Module):
 		)
 		vae_tokens = vae_tokens + self.modality_embeddings["vae"].to(device=device, dtype=img.dtype)
 
-		geo_tokens, geo_grid = self._encode_geo(
+		geo_tokens, geo_grid = self._encode_geo_refs(
 			batch["geo_ref_images"].to(device=device, non_blocking=True),
 		)
 		geo_tokens = geo_tokens + self.modality_embeddings["geo"].to(device=device, dtype=img.dtype)
@@ -786,7 +787,7 @@ class DeepWorldHY(nn.Module):
 			text_tokens = torch.empty(1, 0, self.transformer.hidden_size, device=device, dtype=dtype)
 		txt_tokens = text_tokens + self.modality_embeddings["txt"].to(device=device, dtype=img.dtype)
 
-		vis_tokens, vis_tokens_per_ref = self._encode_vis(
+		vis_tokens, vis_tokens_per_ref = self._encode_vis_refs(
 			batch["vis_ref_images"].to(device=device, non_blocking=True),
 		)
 		vis_tokens = vis_tokens + self.modality_embeddings["vis"].to(device=device, dtype=img.dtype)

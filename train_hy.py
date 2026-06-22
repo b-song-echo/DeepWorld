@@ -477,6 +477,7 @@ def main() -> None:
 				dtype=torch.bfloat16,
 				enabled=torch.cuda.is_available() and config.training.mixed_precision == "bf16",
 			):
+				# TODO: Are you sure gradient accumulation mechanism is correct? I maybe wrong, but it seems that gradients are in sync every step, which is not necessary.
 				loss = model(batch)["loss"] / config.training.gradient_accumulation_steps
 			loss.backward()
 			accumulated_losses.append(loss.detach() * config.training.gradient_accumulation_steps)
