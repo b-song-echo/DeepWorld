@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -321,6 +322,24 @@ def apply_fsdp2(model: DeepWorldHY, config: DeepWorldHYConfig, is_main_process: 
 		fully_shard(model.vis_in, **fsdp_kwargs)
 
 
+@contextmanager
+def model_gradient_sync(model: nn.Module, enabled: bool):
+	"""Toggle FSDP2 gradient synchronization for one forward/backward microstep."""
+
+	fsdp_modules = [
+		module for module in model.modules()
+		if callable(getattr(module, "set_requires_gradient_sync", None))
+	]
+	for module in fsdp_modules:
+		module.set_requires_gradient_sync(enabled, recurse=False)
+	try:
+		yield
+	finally:
+		if not enabled:
+			for module in fsdp_modules:
+				module.set_requires_gradient_sync(True, recurse=False)
+
+
 def build_optimizer(model: DeepWorldHY, config: DeepWorldHYConfig) -> AdamW:
 	"""Build AdamW groups for adapters, geometry stream, and projectors."""
 
@@ -464,25 +483,31 @@ def main() -> None:
 	)
 	global_step = 0
 	epoch_index = 0
+	epoch_steps = len(dataloader)
+	accum_steps = config.training.gradient_accumulation_steps
 	accumulated_losses: list[torch.Tensor] = []
 	model.train()
+	
 	while global_step < total_training_steps:
 		sampler = getattr(dataloader, "sampler", None)
 		if isinstance(sampler, DistributedSampler):
 			sampler.set_epoch(epoch_index)
-
+		
 		for micro_step, batch in enumerate(dataloader):
-			with torch.autocast(
-				device_type="cuda",
-				dtype=torch.bfloat16,
-				enabled=torch.cuda.is_available() and config.training.mixed_precision == "bf16",
-			):
-				# TODO: Are you sure gradient accumulation mechanism is correct? I maybe wrong, but it seems that gradients are in sync every step, which is not necessary.
-				loss = model(batch)["loss"] / config.training.gradient_accumulation_steps
-			loss.backward()
-			accumulated_losses.append(loss.detach() * config.training.gradient_accumulation_steps)
+			local_step = micro_step % accum_steps
+			accum_count = min(accum_steps, epoch_steps - micro_step)
+			should_sync = local_step + 1 == accum_count
 
-			if (micro_step + 1) % config.training.gradient_accumulation_steps != 0:
+			with model_gradient_sync(model, enabled=should_sync):
+				with torch.autocast(
+					device_type="cuda", dtype=torch.bfloat16,
+					enabled=config.training.mixed_precision == "bf16",
+				):
+					loss = model(batch)["loss"] / accum_count
+				loss.backward()
+			accumulated_losses.append(loss.detach() * accum_count)
+
+			if not should_sync:
 				continue
 
 			if config.optimizer.max_grad_norm > 0:

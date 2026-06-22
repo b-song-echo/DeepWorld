@@ -643,11 +643,14 @@ class DeepWorldHY(nn.Module):
 		vis_tokens = vis_tokens.view(1, -1, vis_tokens.size(-1))
 		return vis_tokens, int(vision_states.size(1))
 
-	# TODO: Add empty-reference guard.
 	def _encode_geo_refs(self, geo_ref_images: Tensor) -> tuple[Tensor, tuple[int, int, int]]:
 		"""Encode reference images with frozen VGGT and project geometry tokens."""
 
 		if not self.hy_config.use_geo_tokens:
+			empty = torch.empty(1, 0, self.transformer.hidden_size, device=geo_ref_images.device)
+			return empty, (1, 0, 0)
+
+		if geo_ref_images.numel() == 0:
 			empty = torch.empty(1, 0, self.transformer.hidden_size, device=geo_ref_images.device)
 			return empty, (1, 0, 0)
 
