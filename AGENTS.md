@@ -1,4 +1,4 @@
-Code in Python, indent using tabs.
+This repo is a research codebase. Code in Python, indent using tabs. Do not change not-owned third-party code.
 
 When you make edits:
 - Document classes, functions, and methods.
