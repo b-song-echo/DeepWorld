@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from transformers import AutoProcessor, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from src.config import DeepWorldQWConfig, load_qw_config
-from src.data import DeepWorldQWBatchCollator, build_dataset
+from src.data import DeepWorldQWBatchCollator, WorldDataset
 from src.deep_world_qw import DeepWorldQW
 from src.utils import (
 	configure_offline_runtime,
@@ -425,19 +425,19 @@ def build_eval_dataloader(
 		A rank-local eval dataloader, or `None` when eval generation is disabled.
 	"""
 
-	eval_num_samples = config.training.eval_num_samples
+	eval_num_samples = config.dataset.eval_num_samples
 	if eval_num_samples == 0:
 		return None
 	if not config.dataset.eval_manifest_path:
-		raise ValueError("`dataset.eval_manifest_path` must be set when `training.eval_num_samples` is positive.")
+		raise ValueError("`dataset.eval_manifest_path` must be set when `dataset.eval_num_samples` is positive.")
 	if eval_num_samples % accelerator.num_processes != 0:
 		raise ValueError(
-			"`training.eval_num_samples` must be divisible by the distributed world size; "
+			"`dataset.eval_num_samples` must be divisible by the distributed world size; "
 			f"got eval_num_samples={eval_num_samples}, world_size={accelerator.num_processes}."
 		)
 	if eval_num_samples < accelerator.num_processes:
 		raise ValueError(
-			"`training.eval_num_samples` must be either 0 or at least the distributed world size; "
+			"`dataset.eval_num_samples` must be either 0 or at least the distributed world size; "
 			f"got eval_num_samples={eval_num_samples}, world_size={accelerator.num_processes}."
 		)
 	eval_dataset_config = replace(
@@ -446,10 +446,10 @@ def build_eval_dataloader(
 		num_samples=eval_num_samples,
 		shuffle=False,
 	)
-	eval_dataset = build_dataset(eval_dataset_config)
+	eval_dataset = WorldDataset(eval_dataset_config)
 	if len(eval_dataset) < eval_num_samples:
 		raise ValueError(
-			"`training.eval_num_samples` exceeds the available evaluation dataset size; "
+			"`dataset.eval_num_samples` exceeds the available evaluation dataset size; "
 			f"got eval_num_samples={eval_num_samples}, available={len(eval_dataset)}."
 		)
 	rank_indices = list(range(accelerator.process_index, eval_num_samples, accelerator.num_processes))
@@ -505,7 +505,7 @@ def evaluate(
 		for ref_index in range(reference_images.size(0)):
 			save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
 
-	per_process_samples = config.training.eval_num_samples // accelerator.num_processes
+	per_process_samples = config.dataset.eval_num_samples // accelerator.num_processes
 	was_training = model.training
 	model.eval()
 	num_saved = 0
@@ -543,7 +543,7 @@ def evaluate(
 	accelerator.wait_for_everyone()
 	if accelerator.is_main_process:
 		accelerator.print(
-			f"Saved {config.training.eval_num_samples} evaluation videos to {eval_dir}."
+			f"Saved {config.dataset.eval_num_samples} evaluation videos to {eval_dir}."
 		)
 
 
@@ -627,7 +627,7 @@ def main() -> None:
 	model.to(accelerator.device) # NOTE: do not remove it at the moment
 	optimizer = build_optimizer(model, config)
 
-	dataset = build_dataset(config.dataset)
+	dataset = WorldDataset(config.dataset)
 	processor = AutoProcessor.from_pretrained(config.brain.checkpoint_path, local_files_only=True)
 	collator = DeepWorldQWBatchCollator(
 		dataset_config=config.dataset,

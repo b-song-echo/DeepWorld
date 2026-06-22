@@ -24,7 +24,7 @@ from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_
 
 from hyvideo.hyvideo.commons.parallel_states import get_parallel_state, initialize_parallel_state
 from src.config import DeepWorldHYConfig, load_hy_config
-from src.data import DeepWorldHYBatchCollator, build_dataset
+from src.data import DeepWorldHYBatchCollator, WorldDataset
 from src.deep_world_hy import MMTripleStreamBlock, MMSingleStreamBlock, DeepWorldHY
 from src.utils import (
 	configure_offline_runtime,
@@ -128,14 +128,36 @@ def is_sequence_parallel_writer() -> bool:
 	return parallel_state is None or not getattr(parallel_state, "sp_enabled", False) or parallel_state.sp_rank == 0
 
 
-# TODO: The following three dataloader related functions are a bit messy, and should be refactored. Why one called `create_dataloader` while the other didn't? Besides, make the name clearer: `build_train_dataloader` and `build_eval_dataloader`.
-def create_deepworld_hy_dataloader(
+def build_dataloader_kwargs(
+	dataset,
+	dataset_config,
+	collator: DeepWorldHYBatchCollator,
+	**overrides,
+) -> dict[str, Any]:
+	"""Build common DeepWorldHY dataloader keyword arguments."""
+
+	loader_kwargs = {
+		"dataset": dataset,
+		"batch_size": None,
+		"shuffle": dataset_config.shuffle,
+		"num_workers": dataset_config.num_workers,
+		"pin_memory": dataset_config.pin_memory and torch.cuda.is_available(),
+		"persistent_workers": dataset_config.persistent_workers and dataset_config.num_workers > 0,
+		"collate_fn": collator,
+	}
+	if dataset_config.num_workers > 0 and dataset_config.prefetch_factor is not None:
+		loader_kwargs["prefetch_factor"] = dataset_config.prefetch_factor
+	loader_kwargs.update(overrides)
+	return loader_kwargs
+
+
+def build_train_dataloader(
 	config: DeepWorldHYConfig,
 	collator: DeepWorldHYBatchCollator,
 ) -> DataLoader:
 	"""Build a dataloader whose SP ranks receive identical samples."""
 
-	dataset = build_dataset(config.dataset)
+	dataset = WorldDataset(config.dataset)
 	parallel_state = get_parallel_state() if torch.cuda.is_available() else None
 	if parallel_state is not None and get_world_size() > 1:
 		dp_rank, dp_size = get_data_parallel_rank_size(rank=0)
@@ -151,41 +173,10 @@ def create_deepworld_hy_dataloader(
 		sampler = None
 		shuffle = config.dataset.shuffle
 
-	loader_kwargs = {
-		"dataset": dataset,
-		"batch_size": None,
-		"shuffle": shuffle,
-		"sampler": sampler,
-		"num_workers": config.dataset.num_workers,
-		"pin_memory": config.dataset.pin_memory and torch.cuda.is_available(),
-		"persistent_workers": config.dataset.persistent_workers and config.dataset.num_workers > 0,
-		"collate_fn": collator,
-	}
-	if config.dataset.num_workers > 0 and config.dataset.prefetch_factor is not None:
-		loader_kwargs["prefetch_factor"] = config.dataset.prefetch_factor
-	return DataLoader(**loader_kwargs)
-
-
-def create_dataloader(
-	dataset,
-	dataset_config,
-	collator: DeepWorldHYBatchCollator,
-	shuffle: bool,
-) -> DataLoader:
-	"""Build a basic dataloader for pre-partitioned HY datasets."""
-
-	loader_kwargs = {
-		"dataset": dataset,
-		"batch_size": None,
-		"shuffle": shuffle,
-		"num_workers": dataset_config.num_workers,
-		"pin_memory": dataset_config.pin_memory and torch.cuda.is_available(),
-		"persistent_workers": dataset_config.persistent_workers and dataset_config.num_workers > 0,
-		"collate_fn": collator,
-	}
-	if dataset_config.num_workers > 0 and dataset_config.prefetch_factor is not None:
-		loader_kwargs["prefetch_factor"] = dataset_config.prefetch_factor
-	return DataLoader(**loader_kwargs)
+	return DataLoader(**build_dataloader_kwargs(
+		dataset, config.dataset, collator,
+		shuffle=shuffle, sampler=sampler,
+	))
 
 
 def build_eval_dataloader(
@@ -195,7 +186,7 @@ def build_eval_dataloader(
 ) -> tuple[DataLoader, list[int]] | None:
 	"""Build a deterministic eval loader partitioned across data-parallel groups."""
 
-	if config.training.eval_every == 0 or config.training.eval_num_samples == 0:
+	if config.training.eval_every == 0 or config.dataset.eval_num_samples == 0:
 		return None
 	if not config.dataset.eval_manifest_path:
 		raise ValueError("`dataset.eval_manifest_path` must be set when HY evaluation is enabled.")
@@ -204,19 +195,18 @@ def build_eval_dataloader(
 	eval_dataset_config = replace(
 		config.dataset,
 		manifest_path=config.dataset.eval_manifest_path,
-		num_samples=config.training.eval_num_samples,
+		num_samples=config.dataset.eval_num_samples,
 		shuffle=False,
 	)
-	eval_dataset = build_dataset(eval_dataset_config)
+	eval_dataset = WorldDataset(eval_dataset_config)
 	total_eval_samples = len(eval_dataset)
 	rank_indices = list(range(dp_rank, total_eval_samples, dp_size))
 	eval_source = Subset(eval_dataset, rank_indices)
-	return create_dataloader(
-		dataset=eval_source,
-		dataset_config=eval_dataset_config,
-		collator=collator,
+	
+	return DataLoader(**build_dataloader_kwargs(
+		eval_source, eval_dataset_config, collator,
 		shuffle=False,
-	), rank_indices
+	)), rank_indices
 
 
 def evaluate(
@@ -462,7 +452,7 @@ def main() -> None:
 	optimizer = build_optimizer(model, config)
 
 	collator = DeepWorldHYBatchCollator(config.dataset, geo_patch_size=model.geo_patch_size)
-	dataloader = create_deepworld_hy_dataloader(config, collator)
+	dataloader = build_train_dataloader(config, collator)
 	eval_bundle = build_eval_dataloader(config, collator, rank)
 	total_training_steps = compute_total_training_steps(dataloader, config)
 	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)

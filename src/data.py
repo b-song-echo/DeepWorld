@@ -196,20 +196,6 @@ class WorldDataset(Dataset):
 		)
 
 
-# TODO: Remove this function. I don't get it, why do you have to make such absurd decision? The dataset can simply be created with one line of code, and you wrap it into another funtion. Check the entire repo and rremove redundant or unnecessary abstraction like this, okay?
-def build_dataset(config: DatasetConfig) -> Dataset:
-	"""Construct the curated world-model dataset from config.
-
-	Args:
-		config: Dataset section of the root config.
-
-	Returns:
-		A map-style curated-manifest dataset.
-	"""
-
-	return WorldDataset(config)
-
-
 class DeepWorldQWBatchCollator:
 	"""Collate raw samples into the Qwen/Wan model-specific input views.
 

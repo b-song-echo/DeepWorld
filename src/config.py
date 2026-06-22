@@ -29,6 +29,7 @@ class DatasetConfig:
 	vis_image_size: int = 448
 	geo_image_size: int | None = None
 	max_text_length: int = 1024
+	eval_num_samples: int = 0
 	shuffle: bool = True
 	num_workers: int = 8
 	prefetch_factor: int | None = None
@@ -51,6 +52,8 @@ class DatasetConfig:
 			raise ValueError(f"`dataset.video_duration` must be positive, got {self.video_duration}.")
 		if self.vis_image_size <= 0:
 			raise ValueError(f"`dataset.vis_image_size` must be positive, got {self.vis_image_size}.")
+		if self.eval_num_samples < 0:
+			raise ValueError(f"`dataset.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
 		for name, value in (
 			("prompt_rich_prob", self.prompt_rich_prob),
 			("prompt_medium_prob", self.prompt_medium_prob),
@@ -82,8 +85,6 @@ class TrainingConfig:
 	log_every: int = 10
 	eval_every: int = 0
 	save_every: int = 1000
-	# TODO: This property should belong to `DatasetConfig`. This makes dataloader and dataset creation more elegant. Don't forget to update YAML configs.
-	eval_num_samples: int = 0
 	mixed_precision: str = "bf16"
 	use_fsdp: bool = True
 	gradient_checkpointing: bool = True
@@ -123,8 +124,6 @@ class TrainingConfig:
 			raise ValueError(f"`training.eval_every` must be non-negative, got {self.eval_every}.")
 		if self.save_every < 0:
 			raise ValueError(f"`training.save_every` must be non-negative, got {self.save_every}.")
-		if self.eval_num_samples < 0:
-			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
 
 
 @dataclass

@@ -13,6 +13,7 @@ dataset:
   vis_image_size: 448
   geo_image_size: 448
   max_text_length: 512
+  eval_num_samples: 8
   shuffle: false
   num_workers: 1
   prefetch_factor: 1
@@ -41,7 +42,6 @@ training:
   log_every: 1
   eval_every: 300
   save_every: 300
-  eval_num_samples: 8
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
