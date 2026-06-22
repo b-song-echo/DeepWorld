@@ -18,10 +18,20 @@ import ffmpeg
 import imageio.v3 as iio
 import numpy as np
 from PIL import Image
-from qwen_vl_utils import process_vision_info
 import torch
 import pyiqa
 from filelock import FileLock
+from src.utils import (
+	configure_offline_runtime,
+	read_json_file,
+	read_jsonl_file,
+	write_json_file,
+	write_jsonl_file,
+)
+
+configure_offline_runtime()
+
+from qwen_vl_utils import process_vision_info
 from transformers import (
 	AutoModelForCausalLM,
 	AutoModelForImageTextToText,
@@ -38,13 +48,6 @@ from src.prompts import (
 	IMAGE_CAPTIONING_TEMPLATE,
 	MOTION_DIGESTING_TEMPLATE,
 	VIDEO_CAPTIONING_TEMPLATE,
-)
-# TODO: Why not simply use the original names?
-from src.utils import (
-	read_json_file as read_json,
-	read_jsonl_file as read_jsonl,
-	write_json_file as write_json,
-	write_jsonl_file as write_jsonl,
 )
 
 
@@ -381,7 +384,7 @@ class DataSamplingStage:
 		path = Path(self.args.scannetpp_root) / "metadata" / "scene_types.json"
 		if not path.exists():
 			return {}
-		return read_json(path)
+		return read_json_file(path)
 
 	def _load_scene_ids(self) -> list[str]:
 		split_name = f"nvs_sem_{self.args.split}.txt"
@@ -569,7 +572,7 @@ class DataSamplingStage:
 		path = ctx.require_source_pose_path()
 		if not path.exists():
 			raise RejectedSample(f"Missing iPhone pose file: {path}")
-		raw_payload = read_json(path)
+		raw_payload = read_json_file(path)
 		payload_sequence = parse_payload_to_sequence(raw_payload)
 		if not payload_sequence:
 			raise RejectedSample(f"No pose records found in {path}")
@@ -577,7 +580,7 @@ class DataSamplingStage:
 		clip_poses = poses[ctx.start_frame:(ctx.start_frame + ctx.clip_frames)]
 		if len(clip_poses) < ctx.clip_frames:
 			raise RejectedSample("Pose sequence is shorter than the sampled clip.")
-		write_json(ctx.intermediate_dir / "poses.json", {"poses":
+		write_json_file(ctx.intermediate_dir / "poses.json", {"poses":
 			[p.serialized() if p is not None else None for p in clip_poses]
 		})
 
@@ -659,7 +662,7 @@ class DataSamplingStage:
 		dslr_path = scene.dslr_nerfstudio_transform_undistorted_path
 		if not dslr_path.exists():
 			raise RejectedSample(f"Missing DSLR transforms: {dslr_path}")
-		payload = read_json(dslr_path)
+		payload = read_json_file(dslr_path)
 		dslr_frames = list(payload.get("frames", [])) + list(payload.get("test_frames", []))
 		ref_needed = self.rng.randint(1, self.args.max_ref_images)
 		dslr_needed = ref_needed - int(include_start)
@@ -678,7 +681,7 @@ class DataSamplingStage:
 				"image": image,
 			})
 		
-		raw_payload = read_json(ctx.intermediate_dir / "poses.json")
+		raw_payload = read_json_file(ctx.intermediate_dir / "poses.json")
 		payload_sequence = raw_payload.get("poses", [])
 		clip_poses = [Pose.from_payload(p) for p in payload_sequence]
 		dslr_candidates: list[tuple[float, int]] = []
@@ -862,7 +865,7 @@ class MotionExtractionStage:
 		def round_stats(stats: dict[str, float]) -> dict[str, float]:
 			return {k: round(v, 1) for k, v in stats.items()}
 
-		raw_payload = read_json(ctx.intermediate_dir / "poses.json")
+		raw_payload = read_json_file(ctx.intermediate_dir / "poses.json")
 		payload_sequence = raw_payload.get("poses", [])
 		raw_clip_poses = [Pose.from_payload(p) for p in payload_sequence]
 		clip_poses = self._valid_clip_poses(raw_clip_poses)
@@ -921,7 +924,7 @@ class MotionExtractionStage:
 				"unit_end_in_unit_start_pitch_(deg)": unit_stats["pitch"],
 				"unit_end_in_unit_start_roll_(deg)": unit_stats["roll"],
 			}))
-		write_json(ctx.intermediate_dir / "motion_extraction.json", {
+		write_json_file(ctx.intermediate_dir / "motion_extraction.json", {
 			"overall_motion": overall_motion,
 			"motion_units": motion_units,
 		})
@@ -1208,7 +1211,7 @@ class MotionDigestingStage:
 		clip_seconds = f"{ctx.clip_duration_s:g}"
 		unit_seconds = f"{self.args.motion_digesting_unit_seconds:g}"
 		path = ctx.intermediate_dir / "motion_extraction.json"
-		motion_extraction_json = self.llm.json_to_str(read_json(path))
+		motion_extraction_json = self.llm.json_to_str(read_json_file(path))
 		prompt = (
 			MOTION_DIGESTING_TEMPLATE
 			.replace("<CLIP_SECONDS>", clip_seconds)
@@ -1220,7 +1223,7 @@ class MotionDigestingStage:
 			temperature=self.args.motion_digesting_llm_temperature,
 			max_new_tokens=self.args.motion_digesting_llm_max_new_tokens,
 		)
-		write_json(ctx.intermediate_dir / "motion_caption.json", {
+		write_json_file(ctx.intermediate_dir / "motion_caption.json", {
 			"motion_caption": self.llm.json_by_key(result, "motion_caption"),
 		})
 
@@ -1254,7 +1257,7 @@ class VideoCaptioningStage:
 
 		clip_seconds = f"{ctx.clip_duration_s:g}"
 		path = ctx.intermediate_dir / "motion_caption.json"
-		motion_caption_json = self.vlm.json_to_str(read_json(path))
+		motion_caption_json = self.vlm.json_to_str(read_json_file(path))
 		frame_timeline_json = self.vlm.json_to_str(self._get_timeline(ctx))
 		prompt = (
 			VIDEO_CAPTIONING_TEMPLATE
@@ -1274,7 +1277,7 @@ class VideoCaptioningStage:
 				"resized_height": self.args.video_captioning_height,
 			}],
 		)
-		write_json(ctx.intermediate_dir / "video_caption.json", {
+		write_json_file(ctx.intermediate_dir / "video_caption.json", {
 			"video_caption": self.vlm.json_by_key(result, "video_caption"),
 		})
 
@@ -1311,7 +1314,7 @@ class ImageCaptioningStage:
 				"is_video_start_frame": bool(ref["is_start_frame"]),
 				"caption": self.vlm.json_by_key(result, "image_caption"),
 			})
-		write_json(ctx.intermediate_dir / "image_captions.json", {
+		write_json_file(ctx.intermediate_dir / "image_captions.json", {
 			"image_captions": captions,
 		})
 
@@ -1332,9 +1335,9 @@ class CaptionWiringStage:
 		"""Save `wired_caption.json`."""
 
 		path = ctx.intermediate_dir / "video_caption.json"
-		video_caption_json = self.llm.json_to_str(read_json(path))
+		video_caption_json = self.llm.json_to_str(read_json_file(path))
 		path = ctx.intermediate_dir / "image_captions.json"
-		image_captions_json = self.llm.json_to_str(read_json(path))
+		image_captions_json = self.llm.json_to_str(read_json_file(path))
 		prompt = (
 			CAPTION_WIRING_TEMPLATE
 			.replace("<VIDEO_CAPTION_JSON>", video_caption_json)
@@ -1345,7 +1348,7 @@ class CaptionWiringStage:
 			temperature=self.args.caption_wiring_llm_temperature,
 			max_new_tokens=self.args.caption_wiring_llm_max_new_tokens,
 		)
-		write_json(ctx.intermediate_dir / "wired_caption.json", {
+		write_json_file(ctx.intermediate_dir / "wired_caption.json", {
 			"wired_caption": self.llm.json_by_key(result, "wired_caption"),
 		})
 
@@ -1367,7 +1370,7 @@ class CaptionRephrasingStage:
 
 		clip_seconds = f"{ctx.clip_duration_s:g}"
 		path = ctx.intermediate_dir / "wired_caption.json"
-		wired_caption_json = self.llm.json_to_str(read_json(path))
+		wired_caption_json = self.llm.json_to_str(read_json_file(path))
 		prompt = (
 			CAPTION_REPHRASING_TEMPLATE
 			.replace("<CLIP_SECONDS>", clip_seconds)
@@ -1398,11 +1401,11 @@ class CriticJudgingStage:
 		"""Save `llm_validation.json` and reject invalid prompt candidates."""
 
 		path = ctx.intermediate_dir / "motion_caption.json"
-		motion_caption_json = self.llm.json_to_str(read_json(path))
+		motion_caption_json = self.llm.json_to_str(read_json_file(path))
 		path = ctx.intermediate_dir / "video_caption.json"
-		video_caption_json = self.llm.json_to_str(read_json(path))
+		video_caption_json = self.llm.json_to_str(read_json_file(path))
 		path = ctx.intermediate_dir / "image_captions.json"
-		image_captions_json = self.llm.json_to_str(read_json(path))
+		image_captions_json = self.llm.json_to_str(read_json_file(path))
 		synthesized_prompt = ctx.manifest_entry["synthesized_prompt"]
 		prompt = (
 			CRITIC_JUDGING_TEMPLATE
@@ -1426,7 +1429,7 @@ class CriticJudgingStage:
 			raise RejectedSample("LLM judge fatal checks failed.")
 		if self.args.filter_quality_score_min is not None and quality_score < self.args.filter_quality_score_min:
 			raise RejectedSample(f"LLM judge quality score {quality_score:.4f} below threshold.")
-		write_json(ctx.intermediate_dir / "llm_validation.json", result)
+		write_json_file(ctx.intermediate_dir / "llm_validation.json", result)
 
 
 class DistillationStage:
@@ -1471,18 +1474,18 @@ def commit_sample(args: Namespace, ctx: SampleContext) -> bool | None:
 	tmp_dir = ctx.require_tmp_dir()
 	final_dir = ctx.require_final_dir()
 	with exclusive_lock(args):
-		state = read_json(state_path(args))
+		state = read_json_file(state_path(args))
 		if state["current_count"] >= state["target_count"]:
 			shutil.rmtree(tmp_dir, ignore_errors=True)
 			return None
 		if final_dir.exists():
 			shutil.rmtree(tmp_dir, ignore_errors=True)
 			return False
-		write_json(tmp_dir / "sample.json", ctx.manifest_entry)
+		write_json_file(tmp_dir / "sample.json", ctx.manifest_entry)
 		os.replace(tmp_dir, final_dir)
-		write_jsonl(manifest_path(args), ctx.manifest_entry, append=True)
+		write_jsonl_file(manifest_path(args), ctx.manifest_entry, append=True)
 		state["current_count"] += 1
-		write_json(state_path(args), state)
+		write_json_file(state_path(args), state)
 		return True
 
 
@@ -1503,7 +1506,7 @@ def prepare_output_root(args: Namespace) -> None:
 	
 	with exclusive_lock(args):
 		if not args.no_cleanup:
-			entries = read_jsonl(manifest)
+			entries = read_jsonl_file(manifest)
 			active_entries: list[dict[str, Any]] = []
 			active_sample_ids: set[str] = set()
 			
@@ -1524,10 +1527,10 @@ def prepare_output_root(args: Namespace) -> None:
 					child.unlink(missing_ok=True)
 				elif child.name not in active_sample_ids:
 					shutil.rmtree(child)
-			write_jsonl(manifest, *active_entries, append=False)
+			write_jsonl_file(manifest, *active_entries, append=False)
 		
-		write_json(state_path(args), {
-			"current_count": len(read_jsonl(manifest)),
+		write_json_file(state_path(args), {
+			"current_count": len(read_jsonl_file(manifest)),
 			"target_count": args.num_samples,
 		})
 
@@ -1589,7 +1592,7 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 
 	rng = random.Random(seed)
 	np.random.seed(seed)
-	state = read_json(state_path(args))
+	state = read_json_file(state_path(args))
 	if state["current_count"] >= state["target_count"]:
 		return
 
@@ -1619,7 +1622,7 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 	]
 
 	while True:
-		state = read_json(state_path(args))
+		state = read_json_file(state_path(args))
 		if state["current_count"] >= state["target_count"]:
 			break
 		ctx = SampleContext()
@@ -1629,7 +1632,7 @@ def run_worker(args: Namespace, worker_index: int = 0) -> None:
 			if result is None:
 				break
 			if result:
-				updated_state = read_json(state_path(args))
+				updated_state = read_json_file(state_path(args))
 				print(f"[worker {worker_index}] committed {ctx.sample_id} ({updated_state['current_count']}/{updated_state['target_count']})", flush=True)
 		except RejectedSample as error:
 			cleanup_sample_tmp(ctx)

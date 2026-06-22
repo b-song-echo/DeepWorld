@@ -76,11 +76,11 @@ class TrainingConfig:
 	seed: int = 42
 	max_total_epochs: int | None = 10
 	max_total_steps: int | None = None
-	per_device_batch_size: int = 1
 	sequence_parallel_size: int = 1
 	data_parallel_replicate: int = 1
 	gradient_accumulation_steps: int = 1
 	log_every: int = 10
+	eval_every: int = 0
 	save_every: int = 1000
 	eval_num_samples: int = 0
 	mixed_precision: str = "bf16"
@@ -101,10 +101,6 @@ class TrainingConfig:
 			raise ValueError(
 				f"`training.max_total_steps` must be positive when set, got {self.max_total_steps}."
 			)
-		if self.per_device_batch_size < 1:
-			raise ValueError(
-				f"`training.per_device_batch_size` must be at least 1, got {self.per_device_batch_size}."
-			)
 		if self.sequence_parallel_size < 1:
 			raise ValueError(
 				"`training.sequence_parallel_size` must be at least 1, "
@@ -120,6 +116,12 @@ class TrainingConfig:
 				"`training.gradient_accumulation_steps` must be at least 1, "
 				f"got {self.gradient_accumulation_steps}."
 			)
+		if self.log_every < 0:
+			raise ValueError(f"`training.log_every` must be non-negative, got {self.log_every}.")
+		if self.eval_every < 0:
+			raise ValueError(f"`training.eval_every` must be non-negative, got {self.eval_every}.")
+		if self.save_every < 0:
+			raise ValueError(f"`training.save_every` must be non-negative, got {self.save_every}.")
 		if self.eval_num_samples < 0:
 			raise ValueError(f"`training.eval_num_samples` must be non-negative, got {self.eval_num_samples}.")
 
@@ -158,10 +160,8 @@ class DeepWorldQWOptimizerConfig(OptimizerConfig):
 class DeepWorldHYOptimizerConfig(OptimizerConfig):
 	"""Optimizer settings specific to the Hunyuan DeepWorld variant."""
 
-	# TODO: This should be called `adapter_learning_rate`
-	transformer_learning_rate: float | None = None
-	# TODO: This should be called `geo_stream_learning_rate`
-	geometry_learning_rate: float | None = None
+	adapter_learning_rate: float | None = None
+	geo_stream_learning_rate: float | None = None
 	projector_learning_rate: float | None = None
 
 
@@ -205,7 +205,6 @@ class DeepWorldQWRendererConfig:
 	condition_dropout_prob: float = 0.1
 	train_scheduler_steps: int | None = None
 	inference_steps: int = 50
-	batch_multiplier: int = 1
 
 	def __post_init__(self) -> None:
 		"""Validate Wan renderer training and initialization settings."""
@@ -234,47 +233,6 @@ class DeepWorldQWRendererConfig:
 				"`renderer.condition_dropout_prob` must be in [0, 1], "
 				f"got {self.condition_dropout_prob}."
 			)
-		if self.batch_multiplier < 1:
-			raise ValueError(
-				"`renderer.batch_multiplier` must be at least 1, "
-				f"got {self.batch_multiplier}."
-			)
-
-
-@dataclass
-class DeepWorldHYFlowMatchingConfig:
-	"""Flow-matching schedule used by DeepWorldHY training."""
-
-	# TODO: This is part of the model configuration. There is no need for a separate config class.
-	num_train_timesteps: int = 1000
-	train_timestep_shift: float = 3.0
-	validation_timestep_shift: float = 5.0
-	snr_type: str = "lognorm"
-
-	def __post_init__(self) -> None:
-		"""Validate flow-matching schedule settings."""
-
-		self.snr_type = self.snr_type.lower()
-		if self.num_train_timesteps <= 0:
-			raise ValueError(
-				"`flow_matching.num_train_timesteps` must be positive, "
-				f"got {self.num_train_timesteps}."
-			)
-		if self.train_timestep_shift <= 0:
-			raise ValueError(
-				"`flow_matching.train_timestep_shift` must be positive, "
-				f"got {self.train_timestep_shift}."
-			)
-		if self.validation_timestep_shift <= 0:
-			raise ValueError(
-				"`flow_matching.validation_timestep_shift` must be positive, "
-				f"got {self.validation_timestep_shift}."
-			)
-		if self.snr_type not in {"uniform", "lognorm", "mix", "mode"}:
-			raise ValueError(
-				"`flow_matching.snr_type` must be one of `uniform`, `lognorm`, `mix`, or `mode`, "
-				f"got {self.snr_type!r}."
-			)
 
 
 @dataclass
@@ -289,11 +247,10 @@ class DeepWorldHYModelConfig:
 	vggt_dtype: str | None = None
 	attention_mode: str = "flash"
 	condition_dropout_prob: float = 0.1
-	# TODO: Call the following configs as `use_vae_tokens`, `use_vis_tokens`, `use_geo_tokens`, `use_txt_tokens` respectively.
-	use_reference_vae_tokens: bool = True
-	use_siglip_tokens: bool = True
-	use_geometry_tokens: bool = True
-	use_text_tokens: bool = True
+	use_vae_tokens: bool = True
+	use_vis_tokens: bool = True
+	use_geo_tokens: bool = True
+	use_txt_tokens: bool = True
 	lora_rank: int = 16
 	lora_alpha: int | None = None
 	lora_dropout: float = 0.05
@@ -304,6 +261,11 @@ class DeepWorldHYModelConfig:
 	])
 	geo_stream_init: str = "copy_image"
 	guidance: float = 6016.0
+	num_train_timesteps: int = 1000
+	train_timestep_shift: float = 3.0
+	validation_timestep_shift: float = 5.0
+	snr_type: str = "lognorm"
+	inference_steps: int = 50
 
 	def __post_init__(self) -> None:
 		"""Validate DeepWorldHY model settings."""
@@ -311,6 +273,7 @@ class DeepWorldHYModelConfig:
 		self.lora_alpha = resolve_lora_alpha(self.lora_alpha, self.lora_rank)
 		self.attention_mode = self.attention_mode.lower()
 		self.geo_stream_init = self.geo_stream_init.lower()
+		self.snr_type = self.snr_type.lower()
 		if self.attention_mode == "flex-block-attn":
 			raise ValueError(
 				"`model.attention_mode=flex-block-attn` is not supported because "
@@ -327,6 +290,28 @@ class DeepWorldHYModelConfig:
 			raise ValueError(
 				"`model.geo_stream_init` must be either `copy_image` or `fresh`, "
 				f"got {self.geo_stream_init!r}."
+			)
+		if self.num_train_timesteps <= 0:
+			raise ValueError(
+				"`model.num_train_timesteps` must be positive, "
+				f"got {self.num_train_timesteps}."
+			)
+		if self.train_timestep_shift <= 0:
+			raise ValueError(
+				"`model.train_timestep_shift` must be positive, "
+				f"got {self.train_timestep_shift}."
+			)
+		if self.validation_timestep_shift <= 0:
+			raise ValueError(
+				"`model.validation_timestep_shift` must be positive, "
+				f"got {self.validation_timestep_shift}."
+			)
+		if self.inference_steps <= 0:
+			raise ValueError(f"`model.inference_steps` must be positive, got {self.inference_steps}.")
+		if self.snr_type not in {"uniform", "lognorm", "mix", "mode"}:
+			raise ValueError(
+				"`model.snr_type` must be one of `uniform`, `lognorm`, `mix`, or `mode`, "
+				f"got {self.snr_type!r}."
 			)
 
 
@@ -348,7 +333,6 @@ class DeepWorldHYConfig:
 	dataset: DatasetConfig = field(default_factory=DatasetConfig)
 	optimizer: DeepWorldHYOptimizerConfig = field(default_factory=DeepWorldHYOptimizerConfig)
 	training: TrainingConfig = field(default_factory=TrainingConfig)
-	flow_matching: DeepWorldHYFlowMatchingConfig = field(default_factory=DeepWorldHYFlowMatchingConfig)
 	model: DeepWorldHYModelConfig = field(default_factory=DeepWorldHYModelConfig)
 
 
@@ -402,11 +386,49 @@ def load_qw_config(path: str | Path) -> DeepWorldQWConfig:
 def load_hy_config(path: str | Path) -> DeepWorldHYConfig:
 	"""Load a DeepWorldHY YAML config."""
 
-	return load_config_from_sections(path, DeepWorldHYConfig, {
-		"dataset": DatasetConfig,
-		"optimizer": DeepWorldHYOptimizerConfig,
-		"training": TrainingConfig,
-		"flow_matching": DeepWorldHYFlowMatchingConfig,
-		"model": DeepWorldHYModelConfig,
-	})
+	payload = load_yaml_config(path)
+	if "flow_matching" in payload:
+		model_payload = payload.setdefault("model", {})
+		for key, value in payload.pop("flow_matching").items():
+			if key in model_payload:
+				raise ValueError(
+					f"`flow_matching.{key}` duplicates `model.{key}`; keep the setting under `model`."
+				)
+			model_payload[key] = value
 
+	optimizer_payload = payload.get("optimizer", {})
+	for old_name, new_name in (
+		("transformer_learning_rate", "adapter_learning_rate"),
+		("geometry_learning_rate", "geo_stream_learning_rate"),
+	):
+		if old_name in optimizer_payload:
+			if new_name in optimizer_payload:
+				raise ValueError(
+					f"`optimizer.{old_name}` duplicates `optimizer.{new_name}`; use `{new_name}`."
+				)
+			optimizer_payload[new_name] = optimizer_payload.pop(old_name)
+
+	model_payload = payload.get("model", {})
+	for old_name, new_name in (
+		("use_reference_vae_tokens", "use_vae_tokens"),
+		("use_siglip_tokens", "use_vis_tokens"),
+		("use_geometry_tokens", "use_geo_tokens"),
+		("use_text_tokens", "use_txt_tokens"),
+	):
+		if old_name in model_payload:
+			if new_name in model_payload:
+				raise ValueError(
+					f"`model.{old_name}` duplicates `model.{new_name}`; use `{new_name}`."
+				)
+			model_payload[new_name] = model_payload.pop(old_name)
+
+	valid_sections = {field.name for field in fields(DeepWorldHYConfig)}
+	unknown_sections = sorted(set(payload) - valid_sections)
+	if unknown_sections:
+		raise ValueError(f"Unknown root config section(s): {', '.join(unknown_sections)}")
+	return DeepWorldHYConfig(
+		dataset=dataclass_from_dict(DatasetConfig, payload.get("dataset", {})),
+		optimizer=dataclass_from_dict(DeepWorldHYOptimizerConfig, optimizer_payload),
+		training=dataclass_from_dict(TrainingConfig, payload.get("training", {})),
+		model=dataclass_from_dict(DeepWorldHYModelConfig, model_payload),
+	)

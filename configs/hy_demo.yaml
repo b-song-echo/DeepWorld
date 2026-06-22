@@ -1,4 +1,3 @@
-# TODO: Based on the officially recommended training configurations, and my specific model architecture and data/task, update the configs to the most recommended values.
 dataset:
   manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/DeepWorld/manifest_train.jsonl
   eval_manifest_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/datasets/DeepWorld/manifest_val.jsonl
@@ -24,35 +23,30 @@ optimizer:
   lr_schedule: cosine
   weight_decay: 0.01
   betas:
-  - 0.9
-  - 0.95
+    - 0.9
+    - 0.95
   eps: 1.0e-08
   max_grad_norm: 1.0
   warmup_steps: 500
-  transformer_learning_rate: 1.0e-05
-  geometry_learning_rate: 5.0e-05
+  adapter_learning_rate: 1.0e-05
+  geo_stream_learning_rate: 5.0e-05
   projector_learning_rate: 5.0e-05
 training:
   output_dir: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/DeepWorld/exps/hunyuan_world
   seed: 20021021
   max_total_epochs: 30
   max_total_steps: null
-  per_device_batch_size: 1
   sequence_parallel_size: 8
   data_parallel_replicate: 1
   gradient_accumulation_steps: 4
   log_every: 10
+  eval_every: 1000
   save_every: 1000
   eval_num_samples: 0
   mixed_precision: bf16
   use_fsdp: true
   gradient_checkpointing: true
   pretrained_model_path: null
-flow_matching:
-  num_train_timesteps: 1000
-  train_timestep_shift: 3.0
-  validation_timestep_shift: 5.0
-  snr_type: lognorm
 model:
   checkpoint_path: /home/hadoop-intelligence-studio/dolphinfs_ssd_hadoop-intelligence-studio/songbaijun/data/models/HunyuanVideo-1.5
   transformer_version: 480p_i2v
@@ -62,24 +56,29 @@ model:
   vggt_dtype: null
   attention_mode: flash
   condition_dropout_prob: 0.1
-  use_reference_vae_tokens: true
-  use_siglip_tokens: true
-  use_geometry_tokens: true
-  use_text_tokens: true
+  use_vae_tokens: true
+  use_vis_tokens: true
+  use_geo_tokens: true
+  use_txt_tokens: true
   lora_rank: 16
   lora_alpha: null
   lora_dropout: 0.05
   lora_target_modules:
-  - img_attn_q
-  - img_attn_k
-  - img_attn_v
-  - img_attn_proj
-  - txt_attn_q
-  - txt_attn_k
-  - txt_attn_v
-  - txt_attn_proj
-  - linear1_q
-  - linear1_k
-  - linear1_v
+    - img_attn_q
+    - img_attn_k
+    - img_attn_v
+    - img_attn_proj
+    - txt_attn_q
+    - txt_attn_k
+    - txt_attn_v
+    - txt_attn_proj
+    - linear1_q
+    - linear1_k
+    - linear1_v
   geo_stream_init: copy_image
   guidance: 6016.0
+  num_train_timesteps: 1000
+  train_timestep_shift: 3.0
+  validation_timestep_shift: 5.0
+  snr_type: lognorm
+  inference_steps: 50

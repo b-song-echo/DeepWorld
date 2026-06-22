@@ -30,7 +30,6 @@ def get_world_size() -> int:
 def configure_offline_runtime() -> None:
 	"""Apply process-wide defaults for offline, CUDA-oriented training runs."""
 
-	# TODO: Since these are set here, there is no need to set them repeatedly in the bash script. Check the entire codebase for redundant code and remove them. For example, if the configuration values are checked at data class post initialization, there is no need to recheck them again and again when using them. This can also be used in `synthesize.py`, then these environment variables do not need to be set in bash scripts.
 	os.environ.setdefault("HF_HUB_OFFLINE", "1")
 	os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 	os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
@@ -77,7 +76,7 @@ def open_rank0_jsonl_log(output_dir: str | Path, is_main_process: bool) -> TextI
 		return None
 	output_dir = Path(output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
-	return (output_dir / "logs.jsonl").open("a", encoding="utf-8", buffering=1)
+	return (output_dir / "log.jsonl").open("a", encoding="utf-8", buffering=1)
 
 
 def write_jsonl_log(handle: TextIO | None, payload: dict[str, Any]) -> None:

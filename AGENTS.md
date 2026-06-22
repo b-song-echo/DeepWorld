@@ -1,9 +1,11 @@
-Code in Python, indent using tabs rather than spaces.
+Code in Python, indent using tabs.
 
-Consistently document implementations.
+When you make edits:
+- Document classes, functions, and methods.
+- Keep consistent coding style and naming convention.
+- Remove legacy or redundant implementation.
+- Prefer bottom-up changes over than top-down patches.
+- Prioritize clean and elegent code.
+- Do not make unnecessary abstraction.
 
-Note that I won't run this program locally on this Mac, instead, I will port this code and run it on linux server with CUDA. Therefore, you may see import errors or imcompatability issues, but they are not "real issues", so just ignore them. If I ever encounter real compatability issues, I will inform you in chat.
-
-When you update the codebase, please remove legacy or redundant implementation.
-
-Do not trade code readability for negligible performance gain. Always prefer clean and clear implementation.
+Importantly, **I won't run this repo locally, instead, I will run this repo on linux server with NVIDIA A100 GPUs**. Therefore, do not be bothered errors related to version compatability, environments discrepency, missing packages, etc. Use your knowledge to ensure correct implementation rather than relying on inspecting local-run errors.

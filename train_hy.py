@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -17,19 +18,21 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm.auto import tqdm
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from hyvideo.hyvideo.commons.parallel_states import get_parallel_state, initialize_parallel_state
 from src.config import DeepWorldHYConfig, load_hy_config
 from src.data import DeepWorldHYBatchCollator, build_dataset
-from src.deep_world_hy import GeometryDoubleStreamBlock, DeepWorldHY, MropeSingleStreamBlock
+from src.deep_world_hy import MMTripleStreamBlock, MMSingleStreamBlock, DeepWorldHY
 from src.utils import (
 	configure_offline_runtime,
 	get_world_size,
 	open_rank0_jsonl_log,
 	save_config_yaml,
+	save_image_tensor,
+	save_video_tensor,
 	seed_python_and_torch,
 	write_jsonl_log,
 )
@@ -109,6 +112,23 @@ def open_metrics_log(output_dir: Path, is_main_process: bool):
 	return open_rank0_jsonl_log(output_dir, is_main_process)
 
 
+def get_data_parallel_rank_size(rank: int) -> tuple[int, int]:
+	"""Return the rank and size of the data-parallel mesh."""
+
+	parallel_state = get_parallel_state() if torch.cuda.is_available() else None
+	if parallel_state is None or get_world_size() <= 1:
+		return rank, 1
+	return parallel_state.world_mesh["dp"].get_local_rank(), parallel_state.world_mesh["dp"].size()
+
+
+def is_sequence_parallel_writer() -> bool:
+	"""Return whether this process should write rank-local evaluation artifacts."""
+
+	parallel_state = get_parallel_state() if torch.cuda.is_available() else None
+	return parallel_state is None or not getattr(parallel_state, "sp_enabled", False) or parallel_state.sp_rank == 0
+
+
+# TODO: The following three dataloader related functions are a bit messy, and should be refactored. Why one called `create_dataloader` while the other didn't? Besides, make the name clearer: `build_train_dataloader` and `build_eval_dataloader`.
 def create_deepworld_hy_dataloader(
 	config: DeepWorldHYConfig,
 	collator: DeepWorldHYBatchCollator,
@@ -118,8 +138,7 @@ def create_deepworld_hy_dataloader(
 	dataset = build_dataset(config.dataset)
 	parallel_state = get_parallel_state() if torch.cuda.is_available() else None
 	if parallel_state is not None and get_world_size() > 1:
-		dp_rank = parallel_state.world_mesh["dp"].get_local_rank()
-		dp_size = parallel_state.world_mesh["dp"].size()
+		dp_rank, dp_size = get_data_parallel_rank_size(rank=0)
 		sampler = DistributedSampler(
 			dataset,
 			num_replicas=dp_size,
@@ -134,7 +153,7 @@ def create_deepworld_hy_dataloader(
 
 	loader_kwargs = {
 		"dataset": dataset,
-		"batch_size": config.training.per_device_batch_size,
+		"batch_size": None,
 		"shuffle": shuffle,
 		"sampler": sampler,
 		"num_workers": config.dataset.num_workers,
@@ -147,10 +166,133 @@ def create_deepworld_hy_dataloader(
 	return DataLoader(**loader_kwargs)
 
 
+def create_dataloader(
+	dataset,
+	dataset_config,
+	collator: DeepWorldHYBatchCollator,
+	shuffle: bool,
+) -> DataLoader:
+	"""Build a basic dataloader for pre-partitioned HY datasets."""
+
+	loader_kwargs = {
+		"dataset": dataset,
+		"batch_size": None,
+		"shuffle": shuffle,
+		"num_workers": dataset_config.num_workers,
+		"pin_memory": dataset_config.pin_memory and torch.cuda.is_available(),
+		"persistent_workers": dataset_config.persistent_workers and dataset_config.num_workers > 0,
+		"collate_fn": collator,
+	}
+	if dataset_config.num_workers > 0 and dataset_config.prefetch_factor is not None:
+		loader_kwargs["prefetch_factor"] = dataset_config.prefetch_factor
+	return DataLoader(**loader_kwargs)
+
+
+def build_eval_dataloader(
+	config: DeepWorldHYConfig,
+	collator: DeepWorldHYBatchCollator,
+	rank: int,
+) -> tuple[DataLoader, list[int]] | None:
+	"""Build a deterministic eval loader partitioned across data-parallel groups."""
+
+	if config.training.eval_every == 0 or config.training.eval_num_samples == 0:
+		return None
+	if not config.dataset.eval_manifest_path:
+		raise ValueError("`dataset.eval_manifest_path` must be set when HY evaluation is enabled.")
+
+	dp_rank, dp_size = get_data_parallel_rank_size(rank)
+	eval_dataset_config = replace(
+		config.dataset,
+		manifest_path=config.dataset.eval_manifest_path,
+		num_samples=config.training.eval_num_samples,
+		shuffle=False,
+	)
+	eval_dataset = build_dataset(eval_dataset_config)
+	total_eval_samples = len(eval_dataset)
+	rank_indices = list(range(dp_rank, total_eval_samples, dp_size))
+	eval_source = Subset(eval_dataset, rank_indices)
+	return create_dataloader(
+		dataset=eval_source,
+		dataset_config=eval_dataset_config,
+		collator=collator,
+		shuffle=False,
+	), rank_indices
+
+
+def evaluate(
+	model: DeepWorldHY,
+	eval_bundle: tuple[DataLoader, list[int]] | None,
+	config: DeepWorldHYConfig,
+	step: int,
+	output_dir: Path,
+	device: torch.device,
+) -> None:
+	"""Generate rank-local HY evaluation videos and save them to disk."""
+
+	if eval_bundle is None:
+		return
+
+	eval_dataloader, rank_indices = eval_bundle
+	eval_dir = output_dir / "evaluation" / f"step_{step:08d}"
+	can_write = is_sequence_parallel_writer()
+	if can_write:
+		eval_dir.mkdir(parents=True, exist_ok=True)
+	if dist.is_available() and dist.is_initialized():
+		dist.barrier()
+
+	def save_sample_bundle(batch: dict[str, Any], generated_video: torch.Tensor, eval_index: int) -> None:
+		"""Save generated output, target video, prompt, and reference images."""
+
+		sample_dir = eval_dir / f"sample_{eval_index:04d}"
+		sample_dir.mkdir(parents=True, exist_ok=True)
+		save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=config.dataset.video_duration)
+		save_video_tensor(batch["video"], sample_dir / "ground_truth.mp4", duration_seconds=config.dataset.video_duration)
+		(sample_dir / "prompt.txt").write_text(batch["prompt"] + "\n", encoding="utf-8")
+
+		reference_dir = sample_dir / "references"
+		reference_images = batch["vis_ref_images"]
+		for ref_index in range(reference_images.size(0)):
+			save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
+
+	was_training = model.training
+	model.eval()
+	num_seen = 0
+	try:
+		for batch in eval_dataloader:
+			if num_seen >= len(rank_indices):
+				break
+			eval_index = rank_indices[num_seen]
+			generator = torch.Generator(device=device)
+			generator.manual_seed(config.training.seed + step * 1000003 + eval_index)
+			with torch.no_grad():
+				with torch.autocast(
+					device_type="cuda",
+					dtype=torch.bfloat16,
+					enabled=torch.cuda.is_available() and config.training.mixed_precision == "bf16",
+				):
+					outputs = model(batch, generate_samples=True, generator=generator)
+
+			video = outputs["video"].detach().cpu()
+			if can_write:
+				save_sample_bundle(batch, video, eval_index)
+			num_seen += 1
+	finally:
+		if was_training:
+			model.train()
+
+	if num_seen != len(rank_indices):
+		raise RuntimeError(
+			"Evaluation dataloader ended before this data-parallel rank generated its assigned samples; "
+			f"saved={num_seen}, expected={len(rank_indices)}."
+		)
+	if dist.is_available() and dist.is_initialized():
+		dist.barrier()
+
+
 def apply_gradient_checkpointing(model: DeepWorldHY) -> None:
 	"""Checkpoint Hunyuan transformer blocks with a non-reentrant wrapper."""
 
-	block_types = (GeometryDoubleStreamBlock, MropeSingleStreamBlock)
+	block_types = (MMTripleStreamBlock, MMSingleStreamBlock)
 
 	def non_reentrant_wrapper(module: nn.Module) -> nn.Module:
 		return checkpoint_wrapper(module, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
@@ -186,7 +328,7 @@ def apply_fsdp2(model: DeepWorldHY, config: DeepWorldHYConfig, is_main_process: 
 	fully_shard(model.transformer, **fsdp_kwargs)
 	fully_shard(model.geo_in, **fsdp_kwargs)
 	fully_shard(model.modality_embeddings, **fsdp_kwargs)
-	if getattr(model, "vision_in", None) is not getattr(model.transformer, "vision_in", None):
+	if getattr(model, "vis_in", None) is not getattr(model.transformer, "vision_in", None):
 		fully_shard(model.vis_in, **fsdp_kwargs)
 
 
@@ -197,7 +339,7 @@ def build_optimizer(model: DeepWorldHY, config: DeepWorldHYConfig) -> AdamW:
 		if params:
 			groups.append({"name": name, "params": params, "lr": lr})
 
-	projector_prefixes = ("geo_in.", "vision_in.", "modality_embeddings.")
+	projector_prefixes = ("geo_in.", "vis_in.", "modality_embeddings.")
 	geometry_params: list[nn.Parameter] = []
 	adapter_params: list[nn.Parameter] = []
 	projector_params: list[nn.Parameter] = []
@@ -215,8 +357,8 @@ def build_optimizer(model: DeepWorldHY, config: DeepWorldHYConfig) -> AdamW:
 		else:
 			remainder_params.append(param)
 
-	transformer_lr = config.optimizer.transformer_learning_rate or config.optimizer.learning_rate
-	geometry_lr = config.optimizer.geometry_learning_rate or config.optimizer.learning_rate
+	transformer_lr = config.optimizer.adapter_learning_rate or config.optimizer.learning_rate
+	geometry_lr = config.optimizer.geo_stream_learning_rate or config.optimizer.learning_rate
 	projector_lr = config.optimizer.projector_learning_rate or geometry_lr
 
 	param_groups: list[dict] = []
@@ -259,7 +401,7 @@ def save_checkpoint(
 ) -> None:
 	"""Save model, optimizer, and scheduler state with distributed checkpointing."""
 
-	checkpoint_dir = output_dir / f"checkpoint-{step}"
+	checkpoint_dir = output_dir / "checkpoints" / f"step_{step:08d}"
 	transformer_dir = checkpoint_dir / "model"
 	optimizer_dir = checkpoint_dir / "optimizer"
 	if is_main_process:
@@ -303,12 +445,9 @@ def main() -> None:
 	set_runtime_environment()
 	args = parse_args()
 	config = load_hy_config(args.config)
-	if config.training.per_device_batch_size != 1:
-		raise ValueError("DeepWorldHY expects `training.per_device_batch_size: 1`.")
 
 	device, rank, _, is_main_process = initialize_torchrun(config)
-	parallel_state = get_parallel_state() if torch.cuda.is_available() else None
-	dp_rank = parallel_state.world_mesh["dp"].get_local_rank() if parallel_state is not None else rank
+	dp_rank, _ = get_data_parallel_rank_size(rank)
 	set_process_seed(config.training.seed + dp_rank)
 
 	output_dir = Path(config.training.output_dir)
@@ -324,6 +463,7 @@ def main() -> None:
 
 	collator = DeepWorldHYBatchCollator(config.dataset, geo_patch_size=model.geo_patch_size)
 	dataloader = create_deepworld_hy_dataloader(config, collator)
+	eval_bundle = build_eval_dataloader(config, collator, rank)
 	total_training_steps = compute_total_training_steps(dataloader, config)
 	lr_scheduler = build_lr_scheduler(optimizer, config, total_training_steps)
 
@@ -376,6 +516,12 @@ def main() -> None:
 					"loss": loss_value,
 					"lr": lr_scheduler.get_last_lr()[0],
 				})
+			if eval_bundle is not None and (
+				global_step == total_training_steps
+				or (config.training.eval_every > 0 and global_step % config.training.eval_every == 0)
+			):
+				evaluate(model, eval_bundle, config, global_step, output_dir, device)
+				write_jsonl_log(metrics_log, {"event": "evaluation", "step": global_step})
 			if (global_step == total_training_steps) or (
 				config.training.save_every > 0 and global_step % config.training.save_every == 0
 			):

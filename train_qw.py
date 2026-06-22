@@ -377,10 +377,9 @@ def build_optimizer(model: DeepWorldQW, config: DeepWorldQWConfig) -> AdamW:
 	)
 
 
-def create_world_dataloader(
+def create_train_dataloader(
 	dataset,
 	dataset_config,
-	batch_size: int,
 	collator: DeepWorldQWBatchCollator,
 	shuffle: bool,
 ) -> DataLoader:
@@ -389,7 +388,6 @@ def create_world_dataloader(
 	Args:
 		dataset: Dataset object to iterate.
 		dataset_config: Dataset configuration that controls worker and memory settings.
-		batch_size: Number of samples per dataloader batch.
 		collator: Collation function for raw world-model samples.
 		shuffle: Whether the map-style dataset should be shuffled.
 
@@ -399,7 +397,7 @@ def create_world_dataloader(
 
 	loader_kwargs = {
 		"dataset": dataset,
-		"batch_size": batch_size,
+		"batch_size": 1,
 		"shuffle": shuffle,
 		"num_workers": dataset_config.num_workers,
 		"pin_memory": dataset_config.pin_memory and torch.cuda.is_available(),
@@ -457,10 +455,9 @@ def build_eval_dataloader(
 	rank_indices = list(range(accelerator.process_index, eval_num_samples, accelerator.num_processes))
 	eval_source = Subset(eval_dataset, rank_indices)
 
-	return create_world_dataloader(
+	return create_train_dataloader(
 		dataset=eval_source,
 		dataset_config=eval_dataset_config,
-		batch_size=1,
 		collator=collator,
 		shuffle=False,
 	)
@@ -472,9 +469,9 @@ def evaluate(
 	eval_dataloader: DataLoader | None,
 	config: DeepWorldQWConfig,
 	step: int,
-	checkpoint_dir: Path,
+	eval_dir: Path,
 ) -> None:
-	"""Generate and save rank-local evaluation videos before checkpoint serialization.
+	"""Generate and save rank-local evaluation videos.
 
 	Args:
 		accelerator: Active Accelerate runtime.
@@ -482,32 +479,30 @@ def evaluate(
 		eval_dataloader: Rank-local dataloader over the eval subset, or `None`.
 		config: Root training configuration.
 		step: Global optimizer step used for deterministic sample seeds.
-		checkpoint_dir: Directory where generated videos should be saved.
+		eval_dir: Directory where generated videos should be saved.
 	"""
 
 	if eval_dataloader is None:
 		return
+	if accelerator.is_main_process:
+		eval_dir.mkdir(parents=True, exist_ok=True)
+	accelerator.wait_for_everyone()
 
 	def save_sample_bundle(
 		batch: dict,
 		generated_video: Tensor,
-		batch_index: int,
 		global_eval_index: int,
 	) -> None:
-		sample_dir = checkpoint_dir / f"sample_{global_eval_index:04d}"
+		sample_dir = eval_dir / f"sample_{global_eval_index:04d}"
 		sample_dir.mkdir(parents=True, exist_ok=True)
 		save_video_tensor(generated_video, sample_dir / "generated.mp4", duration_seconds=config.dataset.video_duration)
-		save_video_tensor(batch["videos"][batch_index], sample_dir / "ground_truth.mp4", duration_seconds=config.dataset.video_duration)
+		save_video_tensor(batch["video"], sample_dir / "ground_truth.mp4", duration_seconds=config.dataset.video_duration)
 
-		prompt = batch["prompts"][batch_index]
-		(sample_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+		(sample_dir / "prompt.txt").write_text(batch["prompt"] + "\n", encoding="utf-8")
 
 		reference_dir = sample_dir / "references"
-		reference_mask = batch["reference_mask"][batch_index]
-		reference_images = batch["geo_images"][batch_index]
-		for ref_index, is_valid in enumerate(reference_mask.tolist()):
-			if not is_valid:
-				continue
+		reference_images = batch["geo_images"]
+		for ref_index in range(reference_images.size(0)):
 			save_image_tensor(reference_images[ref_index], reference_dir / f"reference_{ref_index:02d}.png")
 
 	per_process_samples = config.training.eval_num_samples // accelerator.num_processes
@@ -527,18 +522,14 @@ def evaluate(
 				with accelerator.autocast():
 					outputs = model(batch, generate_samples=True, generator=generator)
 
-			videos = outputs["videos"].detach().cpu()
-			for batch_index in range(videos.size(0)):
-				if num_saved >= per_process_samples:
-					break
-				global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
-				save_sample_bundle(
-					batch=batch,
-					generated_video=videos[batch_index],
-					batch_index=batch_index,
-					global_eval_index=global_eval_index,
-				)
-				num_saved += 1
+			video = outputs["video"].detach().cpu()
+			global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
+			save_sample_bundle(
+				batch=batch,
+				generated_video=video,
+				global_eval_index=global_eval_index,
+			)
+			num_saved += 1
 
 		if num_saved != per_process_samples:
 			raise RuntimeError(
@@ -552,7 +543,7 @@ def evaluate(
 	accelerator.wait_for_everyone()
 	if accelerator.is_main_process:
 		accelerator.print(
-			f"Saved {config.training.eval_num_samples} evaluation videos to {checkpoint_dir}."
+			f"Saved {config.training.eval_num_samples} evaluation videos to {eval_dir}."
 		)
 
 
@@ -564,7 +555,7 @@ def save_checkpoint_with_evaluation(
 	step: int,
 	output_dir: Path,
 ) -> None:
-	"""Generate evaluation videos and then save model weights in the same directory.
+	"""Generate evaluation videos and save model weights in separate run subdirectories.
 
 	Args:
 		accelerator: Active Accelerate runtime.
@@ -575,12 +566,13 @@ def save_checkpoint_with_evaluation(
 		output_dir: Root directory where checkpoints should be written.
 	"""
 
-	checkpoint_dir = output_dir / f"checkpoint-{step}"
+	checkpoint_dir = output_dir / "checkpoints" / f"step_{step:08d}"
+	eval_dir = output_dir / "evaluation" / f"step_{step:08d}"
 	if accelerator.is_main_process:
 		checkpoint_dir.mkdir(parents=True, exist_ok=True)
 	accelerator.wait_for_everyone()
 	
-	evaluate(accelerator, model, eval_dataloader, config, step, checkpoint_dir)
+	evaluate(accelerator, model, eval_dataloader, config, step, eval_dir)
 	
 	# NOTE: `get_state_dict` is on all ranks.
 	accelerator.wait_for_everyone()
@@ -649,9 +641,8 @@ def main() -> None:
 			f"to match patch size {collator.geo_patch_size}."
 		)
 
-	dataloader = create_world_dataloader(
+	dataloader = create_train_dataloader(
 		dataset=dataset,
-		batch_size=config.training.per_device_batch_size,
 		shuffle=config.dataset.shuffle,
 		dataset_config=config.dataset,
 		collator=collator,
@@ -712,14 +703,35 @@ def main() -> None:
 							"lr": lr_scheduler.get_last_lr()[0],
 						})
 					
-					if (global_step == total_training_steps) or (config.training.save_every > 0 and global_step % config.training.save_every == 0):
+					should_checkpoint = (
+						global_step == total_training_steps
+						or (config.training.save_every > 0 and global_step % config.training.save_every == 0)
+					)
+					should_eval = (
+						eval_dataloader is not None
+						and config.training.eval_every > 0
+						and global_step % config.training.eval_every == 0
+					)
+					if should_eval and not should_checkpoint:
+						evaluate(
+							accelerator, model, eval_dataloader,
+							config, global_step, output_dir / "evaluation" / f"step_{global_step:08d}"
+						)
+						write_jsonl_log(metrics_log, {
+							"event": "eval", "step": global_step
+						})
+					if should_checkpoint:
 						save_checkpoint_with_evaluation(
 							accelerator, model, eval_dataloader,
 							config, global_step, output_dir
 						)
 						write_jsonl_log(metrics_log, {
-							"event": "eval", "step": global_step
+							"event": "checkpoint", "step": global_step
 						})
+						if eval_dataloader is not None:
+							write_jsonl_log(metrics_log, {
+								"event": "eval", "step": global_step
+							})
 					if global_step >= total_training_steps:
 						break
 		epoch_index += 1

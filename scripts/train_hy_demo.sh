@@ -9,4 +9,3 @@ torchrun \
 	$SCRIPT \
 	--config $CONFIG_FILE \
 	"$@"
-x

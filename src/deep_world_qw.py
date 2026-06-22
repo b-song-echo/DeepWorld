@@ -1,4 +1,6 @@
 from copy import deepcopy
+import math
+from typing import Any
 
 from einops import rearrange
 import torch
@@ -12,8 +14,6 @@ from vggt.vggt.models.vggt import VGGT
 from src.config import DeepWorldQWBrainConfig, DeepWorldQWConfig, DeepWorldQWRendererConfig
 from src.modules import LoraLinear, inject_lora_layers
 from src.utils import resolve_torch_dtype
-
-# TODO: Currently, the model supports batch size greater than 1, but this is unnecessary. Similar to DeepWorldHY,local  batch size 1 will always be used, ecause even two videos can cause OOM, and a single video can mpush the GPU to its limit. This simplifies code significantly because there is no need to pad/unpad for variable sequence lengths, which is particularly a pain in the ass for multimodal data.
 
 
 VIS_MODALITY = 0
@@ -297,20 +297,9 @@ class DeepWorldQWBrain(nn.Module):
 
 	def _encode_visual(
 		self, pixel_values: Tensor,
-		image_grid_thw: Tensor, vis_ref_counts: Tensor,
-	) -> tuple[list[list[Tensor]], list[list[tuple[int, int, int]]]]:
-		"""Extract visual tokens from Qwen's frozen vision encoder.
-
-		Args:
-			pixel_values: Flattened Qwen image inputs for all references in the batch.
-			image_grid_thw: Qwen feature-grid metadata for each flattened reference.
-			vis_ref_counts: Number of references per batch element.
-
-		Returns:
-			A tuple containing:
-			- visual feature tensors regrouped per sample,
-			- the corresponding `(t, h, w)` grids after Qwen's spatial merge.
-		"""
+		image_grid_thw: Tensor,
+	) -> tuple[list[Tensor], list[tuple[int, int, int]]]:
+		"""Extract one sample's reference-image tokens with Qwen's frozen vision encoder."""
 
 		device = next(self.parameters()).device
 		vis_dtype = next(self.vision_encoder.parameters()).dtype
@@ -323,73 +312,43 @@ class DeepWorldQWBrain(nn.Module):
 		bridge_dtype = self.vis_bridge.weight.dtype
 		if isinstance(image_features, tuple):
 			feature_lengths = [features.size(0) for features in image_features]
-			if feature_lengths:
-				flat_features = torch.cat(image_features, dim=0).to(bridge_dtype)
-				flat_features = self.vis_bridge(flat_features)
-				image_features = torch.split(flat_features, feature_lengths)
+			flat_features = torch.cat(image_features, dim=0).to(bridge_dtype)
+			flat_features = self.vis_bridge(flat_features)
+			vis_features = list(torch.split(flat_features, feature_lengths))
 		else:
 			image_features = image_features.to(bridge_dtype)
 			image_features = self.vis_bridge(image_features)
+			vis_features = [image_features] if image_features.dim() == 2 else list(image_features)
 
-		vis_groups: list[list[Tensor]] = []
-		vis_grids: list[list[tuple[int, int, int]]] = []
-		offset = 0
-		for count in vis_ref_counts.tolist():
-			vis_groups.append(list(image_features[offset:(offset + count)]))
-			sample_grids: list[tuple[int, int, int]] = []
-			for grid in image_grid_thw[offset:(offset + count)]:
-				grid_t, grid_h, grid_w = grid.tolist()
-				patch_size = self.vis_patch_size
-				grid_h = grid_h // patch_size
-				grid_w = grid_w // patch_size
-				sample_grids.append((grid_t, grid_h, grid_w))
-			vis_grids.append(sample_grids)
-			offset += count
-		return vis_groups, vis_grids
+		vis_grids: list[tuple[int, int, int]] = []
+		for grid in image_grid_thw:
+			grid_t, grid_h, grid_w = grid.tolist()
+			patch_size = self.vis_patch_size
+			vis_grids.append((grid_t, grid_h // patch_size, grid_w // patch_size))
+		return vis_features, vis_grids
 
 	def _encode_geometry(
 		self, geo_images: Tensor,
-		reference_mask: Tensor,
-	) -> tuple[list[list[Tensor]], list[list[tuple[int, int, int]]]]:
-		"""Extract geometry tokens from the frozen VGGT aggregator.
-
-		Args:
-			geo_images: Shared reference-image tensor with shape `(B, S_ref, 3, H, W)`.
-			reference_mask: Boolean mask identifying valid reference-image slots.
-
-		Returns:
-			A tuple containing:
-			- geometry feature tensors regrouped per sample,
-			- the corresponding `(t, h, w)` token grids.
-		"""
+	) -> tuple[list[Tensor], list[tuple[int, int, int]]]:
+		"""Extract one sample's reference-image geometry tokens with frozen VGGT."""
 
 		device = next(self.parameters()).device
 		vggt_dtype = next(self.geometry_encoder.aggregator.parameters()).dtype
 		bridge_dtype = self.geo_bridge[0].weight.dtype
 		with torch.no_grad():
 			aggregated_tokens, patch_start_idx = self.geometry_encoder.aggregator(
-				geo_images.to(device, vggt_dtype, non_blocking=True)
+				geo_images.unsqueeze(0).to(device, vggt_dtype, non_blocking=True)
 			)
-			geo_tokens = aggregated_tokens[-1][:, :, patch_start_idx:, :]
+			geo_tokens = aggregated_tokens[-1][0, :, patch_start_idx:, :]
 		geo_tokens = self.geo_bridge(geo_tokens.to(bridge_dtype))
 
 		patch_size = self.geometry_encoder.aggregator.patch_size
 		grid_h = geo_images.size(-2) // patch_size
 		grid_w = geo_images.size(-1) // patch_size
 
-		geo_groups: list[list[Tensor]] = []
-		geo_grids: list[list[tuple[int, int, int]]] = []
-		for batch_index in range(geo_images.size(0)):
-			sample_features: list[Tensor] = []
-			sample_grids: list[tuple[int, int, int]] = []
-			for ref_index in range(geo_images.size(1)):
-				if not reference_mask[batch_index, ref_index]:
-					continue
-				sample_features.append(geo_tokens[batch_index, ref_index])
-				sample_grids.append((1, grid_h, grid_w))
-			geo_groups.append(sample_features)
-			geo_grids.append(sample_grids)
-		return geo_groups, geo_grids
+		geo_features = list(geo_tokens)
+		geo_grids = [(1, grid_h, grid_w) for _ in geo_features]
+		return geo_features, geo_grids
 
 	def _make_txt_positions(
 		self, length: int, start_index: int, device: torch.device
@@ -485,31 +444,15 @@ class DeepWorldQWBrain(nn.Module):
 
 	def _build_language_inputs(
 		self,
-		vis_groups: list[list[Tensor]],
-		vis_grids: list[list[tuple[int, int, int]]],
-		geo_groups: list[list[Tensor]],
-		geo_grids: list[list[tuple[int, int, int]]],
+		vis_features: list[Tensor],
+		vis_grids: list[tuple[int, int, int]],
+		geo_features: list[Tensor],
+		geo_grids: list[tuple[int, int, int]],
 		txt_input_ids: Tensor,
 		txt_attention_mask: Tensor,
-		latent_patch_grids: Tensor,
-	) -> dict[str, Tensor | list[tuple[int, int]]]:
-		"""Assemble the direct-embedding Qwen language-model inputs.
-
-		Args:
-			vis_groups: Per-sample visual feature sequences.
-			vis_grids: Per-sample visual token grids.
-			geo_groups: Per-sample geometry feature sequences.
-			geo_grids: Per-sample geometry token grids.
-			txt_input_ids: Tokenized prompt IDs.
-			txt_attention_mask: Prompt attention masks.
-			latent_patch_grids: Target Wan latent token grids, one per batch element.
-
-		Returns:
-			A dictionary containing padded embeddings, masks, position IDs, modality IDs,
-			and bookkeeping for where the generation-token slice lives in each sample.
-			Each sample sequence is prefixed with learned modality marker tokens for the
-			visual, geometry, text, and generation spans.
-		"""
+		latent_patch_grid: tuple[int, int, int],
+	) -> dict[str, Tensor | int]:
+		"""Assemble one direct-embedding Qwen sequence for the local sample."""
 
 		device = next(self.parameters()).device
 		txt_embeddings = self.language_model.embed_tokens(
@@ -517,128 +460,99 @@ class DeepWorldQWBrain(nn.Module):
 		)
 		txt_embeddings = self.txt_bridge(txt_embeddings)
 		txt_attention_mask = txt_attention_mask.to(device, non_blocking=True).bool()
-		batch_size = txt_input_ids.size(0)
 
-		sequences: list[Tensor] = []
-		position_ids: list[Tensor] = []
-		modality_ids: list[Tensor] = []
-		gen_lengths: list[int] = []
+		parts: list[Tensor] = []
+		part_positions: list[Tensor] = []
+		part_modalities: list[Tensor] = []
+		cursor = 0
 
-		for batch_index in range(batch_size):
-			parts: list[Tensor] = []
-			part_positions: list[Tensor] = []
-			part_modalities: list[Tensor] = []
-			cursor = 0
-
-			cursor = self._append_segment_token(
-				"vis", VIS_MODALITY, parts, part_positions,
-				part_modalities, cursor, device, txt_embeddings.dtype,
-			)
-
-			for features, grid in zip(vis_groups[batch_index], vis_grids[batch_index]):
-				features = features.to(device)
-				positions, cursor = self._make_grid_positions(grid, cursor, device)
-				self._append_span(
-					parts, part_positions, part_modalities,
-					features, positions, VIS_MODALITY,
-				)
-
-			cursor = self._append_segment_token(
-				"geo", GEO_MODALITY, parts, part_positions,
-				part_modalities, cursor, device, txt_embeddings.dtype,
-			)
-
-			for features, grid in zip(geo_groups[batch_index], geo_grids[batch_index]):
-				features = features.to(device)
-				positions, cursor = self._make_grid_positions(grid, cursor, device)
-				self._append_span(
-					parts, part_positions, part_modalities,
-					features, positions, GEO_MODALITY,
-				)
-
-			txt_features = txt_embeddings[batch_index, txt_attention_mask[batch_index]]
-			cursor = self._append_segment_token(
-				"txt", TXT_MODALITY, parts, part_positions,
-				part_modalities, cursor, device, txt_embeddings.dtype,
-			)
-			positions, cursor = self._make_txt_positions(txt_features.size(0), cursor, device)
+		cursor = self._append_segment_token(
+			"vis", VIS_MODALITY, parts, part_positions,
+			part_modalities, cursor, device, txt_embeddings.dtype,
+		)
+		for features, grid in zip(vis_features, vis_grids):
+			features = features.to(device)
+			positions, cursor = self._make_grid_positions(grid, cursor, device)
 			self._append_span(
 				parts, part_positions, part_modalities,
-				txt_features, positions, TXT_MODALITY,
+				features, positions, VIS_MODALITY,
 			)
 
-			latent_grid = tuple(int(value) for value in latent_patch_grids[batch_index].tolist())
-			cursor = self._append_segment_token(
-				"gen", GEN_MODALITY, parts, part_positions,
-				part_modalities, cursor, device, txt_embeddings.dtype,
-			)
-			gen_positions, cursor = self._make_grid_positions(latent_grid, cursor, device)
-			gen_length = int(torch.prod(latent_patch_grids[batch_index]).item())
-			gen_lengths.append(gen_length)
-			gen_tokens = self.gen_slot_token.to(device=device, dtype=txt_embeddings.dtype).expand(gen_length, -1)
+		cursor = self._append_segment_token(
+			"geo", GEO_MODALITY, parts, part_positions,
+			part_modalities, cursor, device, txt_embeddings.dtype,
+		)
+		for features, grid in zip(geo_features, geo_grids):
+			features = features.to(device)
+			positions, cursor = self._make_grid_positions(grid, cursor, device)
 			self._append_span(
 				parts, part_positions, part_modalities,
-				gen_tokens, gen_positions, GEN_MODALITY,
+				features, positions, GEO_MODALITY,
 			)
 
-			sequences.append(torch.cat(parts, dim=0))
-			position_ids.append(torch.cat(part_positions, dim=1))
-			modality_ids.append(torch.cat(part_modalities, dim=0))
+		txt_features = txt_embeddings[txt_attention_mask]
+		cursor = self._append_segment_token(
+			"txt", TXT_MODALITY, parts, part_positions,
+			part_modalities, cursor, device, txt_embeddings.dtype,
+		)
+		positions, cursor = self._make_txt_positions(txt_features.size(0), cursor, device)
+		self._append_span(
+			parts, part_positions, part_modalities,
+			txt_features, positions, TXT_MODALITY,
+		)
 
-		max_sequence_length = max(sequence.size(0) for sequence in sequences)
-		inputs_embeds = torch.zeros(batch_size, max_sequence_length, self.hidden_size, device=device, dtype=txt_embeddings.dtype)
-		attention_mask = torch.zeros(batch_size, max_sequence_length, device=device, dtype=torch.long)
-		batched_position_ids = torch.zeros(3, batch_size, max_sequence_length, device=device, dtype=torch.long)
-		batched_modality_ids = torch.full((batch_size, max_sequence_length), TXT_MODALITY, device=device, dtype=torch.long)
-		gen_mask = torch.zeros(batch_size, max(gen_lengths), device=device, dtype=torch.bool)
+		cursor = self._append_segment_token(
+			"gen", GEN_MODALITY, parts, part_positions,
+			part_modalities, cursor, device, txt_embeddings.dtype,
+		)
+		gen_positions, cursor = self._make_grid_positions(latent_patch_grid, cursor, device)
+		gen_length = math.prod(latent_patch_grid)
+		gen_tokens = self.gen_slot_token.to(device=device, dtype=txt_embeddings.dtype).expand(gen_length, -1)
+		self._append_span(
+			parts, part_positions, part_modalities,
+			gen_tokens, gen_positions, GEN_MODALITY,
+		)
 
-		gen_slices: list[tuple[int, int]] = []
-		for batch_index, (sequence, pos, mods, gen_length) in enumerate(zip(sequences, position_ids, modality_ids, gen_lengths)):
-			sequence_length = sequence.size(0)
-			inputs_embeds[batch_index, :sequence_length] = sequence
-			attention_mask[batch_index, :sequence_length] = 1
-			batched_position_ids[:, batch_index, :sequence_length] = pos
-			batched_modality_ids[batch_index, :sequence_length] = mods
-			gen_start = sequence_length - gen_length
-			gen_slices.append((gen_start, sequence_length))
-			gen_mask[batch_index, :gen_length] = True
+		sequence = torch.cat(parts, dim=0)
+		position_ids = torch.cat(part_positions, dim=1)
+		modality_ids = torch.cat(part_modalities, dim=0)
+		sequence_length = sequence.size(0)
+		gen_start = sequence_length - gen_length
 
 		return {
-			"inputs_embeds": inputs_embeds,
-			"attention_mask": attention_mask,
-			"position_ids": batched_position_ids,
-			"modality_ids": batched_modality_ids,
-			"gen_mask": gen_mask,
-			"gen_slices": gen_slices,
+			"inputs_embeds": sequence.unsqueeze(0),
+			"attention_mask": torch.ones(1, sequence_length, device=device, dtype=torch.long),
+			"position_ids": position_ids.unsqueeze(1),
+			"modality_ids": modality_ids.unsqueeze(0),
+			"gen_start": gen_start,
+			"gen_length": gen_length,
 		}
 
-	def forward(self, batch: dict[str, Tensor], latent_patch_grids: Tensor) -> dict[str, Tensor]:
+	def forward(self, batch: dict[str, Any], latent_patch_grid: tuple[int, int, int]) -> dict[str, Tensor]:
 		"""Run the full Qwen/VGGT conditioning pipeline.
 
 		Args:
 			batch: Training batch produced by `DeepWorldQWBatchCollator`.
-			latent_patch_grids: Desired Wan latent token grids for each batch element.
+			latent_patch_grid: Desired Wan latent token grid for the local sample.
 
 		Returns:
-			A dictionary containing:
-			- `gen_hidden_states`: final hidden states of the learned generation tokens,
-			- `gen_mask`: valid-token mask for those generation slots.
+			A dictionary containing the final hidden states of the learned
+			generation tokens.
 		"""
 
-		vis_groups, vis_grids = self._encode_visual(
+		vis_features, vis_grids = self._encode_visual(
 			batch["qwen_vis_pixel_values"],
 			batch["qwen_vis_grid_thw"],
-			batch["vis_ref_counts"],
 		)
-		geo_groups, geo_grids = self._encode_geometry(batch["geo_images"], batch["reference_mask"])
+		geo_features, geo_grids = self._encode_geometry(batch["geo_images"])
 		language_inputs = self._build_language_inputs(
-			vis_groups=vis_groups,
+			vis_features=vis_features,
 			vis_grids=vis_grids,
-			geo_groups=geo_groups,
+			geo_features=geo_features,
 			geo_grids=geo_grids,
 			txt_input_ids=batch["txt_input_ids"],
 			txt_attention_mask=batch["txt_attention_mask"],
-			latent_patch_grids=latent_patch_grids,
+			latent_patch_grid=latent_patch_grid,
 		)
 
 		language_outputs = self.language_model(
@@ -650,22 +564,11 @@ class DeepWorldQWBrain(nn.Module):
 			use_cache=False
 		)
 		last_hidden_state = language_outputs.last_hidden_state
-		max_gen_length = language_inputs["gen_mask"].size(1)
-		gen_hidden_states = torch.zeros(
-			last_hidden_state.size(0),
-			max_gen_length,
-			last_hidden_state.size(-1),
-			device=last_hidden_state.device,
-			dtype=last_hidden_state.dtype,
-		)
-
-		for batch_index, (start, end) in enumerate(language_inputs["gen_slices"]):
-			length = end - start
-			gen_hidden_states[batch_index, :length] = last_hidden_state[batch_index, start:end]
+		gen_start = int(language_inputs["gen_start"])
+		gen_length = int(language_inputs["gen_length"])
 
 		return {
-			"gen_hidden_states": gen_hidden_states,
-			"gen_mask": language_inputs["gen_mask"],
+			"gen_hidden_states": last_hidden_state[:, gen_start:(gen_start + gen_length)],
 		}
 
 
@@ -840,8 +743,15 @@ class DeepWorldQWRenderer(nn.Module):
 		with torch.no_grad():
 			return self.vae.decode(latents, return_dict=False)[0]
 
-	def _latent_patch_grid_tuple(self, latents: Tensor) -> tuple[int, int, int]:
-		"""Compute one latent tensor's patch grid and validate divisibility."""
+	def latent_patch_grid(self, latents: Tensor) -> tuple[int, int, int]:
+		"""Compute the Wan patch-token grid for one latent tensor.
+
+		Args:
+			latents: Latent tensor with shape `(1, C, T, H, W)`.
+
+		Returns:
+			A `(t, h, w)` patch-grid tuple.
+		"""
 
 		p_t, p_h, p_w = self.transformer.config.patch_size
 		latent_t, latent_h, latent_w = latents.size()[-3:]
@@ -852,29 +762,16 @@ class DeepWorldQWRenderer(nn.Module):
 			)
 		return latent_t // p_t, latent_h // p_h, latent_w // p_w
 
-	def latent_patch_grids(self, latents: Tensor) -> Tensor:
-		"""Compute the Wan patch-token grid for a latent tensor.
-
-		Args:
-			latents: Latent tensor with shape `(B, C, T, H, W)`.
-
-		Returns:
-			A tensor of shape `(B, 3)` containing `(t, h, w)` patch-grid sizes.
-		"""
-
-		grid = torch.tensor(self._latent_patch_grid_tuple(latents), device=latents.device, dtype=torch.long)
-		return grid.unsqueeze(0).expand(latents.size(0), -1)
-
 	def _compute_time_embeddings(
 		self,
 		timestep: Tensor,
 		dtype: torch.dtype,
 		device: torch.device,
 	) -> tuple[Tensor, Tensor]:
-		"""Compute Wan time embeddings from per-sample or per-token timesteps.
+		"""Compute Wan time embeddings for the current single-sample timestep.
 
 		Args:
-			timestep: Current diffusion timestep for each sample or each patch token.
+			timestep: Current diffusion timestep with shape `(1, 1)`.
 			dtype: Target dtype for the returned tensors.
 			device: Target device.
 
@@ -903,7 +800,7 @@ class DeepWorldQWRenderer(nn.Module):
 	def _project_conditioning(
 		self,
 		condition_hidden_states: Tensor,
-		token_mask: Tensor | None,
+		drop_condition: Tensor | bool,
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> Tensor:
@@ -911,29 +808,28 @@ class DeepWorldQWRenderer(nn.Module):
 
 		Args:
 			condition_hidden_states: Qwen generation hidden states aligned with Wan tokens.
-			token_mask: Optional boolean mask identifying valid conditioning tokens.
+			drop_condition: Scalar flag that replaces the whole conditioning span
+				with the learned null token.
 			device: Target device.
 			dtype: Target dtype.
 
 		Returns:
-			Projected condition tensor with padded slots replaced by a learned null token.
+			Projected condition tensor, optionally replaced by learned null tokens.
 		"""
 
 		proj_dtype = self.condition_proj.weight.dtype
 		condition_hidden_states = self.condition_proj(
 			condition_hidden_states.to(device=device, dtype=proj_dtype, non_blocking=True)
 		).to(dtype=dtype)
-		if token_mask is None:
-			return condition_hidden_states
+		if isinstance(drop_condition, bool):
+			if not drop_condition:
+				return condition_hidden_states
+			null_cond = self.null_cond.to(device=device, dtype=dtype).expand_as(condition_hidden_states)
+			return null_cond
 
-		token_mask = token_mask.to(device=device, dtype=torch.bool, non_blocking=True)
-		if token_mask.size() != condition_hidden_states.size()[:2]:
-			raise ValueError(
-				"`token_mask` must align with projected conditioning tokens; "
-				f"got mask={tuple(token_mask.size())}, condition={tuple(condition_hidden_states.size()[:2])}."
-			)
+		drop_condition = drop_condition.to(device=device, dtype=torch.bool)
 		null_cond = self.null_cond.to(device=device, dtype=dtype).expand_as(condition_hidden_states)
-		return torch.where(token_mask.unsqueeze(-1), condition_hidden_states, null_cond)
+		return torch.where(drop_condition.view(1, 1, 1), null_cond, condition_hidden_states)
 
 	def _forward_input_addition_block(
 		self,
@@ -977,51 +873,37 @@ class DeepWorldQWRenderer(nn.Module):
 	def _normalize_timestep(
 		self,
 		timestep: Tensor,
-		batch_size: int,
-		num_tokens: int,
 		device: torch.device,
 	) -> Tensor:
-		"""Return timesteps in the 2D shape expected by Wan's per-token path.
-
-		Scalar and per-sample timesteps become `(B, 1)`, which broadcasts across
-		patch tokens without materializing `(B, N)`. Real per-token timesteps keep
-		their `(B, N)` shape.
-		"""
+		"""Return a single-sample timestep in the 2D shape expected by Wan."""
 
 		timestep = timestep.to(device=device)
 		if timestep.dim() == 0:
-			return timestep.view(1, 1).expand(batch_size, 1)
+			return timestep.view(1, 1)
 		if timestep.dim() == 1:
-			return timestep.view(-1, 1)
-		if timestep.dim() != 2:
-			raise ValueError(f"`timestep` must be scalar, 1D, or 2D, got shape {tuple(timestep.size())}.")
-		if timestep.size(1) not in {1, num_tokens}:
-			raise ValueError(
-				"Timestep sequence length must be 1 or match Wan patch tokens; "
-				f"got timestep={tuple(timestep.size())}, num_tokens={num_tokens}."
-			)
-		if timestep.size(0) == 1 and batch_size != 1:
-			return timestep.expand(batch_size, timestep.size(1))
-		return timestep
+			if timestep.numel() != 1:
+				raise ValueError(f"DeepWorldQW expects one timestep, got shape {tuple(timestep.size())}.")
+			return timestep.view(1, 1)
+		if timestep.dim() == 2 and tuple(timestep.size()) == (1, 1):
+			return timestep
+		raise ValueError(f"DeepWorldQW expects one timestep, got shape {tuple(timestep.size())}.")
 
 	def _forward_cross_attention(
 		self,
 		hidden_states: Tensor,
 		timestep: Tensor,
 		condition_hidden_states: Tensor,
-		token_mask: Tensor | None,
+		drop_condition: Tensor | bool,
 		return_dict: bool,
 	) -> dict[str, Tensor] | Tensor:
 		"""Run Wan's native cross-attention path with Qwen states as text embeddings."""
 
 		dtype = self.transformer.patch_embedding.weight.dtype
 		device = hidden_states.device
-		grid_t, grid_h, grid_w = self._latent_patch_grid_tuple(hidden_states)
-		num_tokens = grid_t * grid_h * grid_w
-		timestep = self._normalize_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		timestep = self._normalize_timestep(timestep, device)
 		encoder_hidden_states = self._project_conditioning(
 			condition_hidden_states,
-			token_mask,
+			drop_condition,
 			device=device,
 			dtype=dtype,
 		)
@@ -1041,24 +923,23 @@ class DeepWorldQWRenderer(nn.Module):
 		hidden_states: Tensor,
 		timestep: Tensor,
 		condition_hidden_states: Tensor,
-		token_mask: Tensor | None,
+		drop_condition: Tensor | bool,
 		return_dict: bool,
 	) -> dict[str, Tensor] | Tensor:
 		"""Run the input-addition Qwen-to-Wan conditioning path."""
 
 		p_t, p_h, p_w = self.transformer.config.patch_size
-		grid_t, grid_h, grid_w = self._latent_patch_grid_tuple(hidden_states)
-		num_tokens = grid_t * grid_h * grid_w
+		grid_t, grid_h, grid_w = self.latent_patch_grid(hidden_states)
 		dtype = self.transformer.patch_embedding.weight.dtype
 		device = hidden_states.device
 
-		timestep = self._normalize_timestep(timestep, hidden_states.size(0), num_tokens, device)
+		timestep = self._normalize_timestep(timestep, device)
 		rotary_emb = self.transformer.rope(hidden_states)
 		hidden_states = self.transformer.patch_embedding(hidden_states.to(dtype=dtype))
 		hidden_states = hidden_states.flatten(2).transpose(1, 2)
 		condition_hidden_states = self._project_conditioning(
 			condition_hidden_states,
-			token_mask,
+			drop_condition,
 			device=device,
 			dtype=hidden_states.dtype,
 		)
@@ -1096,16 +977,16 @@ class DeepWorldQWRenderer(nn.Module):
 		hidden_states: Tensor,
 		timestep: Tensor,
 		condition_hidden_states: Tensor,
-		token_mask: Tensor | None = None,
+		drop_condition: Tensor | bool = False,
 		return_dict: bool = True,
 	) -> dict[str, Tensor] | Tensor:
 		"""Predict the latent-space denoising output.
 
 		Args:
-			hidden_states: Noisy Wan latents with shape `(B, C, T, H, W)`.
-			timestep: Current timestep per sample.
+			hidden_states: Noisy Wan latents with shape `(1, C, T, H, W)`.
+			timestep: Current timestep for the single local sample.
 			condition_hidden_states: Qwen generation states aligned with Wan patch tokens.
-			token_mask: Optional boolean mask for valid conditioning tokens.
+			drop_condition: Whether to replace conditioning with learned null tokens.
 			return_dict: Whether to return a dict with key `sample`.
 
 		Returns:
@@ -1117,7 +998,7 @@ class DeepWorldQWRenderer(nn.Module):
 				hidden_states=hidden_states,
 				timestep=timestep,
 				condition_hidden_states=condition_hidden_states,
-				token_mask=token_mask,
+				drop_condition=drop_condition,
 				return_dict=return_dict,
 			)
 		elif self.condition_injection_mode == "input_addition":
@@ -1125,7 +1006,7 @@ class DeepWorldQWRenderer(nn.Module):
 				hidden_states=hidden_states,
 				timestep=timestep,
 				condition_hidden_states=condition_hidden_states,
-				token_mask=token_mask,
+				drop_condition=drop_condition,
 				return_dict=return_dict,
 			)
 		else:
@@ -1195,98 +1076,19 @@ class DeepWorldQW(nn.Module):
 		)
 		self.scheduler = build_wan_scheduler(config, FlowMatchEulerDiscreteScheduler)
 
-	def _build_loss_masks(self, frame_counts: Tensor, latents: Tensor) -> tuple[Tensor, Tensor]:
-		"""Create latent-space and token-space validity masks for padded batches.
-
-		Args:
-			frame_counts: Valid video frame count per batch element before padding.
-			latents: Encoded Wan latents for the padded batch.
-
-		Returns:
-			A tuple containing:
-			- `latent_mask` with shape `(B, 1, T_lat, H_lat, W_lat)`,
-			- `token_mask` with shape `(B, N_tokens)`.
-		"""
-
-		device = latents.device
-		batch_size, _, latent_frames, latent_height, latent_width = latents.size()
-		valid_latent_frames = ((frame_counts.to(device, non_blocking=True) - 1) // self.renderer.vae.config.scale_factor_temporal) + 1
-
-		latent_mask = torch.zeros(batch_size, 1, latent_frames, latent_height, latent_width, device=device, dtype=latents.dtype)
-		for batch_index, valid_frames in enumerate(valid_latent_frames.tolist()):
-			latent_mask[batch_index, :, :valid_frames] = 1.0
-
-		p_t, p_h, p_w = self.renderer.transformer.config.patch_size
-		token_frames = latent_frames // p_t
-		token_height = latent_height // p_h
-		token_width = latent_width // p_w
-		token_mask = torch.zeros(batch_size, token_frames * token_height * token_width, device=device, dtype=torch.bool)
-		for batch_index, valid_frames in enumerate(valid_latent_frames.tolist()):
-			valid_tokens = (valid_frames // p_t) * token_height * token_width
-			token_mask[batch_index, :valid_tokens] = True
-
-		return latent_mask, token_mask
-
-	def _expand_renderer_training_batch(
-		self,
-		latents: Tensor,
-		latent_mask: Tensor,
-		token_mask: Tensor,
-		condition_hidden_states: Tensor,
-	) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-		"""Duplicate renderer-side inputs for independent diffusion timestep training.
-
-		The Qwen brain runs once per real sample. The lightweight Wan renderer can
-		then see multiple noisy versions of each encoded latent by repeating the
-		clean latents and conditioning states along the batch dimension.
-
-		Args:
-			latents: Clean Wan latents with shape `(B, C, T, H, W)`.
-			latent_mask: Latent loss mask aligned with `latents`.
-			token_mask: Wan patch-token validity mask aligned with `latents`.
-			condition_hidden_states: Qwen generation states aligned with Wan tokens.
-
-		Returns:
-			The repeated latents, latent masks, token masks, and conditioning states.
-		"""
-
-		multiplier = self.config.renderer.batch_multiplier
-		if multiplier == 1:
-			return latents, latent_mask, token_mask, condition_hidden_states
-
-		return (
-			latents.repeat_interleave(multiplier, dim=0),
-			latent_mask.repeat_interleave(multiplier, dim=0),
-			token_mask.repeat_interleave(multiplier, dim=0),
-			condition_hidden_states.repeat_interleave(multiplier, dim=0),
-		)
-
-	def _apply_condition_dropout(self, token_mask: Tensor) -> Tensor:
-		"""Randomly replace full renderer samples with the learned null condition.
-
-		The Wan renderer already interprets `False` token-mask entries as null
-		conditioning slots. Clearing an entire row therefore drops all Qwen
-		conditioning for that renderer-side sample while preserving tensor shapes.
-
-		Args:
-			token_mask: Boolean conditioning validity mask with shape `(B, N)`.
-
-		Returns:
-			A mask with some complete rows cleared during training.
-		"""
+	def _sample_condition_drop(self, device: torch.device) -> Tensor | bool:
+		"""Sample the scalar classifier-free conditioning dropout flag."""
 
 		dropout_prob = self.config.renderer.condition_dropout_prob
 		if not self.training or dropout_prob <= 0.0:
-			return token_mask
+			return False
 		if dropout_prob >= 1.0:
-			return torch.zeros_like(token_mask)
-
-		keep_condition = torch.rand(token_mask.size(0), device=token_mask.device) >= dropout_prob
-		return token_mask & keep_condition.unsqueeze(1)
+			return True
+		return torch.rand((), device=device) < dropout_prob
 
 	def forward(
 		self,
-		batch: dict[str, Tensor],
+		batch: dict[str, Any],
 		return_auxiliary: bool = False,
 		generate_samples: bool = False,
 		generator: torch.Generator | None = None,
@@ -1306,37 +1108,28 @@ class DeepWorldQW(nn.Module):
 		if generate_samples:
 			return {"videos": self.generate(batch, generator=generator)}
 
-		videos = batch["videos"].to(device=next(self.parameters()).device, non_blocking=True)
+		videos = batch["videos"].unsqueeze(0).to(device=next(self.parameters()).device, non_blocking=True)
 		latents = self.renderer.encode_videos(videos, sample_posterior=self.config.renderer.vae_sample_posterior)
-		latent_mask, token_mask = self._build_loss_masks(batch["video_frame_counts"], latents)
-		latent_patch_grids = self.renderer.latent_patch_grids(latents)
+		latent_patch_grid = self.renderer.latent_patch_grid(latents)
 
-		brain_outputs = self.brain(batch, latent_patch_grids=latent_patch_grids)
+		brain_outputs = self.brain(batch, latent_patch_grid=latent_patch_grid)
 		condition_hidden_states = brain_outputs["gen_hidden_states"]
 
-		latents, latent_mask, token_mask, condition_hidden_states = self._expand_renderer_training_batch(
-			latents, latent_mask, token_mask, condition_hidden_states,
-		)
-
 		noise = torch.randn_like(latents)
-		sigmas = torch.rand(latents.size(0), device=latents.device, dtype=latents.dtype)
-		sigma_view = sigmas.view(-1, 1, 1, 1, 1)
+		sigma = torch.rand((), device=latents.device, dtype=latents.dtype)
+		sigma_view = sigma.view(1, 1, 1, 1, 1)
 		noisy_latents = sigma_view * noise + (1.0 - sigma_view) * latents
 		target = noise - latents
 
 		model_output = self.renderer(
 			hidden_states=noisy_latents,
-			timestep=sigmas * self.scheduler.config.num_train_timesteps,
+			timestep=sigma * self.scheduler.config.num_train_timesteps,
 			condition_hidden_states=condition_hidden_states,
-			token_mask=self._apply_condition_dropout(token_mask),
+			drop_condition=self._sample_condition_drop(latents.device),
 			return_dict=True,
 		)["sample"]
 
-		loss = (model_output.float() - target.float()).pow(2)
-		loss_mask = latent_mask.float()
-		loss_per_sample = (loss * loss_mask).flatten(1).sum(1)
-		valid_per_sample = loss_mask.flatten(1).sum(1) * loss.size(1)
-		loss = (loss_per_sample / valid_per_sample.clamp_min(1.0)).mean()
+		loss = (model_output.float() - target.float()).pow(2).mean()
 
 		if not return_auxiliary:
 			return {"loss": loss}
@@ -1350,7 +1143,7 @@ class DeepWorldQW(nn.Module):
 	@torch.no_grad()
 	def generate(
 		self,
-		batch: dict[str, Tensor],
+		batch: dict[str, Any],
 		num_frames: int | None = None,
 		height: int | None = None,
 		width: int | None = None,
@@ -1384,7 +1177,6 @@ class DeepWorldQW(nn.Module):
 
 		latent_frames = (num_frames - 1) // self.renderer.vae.config.scale_factor_temporal + 1
 		latents = torch.randn(
-			batch["txt_input_ids"].size(0),
 			self.renderer.transformer.config.in_channels,
 			latent_frames,
 			height // self.renderer.vae.config.scale_factor_spatial,
@@ -1392,21 +1184,19 @@ class DeepWorldQW(nn.Module):
 			device=device,
 			dtype=self.renderer.transformer.patch_embedding.weight.dtype,
 			generator=generator,
-		)
+		).unsqueeze(0)
 
-		latent_patch_grids = self.renderer.latent_patch_grids(latents)
-		brain_outputs = self.brain(batch, latent_patch_grids=latent_patch_grids)
-		token_mask = brain_outputs["gen_mask"][:, : brain_outputs["gen_hidden_states"].size(1)]
+		latent_patch_grid = self.renderer.latent_patch_grid(latents)
+		brain_outputs = self.brain(batch, latent_patch_grid=latent_patch_grid)
 		self.scheduler.set_timesteps(num_inference_steps or self.config.renderer.inference_steps, device=device)
 
 		for timestep in self.scheduler.timesteps:
 			model_output = self.renderer(
 				hidden_states=latents,
-				timestep=timestep.expand(latents.size(0)),
+				timestep=timestep,
 				condition_hidden_states=brain_outputs["gen_hidden_states"],
-				token_mask=token_mask,
 				return_dict=True,
 			)["sample"]
 			latents = self.scheduler.step(model_output, timestep, latents, return_dict=False)[0]
 
-		return self.renderer.decode_latents(latents)
+		return self.renderer.decode_latents(latents)[0]

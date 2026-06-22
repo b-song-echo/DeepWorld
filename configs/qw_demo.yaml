@@ -27,8 +27,8 @@ optimizer:
   lr_schedule: constant
   weight_decay: 0.01
   betas:
-  - 0.9
-  - 0.95
+    - 0.9
+    - 0.95
   eps: 1.0e-08
   max_grad_norm: 1.0
   warmup_steps: 20
@@ -37,9 +37,9 @@ training:
   seed: 20021021
   max_total_epochs: 30
   max_total_steps: 1500
-  per_device_batch_size: 1
   gradient_accumulation_steps: 2
   log_every: 1
+  eval_every: 300
   save_every: 300
   eval_num_samples: 8
   mixed_precision: bf16
@@ -55,10 +55,10 @@ brain:
   lora_alpha: null
   lora_dropout: 0.05
   lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
   routed_ffn_mode: lora
   routed_ffn_lora_rank: 256
   routed_ffn_lora_alpha: null
@@ -76,4 +76,3 @@ renderer:
   condition_dropout_prob: 0.1
   train_scheduler_steps: 1000
   inference_steps: 25
-  batch_multiplier: 4
