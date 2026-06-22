@@ -82,6 +82,7 @@ class TrainingConfig:
 	log_every: int = 10
 	eval_every: int = 0
 	save_every: int = 1000
+	# TODO: This property should belong to `DatasetConfig`. This makes dataloader and dataset creation more elegant. Don't forget to update YAML configs.
 	eval_num_samples: int = 0
 	mixed_precision: str = "bf16"
 	use_fsdp: bool = True
