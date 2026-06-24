@@ -16,7 +16,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 	apply_activation_checkpointing,
 	checkpoint_wrapper,
 )
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm.auto import tqdm
@@ -313,13 +313,18 @@ def apply_fsdp2(model: DeepWorldHY, config: DeepWorldHYConfig, is_main_process: 
 			if is_main_process:
 				print(f"Could not attach Hunyuan FSDP mesh, falling back to default process group: {error}")
 
-	for block in list(model.transformer.double_blocks) + list(model.transformer.single_blocks):
+	for block in list(model.transformer.double_blocks):
+		fully_shard(block, **fsdp_kwargs)
+	for block in list(model.transformer.single_blocks):
 		fully_shard(block, **fsdp_kwargs)
 	fully_shard(model.transformer, **fsdp_kwargs)
-	fully_shard(model.geo_in, **fsdp_kwargs)
 	fully_shard(model.modality_embeddings, **fsdp_kwargs)
-	if getattr(model, "vis_in", None) is not getattr(model.transformer, "vision_in", None):
-		fully_shard(model.vis_in, **fsdp_kwargs)
+	geo_in = getattr(model, "geo_in", None)
+	if geo_in:
+		fully_shard(geo_in, **fsdp_kwargs)
+	vis_in = getattr(model, "vis_in", None)
+	if vis_in and vis_in is not getattr(model.transformer, "vision_in", None):
+		fully_shard(vis_in, **fsdp_kwargs)
 
 
 @contextmanager
@@ -401,27 +406,46 @@ def build_lr_scheduler(optimizer: AdamW, config: DeepWorldHYConfig, total_traini
 
 def save_checkpoint(
 	model: DeepWorldHY,
-	optimizer: AdamW,
-	lr_scheduler,
 	step: int,
 	output_dir: Path,
 	is_main_process: bool,
 ) -> None:
-	"""Save model, optimizer, and scheduler state with distributed checkpointing."""
+	"""Save model state with distributed checkpointing."""
 
 	checkpoint_dir = output_dir / "checkpoints" / f"step_{step:08d}"
-	transformer_dir = checkpoint_dir / "model"
-	optimizer_dir = checkpoint_dir / "optimizer"
+	model_dir = checkpoint_dir / "model"
 	if is_main_process:
 		checkpoint_dir.mkdir(parents=True, exist_ok=True)
 	if dist.is_available() and dist.is_initialized():
 		dist.barrier()
 
-	dcp.save({"model": get_model_state_dict(model)}, checkpoint_id=str(transformer_dir))
-	dcp.save({"optimizer": get_optimizer_state_dict(model, optimizer)}, checkpoint_id=str(optimizer_dir))
+	dcp.save({"model": get_model_state_dict(model)}, checkpoint_id=str(model_dir))
+	if dist.is_available() and dist.is_initialized():
+		dist.barrier()
 
+
+def load_pretrained_model_state(
+	model: DeepWorldHY,
+	pretrained_model_path: str | None,
+	is_main_process: bool,
+) -> None:
+	"""Load an optional DeepWorldHY model checkpoint before optimizer creation."""
+
+	if pretrained_model_path is None:
+		return
+
+	checkpoint_path = Path(pretrained_model_path)
+	model_dir = checkpoint_path / "model" if (checkpoint_path / "model").exists() else checkpoint_path
+	state_dict = {"model": get_model_state_dict(model)}
+	dcp.load(state_dict, checkpoint_id=str(model_dir))
+	load_result = set_model_state_dict(model, state_dict["model"])
+	if load_result.missing_keys or load_result.unexpected_keys:
+		raise RuntimeError(
+			"Pretrained HY checkpoint does not match the model state dict: "
+			f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}."
+		)
 	if is_main_process:
-		torch.save({"global_step": step, "lr_scheduler": lr_scheduler.state_dict()}, checkpoint_dir / "training_state.pt")
+		print(f"Loaded DeepWorldHY model weights from {model_dir}.")
 	if dist.is_available() and dist.is_initialized():
 		dist.barrier()
 
@@ -467,8 +491,10 @@ def main() -> None:
 	if config.training.gradient_checkpointing:
 		apply_gradient_checkpointing(model)
 	apply_fsdp2(model, config, is_main_process)
+	load_pretrained_model_state(model, config.training.pretrained_model_path, is_main_process)
 	optimizer = build_optimizer(model, config)
 
+	# TODO: Collator should no longer take geo_patch_size as argument.
 	collator = DeepWorldHYBatchCollator(config.dataset, geo_patch_size=model.geo_patch_size)
 	dataloader = build_train_dataloader(config, collator)
 	eval_bundle = build_eval_dataloader(config, collator, rank)
@@ -540,7 +566,7 @@ def main() -> None:
 			if (global_step == total_training_steps) or (
 				config.training.save_every > 0 and global_step % config.training.save_every == 0
 			):
-				save_checkpoint(model, optimizer, lr_scheduler, global_step, output_dir, is_main_process)
+				save_checkpoint(model, global_step, output_dir, is_main_process)
 				write_jsonl_log(metrics_log, {"event": "checkpoint", "step": global_step})
 			if global_step >= total_training_steps:
 				break

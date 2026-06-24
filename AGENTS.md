@@ -7,6 +7,7 @@ When you make edits:
 - Do not work against my coding style unless it yields bugs.
 - Do not code defensively, do not be obsessed with safety checks.
 - Remove legacy or redundant implementation, keep the repo fresh.
+- Never maintain compatability with legacy code, always start fresh.
 - Prioritize clean, elegent, no-boilerplate code.
 - Do not make unnecessary abstraction.
 

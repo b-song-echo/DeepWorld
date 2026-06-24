@@ -629,6 +629,7 @@ def main() -> None:
 
 	dataset = WorldDataset(config.dataset)
 	processor = AutoProcessor.from_pretrained(config.brain.checkpoint_path, local_files_only=True)
+	# TODO: Collator should no longer accept geo_patch_size. And do not print patch size here.
 	collator = DeepWorldQWBatchCollator(
 		dataset_config=config.dataset,
 		tokenizer=processor.tokenizer,

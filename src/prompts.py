@@ -209,7 +209,7 @@ Required JSON schema:
 }
 
 Video caption:
-<VIDEO_CAPTION_JSON>
+<VIDEO_CAPTION>
 
 Reference image captions:
 <IMAGE_CAPTIONS_JSON>
@@ -396,7 +396,7 @@ Camera-motion caption:
 <MOTION_CAPTION_JSON>
 
 Video caption:
-<VIDEO_CAPTION_JSON>
+<VIDEO_CAPTION>
 
 Reference image captions:
 <IMAGE_CAPTIONS_JSON>

@@ -10,6 +10,7 @@ dataset:
   prompt_rich_prob: 0.5
   prompt_medium_prob: 0.3
   prompt_coarse_prob: 0.2
+  mixing_t2v_prob: 0.2
   vis_image_size: 384
   geo_image_size: 448
   max_text_length: 512
@@ -56,10 +57,25 @@ model:
   vggt_dtype: null
   attention_mode: flash
   condition_dropout_prob: 0.1
+  drop_vae_tokens_prob: 0.0
+  drop_vis_tokens_prob: 0.0
+  drop_geo_tokens_prob: 0.0
+  drop_txt_tokens_prob: 0.0
   use_vae_tokens: true
   use_vis_tokens: true
   use_geo_tokens: true
-  use_txt_tokens: true
+  use_mrope: true
+  video_vae_sample: false
+  cfg_guidance_scale: 1.0
+  cfg_guidance_rescale: 0.0
+  use_vae_kv_gate: true
+  use_geo_kv_gate: true
+  use_vis_kv_gate: true
+  use_txt_kv_gate: false
+  vae_kv_gate_init: 0.0
+  geo_kv_gate_init: 0.0
+  vis_kv_gate_init: 0.0
+  txt_kv_gate_init: 0.0
   lora_rank: 16
   lora_alpha: null
   lora_dropout: 0.05
@@ -79,6 +95,6 @@ model:
   guidance: 6016.0
   num_train_timesteps: 1000
   train_timestep_shift: 3.0
-  validation_timestep_shift: 5.0
+  eval_timestep_shift: 5.0
   snr_type: lognorm
   inference_steps: 50

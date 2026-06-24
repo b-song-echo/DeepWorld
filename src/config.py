@@ -26,6 +26,7 @@ class DatasetConfig:
 	prompt_rich_prob: float = 0.5
 	prompt_medium_prob: float = 0.3
 	prompt_coarse_prob: float = 0.2
+	mixing_t2v_prob: float = 0.2
 	vis_image_size: int = 448
 	geo_image_size: int | None = None
 	max_text_length: int = 1024
@@ -63,6 +64,11 @@ class DatasetConfig:
 				raise ValueError(f"`dataset.{name}` must be non-negative, got {value}.")
 		if self.prompt_rich_prob + self.prompt_medium_prob + self.prompt_coarse_prob <= 0:
 			raise ValueError("At least one prompt probability must be positive.")
+		if not 0.0 <= self.mixing_t2v_prob <= 1.0:
+			raise ValueError(
+				"`dataset.mixing_t2v_prob` must be in [0, 1], "
+				f"got {self.mixing_t2v_prob}."
+			)
 
 	@property
 	def video_num_frames(self) -> int:
@@ -247,10 +253,26 @@ class DeepWorldHYModelConfig:
 	vggt_dtype: str | None = None
 	attention_mode: str = "flash"
 	condition_dropout_prob: float = 0.1
+	drop_vae_tokens_prob: float = 0.0
+	drop_vis_tokens_prob: float = 0.0
+	drop_geo_tokens_prob: float = 0.0
+	drop_txt_tokens_prob: float = 0.0
 	use_vae_tokens: bool = True
 	use_vis_tokens: bool = True
 	use_geo_tokens: bool = True
-	use_txt_tokens: bool = True
+	use_mrope: bool = True
+	video_vae_sample: bool = False
+	cfg_guidance_scale: float = 1.0
+	cfg_guidance_rescale: float = 0.0
+	# TODO: Merge `use_xxx_kv_gate` and `xxx_kv_gate_init` into a single one: `xxx_kv_gate`. When set to None, do not use gates, otherwise, use it as init value for learnable gates.
+	use_vae_kv_gate: bool = True
+	use_geo_kv_gate: bool = True
+	use_vis_kv_gate: bool = True
+	use_txt_kv_gate: bool = False
+	vae_kv_gate_init: float = 0.0
+	geo_kv_gate_init: float = 0.0
+	vis_kv_gate_init: float = 0.0
+	txt_kv_gate_init: float = 0.0
 	lora_rank: int = 16
 	lora_alpha: int | None = None
 	lora_dropout: float = 0.05
@@ -263,7 +285,8 @@ class DeepWorldHYModelConfig:
 	guidance: float = 6016.0
 	num_train_timesteps: int = 1000
 	train_timestep_shift: float = 3.0
-	validation_timestep_shift: float = 5.0
+	# TODO: You included this config but never used it. I have told you, never leave unused or redundant code, either use it, or remove it.
+	eval_timestep_shift: float = 5.0
 	snr_type: str = "lognorm"
 	inference_steps: int = 50
 
@@ -284,6 +307,27 @@ class DeepWorldHYModelConfig:
 				"`model.condition_dropout_prob` must be in [0, 1], "
 				f"got {self.condition_dropout_prob}."
 			)
+		for name, value in (
+			("drop_vae_tokens_prob", self.drop_vae_tokens_prob),
+			("drop_vis_tokens_prob", self.drop_vis_tokens_prob),
+			("drop_geo_tokens_prob", self.drop_geo_tokens_prob),
+			("drop_txt_tokens_prob", self.drop_txt_tokens_prob),
+		):
+			if not 0.0 <= value <= 1.0:
+				raise ValueError(
+					f"`model.{name}` must be in [0, 1], "
+					f"got {value}."
+				)
+		if self.cfg_guidance_scale < 1.0:
+			raise ValueError(
+				"`model.cfg_guidance_scale` must be at least 1.0, "
+				f"got {self.cfg_guidance_scale}."
+			)
+		if not 0.0 <= self.cfg_guidance_rescale <= 1.0:
+			raise ValueError(
+				"`model.cfg_guidance_rescale` must be in [0, 1], "
+				f"got {self.cfg_guidance_rescale}."
+			)
 		if self.lora_rank <= 0:
 			raise ValueError(f"`model.lora_rank` must be positive, got {self.lora_rank}.")
 		if self.geo_stream_init not in {"copy_image", "fresh"}:
@@ -301,10 +345,10 @@ class DeepWorldHYModelConfig:
 				"`model.train_timestep_shift` must be positive, "
 				f"got {self.train_timestep_shift}."
 			)
-		if self.validation_timestep_shift <= 0:
+		if self.eval_timestep_shift <= 0:
 			raise ValueError(
 				"`model.validation_timestep_shift` must be positive, "
-				f"got {self.validation_timestep_shift}."
+				f"got {self.eval_timestep_shift}."
 			)
 		if self.inference_steps <= 0:
 			raise ValueError(f"`model.inference_steps` must be positive, got {self.inference_steps}.")
@@ -397,6 +441,7 @@ def load_hy_config(path: str | Path) -> DeepWorldHYConfig:
 			model_payload[key] = value
 
 	optimizer_payload = payload.get("optimizer", {})
+	# TODO: Would you stop doing these? I have already told you, remove legacy code, **do not** maintain compatability with previous code.
 	for old_name, new_name in (
 		("transformer_learning_rate", "adapter_learning_rate"),
 		("geometry_learning_rate", "geo_stream_learning_rate"),
@@ -413,7 +458,6 @@ def load_hy_config(path: str | Path) -> DeepWorldHYConfig:
 		("use_reference_vae_tokens", "use_vae_tokens"),
 		("use_siglip_tokens", "use_vis_tokens"),
 		("use_geometry_tokens", "use_geo_tokens"),
-		("use_text_tokens", "use_txt_tokens"),
 	):
 		if old_name in model_payload:
 			if new_name in model_payload:

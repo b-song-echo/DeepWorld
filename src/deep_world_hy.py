@@ -1,5 +1,6 @@
 import math
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,31 @@ from hyvideo.hyvideo.models.transformers.modules.attention import parallel_atten
 from hyvideo.hyvideo.models.transformers.modules.modulate_layers import apply_gate, modulate
 from hyvideo.hyvideo.models.transformers.modules.posemb_layers import apply_rotary_emb, get_1d_rotary_pos_embed
 from hyvideo.hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
+from hyvideo.hyvideo.pipelines.pipeline_utils import rescale_noise_cfg
 from hyvideo.hyvideo.schedulers.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from hyvideo.hyvideo.utils.communications import all_gather
 from vggt.vggt.models.vggt import VGGT
+
+
+# TODO: Remove `DEFAULT_GEO_PATCH_SIZE`, this is really ugly.
+DEFAULT_GEO_PATCH_SIZE = 14
+
+# TODO: Define a data structure called `Span`. It contains three property: start (int), length (int), attachment (Any). It also has a method `shifted` that returns a instance with `start` shifted and other fields shallow-copied.
+
+# TODO: There is no need for this two typealias. `RopeSpans` simply becomes list[Span], where the `attachment` field becomes freqs_cis (tuple[Tensor, Tensor]). `KVSpans` is also list[Span], where the `attachment` field becomes modality (str).
+RopeSpans = list[tuple[int, int, tuple[Tensor, Tensor]]]
+KVSpans = dict[str, list[tuple[int, int]]]
+
+
+# TODO: Remove this class. There is no need to create a standalone dataclass for such simple functionality.
+@dataclass(frozen=True)
+class HYConditionPlan:
+	"""Resolved per-sample condition-token usage for one HY transformer call."""
+
+	use_vae: bool
+	use_geo: bool
+	use_vis: bool
+	use_txt: bool
 
 
 def _reset_module_parameters(module: nn.Module) -> None:
@@ -78,34 +101,144 @@ def _build_stream_modules(
 	return modules
 
 
-class MMTripleStreamBlock(nn.Module):
-	"""Hunyuan double-stream block extended with a trainable geometry stream.
+# TODO: In this file, variables, argumets, methods related to KVSpan/RopeSpan should all be renamed to new terminologies. Specifically, simply xxx_rope_spans/xxx_gate_spans.
 
-	The pretrained image and text branches are reused by reference. The geometry
-	branch owns its own modulation, attention, and MLP modules. Joint attention
-	is still computed over all image, geometry, and text tokens by concatenating
-	image and geometry queries during the attention call and splitting the result
-	afterward.
+
+def _build_kv_gates(hy_config: DeepWorldHYModelConfig, dtype: torch.dtype) -> nn.ParameterDict:
+	"""Create trainable scalar K/V gates enabled by the HY config."""
+
+	gates = nn.ParameterDict()
+	for modality in ("vae", "geo", "vis", "txt"):
+		stream_enabled = modality == "txt" or getattr(hy_config, f"use_{modality}_tokens")
+		if stream_enabled and getattr(hy_config, f"use_{modality}_kv_gate"):
+			initial_value = float(getattr(hy_config, f"{modality}_kv_gate_init"))
+			gates[modality] = nn.Parameter(torch.full((), initial_value, dtype=dtype))
+	return gates
+
+
+def _apply_qk_rope(query: Tensor, key: Tensor, rope_spans: RopeSpans | None) -> tuple[Tensor, Tensor]:
+	"""Apply RoPE to selected contiguous spans while leaving other tokens untouched."""
+
+	if not rope_spans:
+		return query, key
+
+	query_parts: list[Tensor] = []
+	key_parts: list[Tensor] = []
+	cursor = 0
+	for start, length, freqs_cis in sorted(rope_spans, key=lambda span: span[0]):
+		end = start + length
+		if cursor < start:
+			query_parts.append(query[:, cursor:start])
+			key_parts.append(key[:, cursor:start])
+		span_q, span_k = apply_rotary_emb(
+			query[:, start:end], key[:, start:end],
+			freqs_cis, head_first=False,
+		)
+		query_parts.append(span_q)
+		key_parts.append(span_k)
+		cursor = end
+	if cursor < query.size(1):
+		query_parts.append(query[:, cursor:])
+		key_parts.append(key[:, cursor:])
+	query = torch.cat(query_parts, dim=1)
+	key = torch.cat(key_parts, dim=1)
+	return query, key
+
+
+# TODO: There is no need for this function. With `shifted` method defined on the `Span` dataclass, this function can be achieved with a single line of code.
+def _offset_kv_spans(kv_spans: KVSpans, offset: int) -> KVSpans:
+	"""Shift every K/V gate span by a sequence offset."""
+
+	return {
+		modality: [(start + offset, length) for start, length in spans]
+		for modality, spans in kv_spans.items()
+	}
+
+
+# TODO: Because KVSpan is no longer a dict, there is need for this merge function.
+def _merge_kv_spans(*span_tables: KVSpans) -> KVSpans:
+	"""Merge K/V span tables without changing their sequence coordinates."""
+
+	merged: KVSpans = {}
+	for span_table in span_tables:
+		for modality, spans in span_table.items():
+			merged.setdefault(modality, []).extend(spans)
+	return merged
+
+
+# TODO: No need for this function.
+def _offset_rope_spans(rope_spans: RopeSpans, offset: int) -> RopeSpans:
+	"""Shift every RoPE span by a sequence offset."""
+
+	return [
+		(start + offset, length, freqs_cis)
+		for start, length, freqs_cis in rope_spans
+	]
+
+
+def _apply_kv_gate(
+	key: Tensor,
+	value: Tensor,
+	kv_spans: KVSpans | None,
+	kv_gates: nn.ParameterDict,
+) -> tuple[Tensor, Tensor]:
+	"""Scale selected K/V spans with learnable modality gates."""
+
+	if not kv_spans or len(kv_gates) == 0:
+		return key, value
+
+	key = key.clone()
+	value = value.clone()
+	for modality, spans in kv_spans.items():
+		if modality not in kv_gates:
+			continue
+		gate = kv_gates[modality].to(device=key.device, dtype=key.dtype)
+		for start, length in spans:
+			if length == 0:
+				continue
+			end = start + length
+			key[:, start:end] = key[:, start:end] * gate
+			value[:, start:end] = value[:, start:end] * gate
+	return key, value
+
+
+class MMTripleStreamBlock(nn.Module):
+	"""Hunyuan double-stream block optionally extended with a geometry stream.
+
+	The pretrained image and text branches are reused by reference. When geometry
+	is enabled, the geometry branch owns trainable copied modules and joins image
+	tokens as an image-like prefix during attention. When geometry is disabled,
+	the block remains a two-stream MMDiT block with no geometry modules.
 	"""
 
-	def __init__(self, base_block: nn.Module, geo_stream_init: str):
+	def __init__(self, base_block: nn.Module, hy_config: DeepWorldHYModelConfig):
 		"""Wrap one pretrained Hunyuan double-stream block."""
 
 		super().__init__()
 		self.heads_num = base_block.heads_num
 		self.attn_mode = base_block.attn_mode
 		self.hybrid_seq_parallel_attn = None
+		self.use_geo_stream = hy_config.use_geo_tokens
 
 		self.img = _build_stream_modules(base_block, "img", clone_modules=False)
 		self.txt = _build_stream_modules(base_block, "txt", clone_modules=False)
-		self.geo = _build_stream_modules(base_block, "img", clone_modules=True, init_mode=geo_stream_init)
+		if self.use_geo_stream:
+			self.geo = _build_stream_modules(
+				base_block, "img", clone_modules=True,
+				init_mode=hy_config.geo_stream_init
+			)
+		self.kv_gates = _build_kv_gates(
+			hy_config, next(base_block.parameters()).dtype
+		)
 
+	# TODO: Return a dict, so that there is no need to unpack some many values at once on call site.
 	def _project_stream_attention(
 		self,
 		hidden_states: Tensor,
 		modules: dict[str, nn.Module],
 		vec: Tensor,
-		freqs_cis: tuple[Tensor, Tensor] | None,
+		rope_spans: RopeSpans | None,
+		kv_spans: KVSpans | None,
 	) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
 		"""Apply one stream's attention AdaLN, QKV projection, and RoPE."""
 
@@ -121,8 +254,8 @@ class MMTripleStreamBlock(nn.Module):
 		query = modules["attn_q_norm"](query).to(value)
 		key = modules["attn_k_norm"](key).to(value)
 
-		if freqs_cis is not None and hidden_states.size(1) > 0:
-			query, key = apply_rotary_emb(query, key, freqs_cis, head_first=False)
+		query, key = _apply_qk_rope(query, key, rope_spans)
+		key, value = _apply_kv_gate(key, value, kv_spans, self.kv_gates)
 
 		return query, key, value, mod1_gate, mod2_shift, mod2_scale, mod2_gate
 
@@ -145,9 +278,12 @@ class MMTripleStreamBlock(nn.Module):
 		geo: Tensor,
 		txt: Tensor,
 		vec: Tensor,
-		img_freqs: tuple[Tensor, Tensor] | None,
-		geo_freqs: tuple[Tensor, Tensor] | None,
-		txt_freqs: tuple[Tensor, Tensor] | None,
+		img_rope_spans: RopeSpans | None,
+		geo_rope_spans: RopeSpans | None,
+		txt_rope_spans: RopeSpans | None,
+		img_kv_spans: KVSpans | None,
+		geo_kv_spans: KVSpans | None,
+		txt_kv_spans: KVSpans | None,
 		text_mask: Tensor | None = None,
 		attn_param: dict[str, Any] | None = None,
 		is_flash: bool = False,
@@ -156,18 +292,21 @@ class MMTripleStreamBlock(nn.Module):
 		"""Run one three-stream MMDiT block."""
 
 		img_q, img_k, img_v, img_gate, img_mlp_shift, img_mlp_scale, img_mlp_gate = self._project_stream_attention(
-			img, self.img, vec, img_freqs,
-		)
-		geo_q, geo_k, geo_v, geo_gate, geo_mlp_shift, geo_mlp_scale, geo_mlp_gate = self._project_stream_attention(
-			geo, self.geo, vec, geo_freqs,
+			img, self.img, vec, img_rope_spans, img_kv_spans,
 		)
 		txt_q, txt_k, txt_v, txt_gate, txt_mlp_shift, txt_mlp_scale, txt_mlp_gate = self._project_stream_attention(
-			txt, self.txt, vec, txt_freqs,
+			txt, self.txt, vec, txt_rope_spans, txt_kv_spans,
 		)
 
-		prefix_q = torch.cat([img_q, geo_q], dim=1)
-		prefix_k = torch.cat([img_k, geo_k], dim=1)
-		prefix_v = torch.cat([img_v, geo_v], dim=1)
+		if self.use_geo_stream:
+			geo_q, geo_k, geo_v, geo_gate, geo_mlp_shift, geo_mlp_scale, geo_mlp_gate = self._project_stream_attention(
+				geo, self.geo, vec, geo_rope_spans, geo_kv_spans,
+			)
+			prefix_q = torch.cat([img_q, geo_q], dim=1)
+			prefix_k = torch.cat([img_k, geo_k], dim=1)
+			prefix_v = torch.cat([img_v, geo_v], dim=1)
+		else:
+			prefix_q, prefix_k, prefix_v = img_q, img_k, img_v
 		
 		attn_mode = "flash" if is_flash else self.attn_mode
 		attn = parallel_attention(
@@ -182,21 +321,29 @@ class MMTripleStreamBlock(nn.Module):
 			block_idx=block_idx,
 		)
 
-		img_attn, geo_attn, txt_attn = attn.split([img_q.shape[1], geo_q.shape[1], txt_q.shape[1]], dim=1)
+		if self.use_geo_stream:
+			chunk_lens = [img_q.shape[1], geo_q.shape[1], txt_q.shape[1]]
+			img_attn, geo_attn, txt_attn = attn.split(chunk_lens, dim=1)
+		else:
+			chunk_lens = [img_q.shape[1], txt_q.shape[1]]
+			img_attn, txt_attn = attn.split(chunk_lens, dim=1)
+		
 		img = img + apply_gate(self.img["attn_proj"](img_attn), gate=img_gate)
-		geo = geo + apply_gate(self.geo["attn_proj"](geo_attn), gate=geo_gate)
 		txt = txt + apply_gate(self.txt["attn_proj"](txt_attn), gate=txt_gate)
+		if self.use_geo_stream:
+			geo = geo + apply_gate(self.geo["attn_proj"](geo_attn), gate=geo_gate)
 
 		img = self._apply_stream_mlp(img, self.img, img_mlp_shift, img_mlp_scale, img_mlp_gate)
-		geo = self._apply_stream_mlp(geo, self.geo, geo_mlp_shift, geo_mlp_scale, geo_mlp_gate)
 		txt = self._apply_stream_mlp(txt, self.txt, txt_mlp_shift, txt_mlp_scale, txt_mlp_gate)
+		if self.use_geo_stream:
+			geo = self._apply_stream_mlp(geo, self.geo, geo_mlp_shift, geo_mlp_scale, geo_mlp_gate)
 		return img, geo, txt
 
 
 class MMSingleStreamBlock(nn.Module):
 	"""Hunyuan single-stream block with MRoPE applied to every modality span."""
 
-	def __init__(self, base_block: nn.Module):
+	def __init__(self, base_block: nn.Module, hy_config: DeepWorldHYModelConfig):
 		"""Wrap one pretrained Hunyuan single-stream block."""
 
 		super().__init__()
@@ -216,22 +363,9 @@ class MMSingleStreamBlock(nn.Module):
 		self.pre_norm = base_block.pre_norm
 		self.modulation = base_block.modulation
 		self.hybrid_seq_parallel_attn = None
-
-	def _apply_span_rope(
-		self,
-		query: Tensor,
-		key: Tensor,
-		start: int,
-		length: int,
-		freqs_cis: tuple[Tensor, Tensor] | None,
-	) -> tuple[Tensor, Tensor]:
-		"""Apply RoPE to one contiguous span inside a joined sequence."""
-
-		if length == 0 or freqs_cis is None:
-			return query[:, start:(start + length)], key[:, start:(start + length)]
-		span_q = query[:, start:(start + length)]
-		span_k = key[:, start:(start + length)]
-		return apply_rotary_emb(span_q, span_k, freqs_cis, head_first=False)
+		self.kv_gates = _build_kv_gates(
+			hy_config, next(base_block.parameters()).dtype
+		)
 
 	def forward(
 		self,
@@ -240,9 +374,8 @@ class MMSingleStreamBlock(nn.Module):
 		img_len: int,
 		geo_len: int,
 		txt_len: int,
-		img_freqs: tuple[Tensor, Tensor] | None,
-		geo_freqs: tuple[Tensor, Tensor] | None,
-		txt_freqs: tuple[Tensor, Tensor] | None,
+		rope_spans: RopeSpans | None,
+		kv_spans: KVSpans | None,
 		text_mask: Tensor | None = None,
 		attn_param: dict[str, Any] | None = None,
 		is_flash: bool = False,
@@ -263,16 +396,13 @@ class MMSingleStreamBlock(nn.Module):
 		query = self.q_norm(query).to(value)
 		key = self.k_norm(key).to(value)
 
-		img_q, img_k = self._apply_span_rope(query, key, 0, img_len, img_freqs)
-		geo_q, geo_k = self._apply_span_rope(query, key, img_len, geo_len, geo_freqs)
-		txt_q, txt_k = self._apply_span_rope(query, key, img_len + geo_len, txt_len, txt_freqs)
+		query, key = _apply_qk_rope(query, key, rope_spans)
+		key, value = _apply_kv_gate(key, value, kv_spans, self.kv_gates)
 
-		img_v = value[:, :img_len]
-		geo_v = value[:, img_len:(img_len + geo_len)]
-		txt_v = value[:, (img_len + geo_len):(img_len + geo_len + txt_len)]
-		prefix_q = torch.cat([img_q, geo_q], dim=1)
-		prefix_k = torch.cat([img_k, geo_k], dim=1)
-		prefix_v = torch.cat([img_v, geo_v], dim=1)
+		prefix_len = img_len + geo_len
+		prefix_q, txt_q = query[:, :prefix_len], query[:, prefix_len:]
+		prefix_k, txt_k = key[:, :prefix_len], key[:, prefix_len:]
+		prefix_v, txt_v = value[:, :prefix_len], value[:, prefix_len:]
 
 		attn_mode = "flash" if is_flash else self.attn_mode
 		attn = parallel_attention(
@@ -312,7 +442,7 @@ class DeepWorldHY(nn.Module):
 		self.transformer.set_attn_mode(self.hy_config.attention_mode)
 		self.transformer.requires_grad_(False)
 
-		self._install_three_stream_blocks(self.hy_config)
+		self._install_triple_stream_blocks(self.hy_config)
 		self._inject_lora_adapters(self.hy_config)
 
 		vae_dtype = resolve_torch_dtype(self.hy_config.vae_dtype)
@@ -330,48 +460,53 @@ class DeepWorldHY(nn.Module):
 			device=None,
 		)
 		self.txt_encoder.requires_grad_(False)
-		self.vis_encoder = HunyuanVideo_1_5_Pipeline._load_vision_encoder(
-			self.hy_config.checkpoint_path,
-			device=None,
-		)
-		self.vis_encoder.requires_grad_(False)
-
-		self.geo_encoder = VGGT.from_pretrained(
-			self.hy_config.vggt_checkpoint_path,
-			local_files_only=True,
-			enable_camera=False,
-			enable_point=False,
-			enable_depth=False,
-			enable_track=False,
-		)
-		vggt_dtype = resolve_torch_dtype(self.hy_config.vggt_dtype)
-		if vggt_dtype is not None:
-			self.geo_encoder.to(dtype=vggt_dtype)
-		self.geo_encoder.requires_grad_(False)
+		# TODO: Mirroring `geo_in` and `vis_in`, you should assign the projector in txt_encoder to a property `txt_in` and use it downstream.
 
 		trainable_dtype = next(self.transformer.parameters()).dtype
-		self.geo_patch_size = self.geo_encoder.aggregator.patch_size
-		geo_hidden_size = self.geo_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
-		self.geo_in = nn.Sequential(
-			nn.LayerNorm(geo_hidden_size, dtype=trainable_dtype),
-			nn.Linear(geo_hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
-			nn.GELU(),
-			nn.Linear(self.transformer.hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
-			nn.LayerNorm(self.transformer.hidden_size, dtype=trainable_dtype),
-		)
-
-		vis_in = getattr(self.transformer, "vision_in", None)
-		if vis_in is None:
-			vision_hidden_size = int(self.vis_encoder.model.config.hidden_size)
-			self.vis_in = nn.Sequential(
-				nn.LayerNorm(vision_hidden_size, dtype=trainable_dtype),
-				nn.Linear(vision_hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
+		# TODO: There is no need ror this property. VGGT patch size can be inferred inside `_encode_geo_refs`.
+		self.geo_patch_size = DEFAULT_GEO_PATCH_SIZE
+		
+		if self.hy_config.use_geo_tokens:
+			self.geo_encoder = VGGT.from_pretrained(
+				self.hy_config.vggt_checkpoint_path,
+				local_files_only=True,
+				enable_camera=False,
+				enable_point=False,
+				enable_depth=False,
+				enable_track=False,
+			)
+			vggt_dtype = resolve_torch_dtype(self.hy_config.vggt_dtype)
+			if vggt_dtype is not None:
+				self.geo_encoder.to(dtype=vggt_dtype)
+			self.geo_encoder.requires_grad_(False)
+			self.geo_patch_size = self.geo_encoder.aggregator.patch_size
+			geo_hidden_size = self.geo_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
+			self.geo_in = nn.Sequential(
+				nn.LayerNorm(geo_hidden_size, dtype=trainable_dtype),
+				nn.Linear(geo_hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
 				nn.GELU(),
 				nn.Linear(self.transformer.hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
 				nn.LayerNorm(self.transformer.hidden_size, dtype=trainable_dtype),
 			)
-		else:
-			self.vis_in = vis_in
+
+		if self.hy_config.use_vis_tokens:
+			self.vis_encoder = HunyuanVideo_1_5_Pipeline._load_vision_encoder(
+				self.hy_config.checkpoint_path,
+				device=None,
+			)
+			self.vis_encoder.requires_grad_(False)
+			vis_in = getattr(self.transformer, "vision_in", None)
+			if vis_in is None:
+				vision_hidden_size = int(self.vis_encoder.model.config.hidden_size)
+				self.vis_in = nn.Sequential(
+					nn.LayerNorm(vision_hidden_size, dtype=trainable_dtype),
+					nn.Linear(vision_hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
+					nn.GELU(),
+					nn.Linear(self.transformer.hidden_size, self.transformer.hidden_size, dtype=trainable_dtype),
+					nn.LayerNorm(self.transformer.hidden_size, dtype=trainable_dtype),
+				)
+			else:
+				self.vis_in = vis_in
 
 		self.modality_embeddings = nn.ParameterDict({
 			"video": nn.Parameter(torch.empty(1, 1, self.transformer.hidden_size, dtype=trainable_dtype)),
@@ -389,8 +524,10 @@ class DeepWorldHY(nn.Module):
 
 		self.vae.eval()
 		self.txt_encoder.eval()
-		self.vis_encoder.eval()
-		self.geo_encoder.eval()
+		if self.hy_config.use_vis_tokens:
+			self.vis_encoder.eval()
+		if self.hy_config.use_geo_tokens:
+			self.geo_encoder.eval()
 
 	def train(self, mode: bool = True):
 		"""Set train mode while preserving eval mode for frozen encoders."""
@@ -399,15 +536,15 @@ class DeepWorldHY(nn.Module):
 		self._set_frozen_modules_eval()
 		return self
 
-	def _install_three_stream_blocks(self, hy_config: DeepWorldHYModelConfig) -> None:
+	def _install_triple_stream_blocks(self, hy_config: DeepWorldHYModelConfig) -> None:
 		"""Replace Hunyuan blocks with MRoPE-aware wrapper blocks."""
 
 		self.transformer.double_blocks = nn.ModuleList([
-			MMTripleStreamBlock(block, geo_stream_init=hy_config.geo_stream_init)
+			MMTripleStreamBlock(block, hy_config=hy_config)
 			for block in self.transformer.double_blocks
 		])
 		self.transformer.single_blocks = nn.ModuleList([
-			MMSingleStreamBlock(block)
+			MMSingleStreamBlock(block, hy_config=hy_config)
 			for block in self.transformer.single_blocks
 		])
 
@@ -451,20 +588,20 @@ class DeepWorldHY(nn.Module):
 	def _split_for_sequence_parallel(
 		self,
 		tokens: Tensor,
-		freqs_cis: tuple[Tensor, Tensor] | None,
+		rope_spans: RopeSpans,
 		stream_name: str,
-	) -> tuple[Tensor, tuple[Tensor, Tensor] | None, int, int]:
+	) -> tuple[Tensor, RopeSpans, int, int]:
 		"""Shard one prefix stream along sequence length for Hunyuan sequence parallelism."""
 
 		parallel_dims = get_parallel_state()
 		if not getattr(parallel_dims, "sp_enabled", False):
-			return tokens, freqs_cis, 0, tokens.size(1)
+			return tokens, rope_spans, 0, tokens.size(1)
 
 		sp_size = parallel_dims.sp
 		sp_rank = parallel_dims.sp_rank
 		token_count = tokens.size(1)
 		if token_count == 0:
-			return tokens, freqs_cis, 0, 0
+			return tokens, rope_spans, 0, 0
 		if token_count % sp_size != 0:
 			min_supported_tokens = (token_count // sp_size + 1) * (sp_size - 1)
 			if token_count <= min_supported_tokens:
@@ -482,16 +619,48 @@ class DeepWorldHY(nn.Module):
 		local_start = sum(chunk.size(1) for chunk in token_chunks[:sp_rank])
 		local_end = local_start + token_chunks[sp_rank].size(1)
 
-		if freqs_cis is None:
-			return token_chunks[sp_rank], None, local_start, local_end
-		cos_chunks = torch.chunk(freqs_cis[0], sp_size, dim=0)
-		sin_chunks = torch.chunk(freqs_cis[1], sp_size, dim=0)
-		if len(cos_chunks) != sp_size or len(sin_chunks) != sp_size:
-			raise ValueError(
-				f"`{stream_name}` rotary positions cannot be split into "
-				f"{sp_size} sequence-parallel chunks."
-			)
-		return token_chunks[sp_rank], (cos_chunks[sp_rank], sin_chunks[sp_rank]), local_start, local_end
+		return (
+			token_chunks[sp_rank],
+			self._localize_rope_spans(rope_spans, local_start, local_end),
+			local_start, local_end,
+		)
+
+	# TODO: For the following two methods, how about embed them into the `_split_for_sequence_parallel` method, then some shared logic can be implemented as nested helper functions.
+	def _localize_rope_spans(self, rope_spans: RopeSpans, local_start: int, local_end: int) -> RopeSpans:
+		"""Slice global RoPE spans down to a sequence-parallel local window."""
+
+		local_spans: RopeSpans = []
+		for span_start, span_length, freqs_cis in rope_spans:
+			span_end = span_start + span_length
+			overlap_start = max(span_start, local_start)
+			overlap_end = min(span_end, local_end)
+			if overlap_start >= overlap_end:
+				continue
+			freq_start = overlap_start - span_start
+			freq_end = overlap_end - span_start
+			local_spans.append((
+				overlap_start - local_start,
+				overlap_end - overlap_start,
+				(freqs_cis[0][freq_start:freq_end], freqs_cis[1][freq_start:freq_end]),
+			))
+		return local_spans
+
+	def _localize_gate_spans(self, kv_spans: KVSpans, local_start: int, local_end: int) -> KVSpans:
+		"""Slice global K/V spans down to a sequence-parallel local window."""
+
+		local_spans: KVSpans = {}
+		for modality, spans in kv_spans.items():
+			for span_start, span_length in spans:
+				span_end = span_start + span_length
+				overlap_start = max(span_start, local_start)
+				overlap_end = min(span_end, local_end)
+				if overlap_start >= overlap_end:
+					continue
+				local_spans.setdefault(modality, []).append((
+					overlap_start - local_start,
+					overlap_end - overlap_start,
+				))
+		return local_spans
 
 	@property
 	def vae_spatial_compression_ratio(self) -> int:
@@ -543,28 +712,34 @@ class DeepWorldHY(nn.Module):
 		latents = self._unscale_vae_latents(latents).to(device=vae_param.device, dtype=vae_param.dtype)
 		with torch.no_grad(), self.vae.memory_efficient_context():
 			return self.vae.decode(latents, return_dict=False)[0]
+	
+	def _uses_concat_condition(self) -> bool:
+		"""Return whether the loaded Hunyuan patch embedder expects condition channels."""
 
-	def _video_condition_channels(self, latents: Tensor) -> Tensor:
+		return bool(getattr(self.transformer.config, "concat_condition", True))
+
+	def _video_patch_input(self, latents: Tensor) -> Tensor:
 		"""Build empty i2v condition channels for target video tokens."""
 
-		mask_channel = torch.zeros(
+		if not self._uses_concat_condition():
+			return latents
+		mask = torch.zeros(
+			latents.size(0), 1, *latents.shape[-3:],
+			device=latents.device, dtype=latents.dtype,
+		)
+		return torch.cat([latents, torch.zeros_like(latents), mask], dim=1)
+
+	def _reference_patch_input(self, latents: Tensor) -> Tensor:
+		"""Build i2v-style condition channels for reference image latents."""
+
+		if not self._uses_concat_condition():
+			return latents
+		mask = torch.ones(
 			latents.size(0), 1, *latents.shape[-3:],
 			device=latents.device,
 			dtype=latents.dtype,
 		)
-		ref_latents = torch.zeros_like(latents)
-		return torch.cat([latents, ref_latents, mask_channel], dim=1)
-
-	def _reference_condition_channels(self, ref_latents: Tensor) -> Tensor:
-		"""Build i2v-style condition channels for reference image latents."""
-
-		mask_channel = torch.ones(
-			ref_latents.size(0), 1, *ref_latents.shape[-3:],
-			device=ref_latents.device,
-			dtype=ref_latents.dtype,
-		)
-		latents = torch.zeros_like(ref_latents)
-		return torch.cat([latents, ref_latents, mask_channel], dim=1)
+		return torch.cat([torch.zeros_like(latents), latents, mask], dim=1)
 
 	def _latent_patch_grid(self, latents: Tensor) -> tuple[int, int, int]:
 		"""Return the Hunyuan patch grid for a latent tensor."""
@@ -623,6 +798,7 @@ class DeepWorldHY(nn.Module):
 				max_length=self.config.dataset.max_text_length,
 			)
 			text_outputs = self.txt_encoder.encode(text_inputs, data_type="video", device=device)
+			# TODO: Why do I need this mask when is no padding or causal needed? If it is necessary, tell me in chat. Otherwise, remove it.
 		return text_outputs.hidden_state.to(device=device, dtype=dtype), text_outputs.attention_mask.to(device)
 
 	def _encode_vis_refs(self, vis_ref_images: Tensor) -> tuple[Tensor, int]:
@@ -679,58 +855,114 @@ class DeepWorldHY(nn.Module):
 			return empty, (1, 0, 0)
 
 		ref_latents = self.encode_vae(vae_ref_images, sample_posterior=False)
-		ref_input = self._reference_condition_channels(ref_latents)
+		ref_input = self._reference_patch_input(ref_latents)
 		ref_tokens = self.transformer.img_in(ref_input.to(dtype=next(self.transformer.parameters()).dtype))
 		ref_tokens = ref_tokens.view(1, -1, ref_tokens.size(-1))
 		return ref_tokens, self._latent_patch_grid(ref_latents)
 
-	def _build_positions(
+	def _build_rope_and_kv_spans(
 		self,
 		video_grid: tuple[int, int, int],
+		video_token_count: int,
 		vae_grid: tuple[int, int, int],
+		vae_token_count: int,
 		geo_grid: tuple[int, int, int],
+		geo_token_count: int,
 		vis_tokens_per_ref: int,
-		text_length: int,
+		vis_token_count: int,
+		txt_token_count: int,
 		reference_count: int,
 		device: torch.device,
-	) -> tuple[tuple[Tensor, Tensor] | None, tuple[Tensor, Tensor] | None, tuple[Tensor, Tensor] | None]:
-		"""Build MRoPE frequencies in video, VAE, geometry, visual, text order."""
+	) -> tuple[RopeSpans, RopeSpans, RopeSpans, KVSpans, KVSpans, KVSpans]:
+		"""Build RoPE and K/V-gate spans in video, VAE, geometry, visual, text order."""
 
 		cursor = 0
-		img_positions: list[Tensor] = []
-		geo_positions: list[Tensor] = []
-		txt_positions: list[Tensor] = []
+		img_rope_spans: RopeSpans = []
+		geo_rope_spans: RopeSpans = []
+		txt_rope_spans: RopeSpans = []
+
+		def add_rope_span(spans: RopeSpans, start: int, positions: Tensor) -> None:
+			"""Append one span's RoPE frequencies when the span is non-empty."""
+
+			if positions.numel() == 0:
+				return
+			freqs_cis = self._build_mrope_freqs(positions)
+			if freqs_cis is not None:
+				spans.append((start, positions.size(0), freqs_cis))
 
 		positions, cursor = self._make_grid_positions(video_grid, cursor, device)
-		img_positions.append(positions)
-		for _ in range(reference_count if self.hy_config.use_vae_tokens else 0):
-			positions, cursor = self._make_grid_positions(vae_grid, cursor, device)
-			img_positions.append(positions)
-		for _ in range(reference_count if self.hy_config.use_geo_tokens else 0):
-			positions, cursor = self._make_grid_positions(geo_grid, cursor, device)
-			geo_positions.append(positions)
-		for _ in range(reference_count if self.hy_config.use_vis_tokens else 0):
-			positions, cursor = self._make_text_positions(vis_tokens_per_ref, cursor, device)
-			txt_positions.append(positions)
-		if self.hy_config.use_txt_tokens:
-			positions, cursor = self._make_text_positions(text_length, cursor, device)
-			txt_positions.append(positions)
+		add_rope_span(img_rope_spans, 0, positions)
 
-		img_freqs = self._build_mrope_freqs(torch.cat(img_positions, dim=0))
-		geo_freqs = self._build_mrope_freqs(torch.cat(geo_positions, dim=0)) if geo_positions else None
-		txt_freqs = self._build_mrope_freqs(torch.cat(txt_positions, dim=0)) if txt_positions else None
-		return img_freqs, geo_freqs, txt_freqs
+		if self.hy_config.use_mrope:
+			vae_tokens_per_ref = math.prod(vae_grid) if vae_token_count > 0 else 0
+			vae_start = video_token_count
+			for _ in range(reference_count if vae_tokens_per_ref > 0 else 0):
+				positions, cursor = self._make_grid_positions(vae_grid, cursor, device)
+				add_rope_span(img_rope_spans, vae_start, positions)
+				vae_start += positions.size(0)
 
-	def _apply_condition_dropout(self, *spans: Tensor) -> tuple[Tensor, ...]:
-		"""Zero non-video conditioning spans for classifier-free-style training."""
+			geo_tokens_per_ref = math.prod(geo_grid) if geo_token_count > 0 else 0
+			geo_start = 0
+			for _ in range(reference_count if geo_tokens_per_ref > 0 else 0):
+				positions, cursor = self._make_grid_positions(geo_grid, cursor, device)
+				add_rope_span(geo_rope_spans, geo_start, positions)
+				geo_start += positions.size(0)
 
-		dropout_prob = self.hy_config.condition_dropout_prob
-		if not self.training or dropout_prob <= 0.0:
-			return spans
-		keep_condition = torch.rand((), device=spans[0].device) >= dropout_prob
-		if keep_condition:
-			return spans
-		return tuple(torch.zeros_like(span) for span in spans)
+			# TODO: You seem to have treated vis_tokens as 1D sequence like text, rather than a 2D grid. This should behave like `vae_tokens` and `geo_tokens` to enhance spatial reasoning capabilities.
+			vis_start = 0
+			for _ in range(reference_count if vis_tokens_per_ref > 0 else 0):
+				positions, cursor = self._make_text_positions(vis_tokens_per_ref, cursor, device)
+				add_rope_span(txt_rope_spans, vis_start, positions)
+				vis_start += positions.size(0)
+			
+			if txt_token_count > 0:
+				positions, cursor = self._make_text_positions(txt_token_count, cursor, device)
+				add_rope_span(txt_rope_spans, vis_token_count, positions)
+
+		img_kv_spans: KVSpans = {}
+		geo_kv_spans: KVSpans = {}
+		txt_kv_spans: KVSpans = {}
+		if vae_token_count > 0:
+			img_kv_spans["vae"] = [(video_token_count, vae_token_count)]
+		if geo_token_count > 0:
+			geo_kv_spans["geo"] = [(0, geo_token_count)]
+		if vis_token_count > 0:
+			txt_kv_spans["vis"] = [(0, vis_token_count)]
+		if txt_token_count > 0:
+			txt_kv_spans["txt"] = [(vis_token_count, txt_token_count)]
+		return img_rope_spans, geo_rope_spans, txt_rope_spans, img_kv_spans, geo_kv_spans, txt_kv_spans
+
+	def _sample_drop(self, prob: float, device: torch.device) -> bool:
+		"""Sample one Bernoulli token-drop decision."""
+
+		return bool(prob > 0.0 and torch.rand((), device=device) < prob)
+
+	def _build_condition_plan(
+		self,
+		batch: dict[str, Any],
+		device: torch.device,
+		force_drop_condition: bool = False,
+		sample_dropout: bool = True,
+	) -> HYConditionPlan:
+		"""Resolve which condition-token encoders should run for this sample."""
+
+		is_t2v = bool(batch.get("is_t2v", False))
+		use_vae = self.hy_config.use_vae_tokens and not is_t2v
+		use_geo = self.hy_config.use_geo_tokens and not is_t2v
+		use_vis = self.hy_config.use_vis_tokens and not is_t2v
+		use_txt = True
+		if force_drop_condition:
+			return HYConditionPlan(False, False, False, False)
+
+		should_sample_dropout = self.training and sample_dropout
+		if should_sample_dropout and self._sample_drop(self.hy_config.condition_dropout_prob, device):
+			return HYConditionPlan(False, False, False, False)
+		if should_sample_dropout and not is_t2v:
+			use_vae = use_vae and not self._sample_drop(self.hy_config.drop_vae_tokens_prob, device)
+			use_geo = use_geo and not self._sample_drop(self.hy_config.drop_geo_tokens_prob, device)
+			use_vis = use_vis and not self._sample_drop(self.hy_config.drop_vis_tokens_prob, device)
+			use_txt = use_txt and not self._sample_drop(self.hy_config.drop_txt_tokens_prob, device)
+		return HYConditionPlan(use_vae, use_geo, use_vis, use_txt)
 
 	def _time_vector(self, timesteps: Tensor, dtype: torch.dtype) -> Tensor:
 		"""Build the Hunyuan time and optional embedded-guidance vector."""
@@ -751,75 +983,96 @@ class DeepWorldHY(nn.Module):
 		latents_noised: Tensor,
 		timesteps: Tensor,
 		batch: dict[str, Any],
+		force_drop_condition: bool = False,
+		sample_dropout: bool = True,
 	) -> Tensor:
 		"""Run the Hunyuan three-stream transformer and predict flow velocity."""
 
 		device = latents_noised.device
 		dtype = next(self.transformer.parameters()).dtype
-		video_input = self._video_condition_channels(latents_noised)
+		hidden_size = self.transformer.hidden_size
+		condition_plan = self._build_condition_plan(
+			batch,
+			device=device,
+			force_drop_condition=force_drop_condition,
+			sample_dropout=sample_dropout,
+		)
+		video_input = self._video_patch_input(latents_noised)
 		video_grid = self._latent_patch_grid(latents_noised)
 		video_token_count = math.prod(video_grid)
 
 		img = self.transformer.img_in(video_input.to(dtype=dtype))
 		img = img + self.modality_embeddings["video"].to(device=device, dtype=img.dtype)
 
-		vae_tokens, vae_grid = self._encode_vae_refs(
-			batch["vae_ref_images"].to(device=device, non_blocking=True),
-		)
-		vae_tokens = vae_tokens + self.modality_embeddings["vae"].to(device=device, dtype=img.dtype)
+		vae_tokens = torch.empty(1, 0, hidden_size, device=device, dtype=dtype)
+		vae_grid = (1, 0, 0)
+		geo_tokens = torch.empty(1, 0, hidden_size, device=device, dtype=dtype)
+		geo_grid = (1, 0, 0)
+		vis_tokens = torch.empty(1, 0, hidden_size, device=device, dtype=dtype)
+		vis_mask = torch.empty(1, 0, device=device, dtype=torch.long)
+		vis_tokens_per_ref = 0
+		txt_tokens = torch.empty(1, 0, hidden_size, device=device, dtype=dtype)
+		txt_mask = torch.empty(1, 0, device=device, dtype=torch.long)
+		
+		if condition_plan.use_vae:
+			refs = batch["vae_ref_images"].to(device=device, non_blocking=True)
+			vae_tokens, vae_grid = self._encode_vae_refs(refs)
+			vae_tokens = vae_tokens + self.modality_embeddings["vae"].to(device=device, dtype=img.dtype)
+		
+		if condition_plan.use_geo:
+			refs = batch["geo_ref_images"].to(device=device, non_blocking=True)
+			geo_tokens, geo_grid = self._encode_geo_refs(refs)
+			geo_tokens = geo_tokens + self.modality_embeddings["geo"].to(device=device, dtype=img.dtype)
+		
+		if condition_plan.use_vis:
+			refs = batch["vis_ref_images"].to(device=device, non_blocking=True)
+			vis_tokens, vis_tokens_per_ref = self._encode_vis_refs(refs)
+			vis_tokens = vis_tokens + self.modality_embeddings["vis"].to(device=device, dtype=img.dtype)
+			vis_mask = torch.ones(vis_tokens.size()[:2], device=device, dtype=torch.long)
 
-		geo_tokens, geo_grid = self._encode_geo_refs(
-			batch["geo_ref_images"].to(device=device, non_blocking=True),
-		)
-		geo_tokens = geo_tokens + self.modality_embeddings["geo"].to(device=device, dtype=img.dtype)
-
-		text_states, text_mask = self._encode_text(batch["prompt"], device=device, dtype=dtype)
-		if not self.hy_config.use_txt_tokens:
-			text_states = text_states[:, :0]
-			text_mask = text_mask[:, :0]
-		if text_states.size(1) > 0:
+		if condition_plan.use_txt:
+			text_states, txt_mask = self._encode_text(batch["prompt"], device=device, dtype=dtype)
 			if self.transformer.text_projection == "linear":
-				text_tokens = self.transformer.txt_in(text_states)
+				txt_tokens = self.transformer.txt_in(text_states)
 			else:
-				text_tokens = self.transformer.txt_in(
-					text_states,
-					timesteps,
-					text_mask if self.transformer.use_attention_mask else None,
-				)
-		else:
-			text_tokens = torch.empty(1, 0, self.transformer.hidden_size, device=device, dtype=dtype)
-		txt_tokens = text_tokens + self.modality_embeddings["txt"].to(device=device, dtype=img.dtype)
-
-		vis_tokens, vis_tokens_per_ref = self._encode_vis_refs(
-			batch["vis_ref_images"].to(device=device, non_blocking=True),
-		)
-		vis_tokens = vis_tokens + self.modality_embeddings["vis"].to(device=device, dtype=img.dtype)
-		vis_mask = torch.ones(vis_tokens.size()[:2], device=device, dtype=text_mask.dtype)
-
-		vae_tokens, geo_tokens, vis_tokens, txt_tokens = self._apply_condition_dropout(
-			vae_tokens,
-			geo_tokens,
-			vis_tokens,
-			txt_tokens,
-		)
-
+				txt_tokens = self.transformer.txt_in(text_states, timesteps, txt_mask if self.transformer.use_attention_mask else None)
+			txt_tokens = txt_tokens + self.modality_embeddings["txt"].to(device=device, dtype=img.dtype)
+		
 		img = torch.cat([img, vae_tokens.to(dtype=img.dtype)], dim=1)
 		txt = torch.cat([vis_tokens.to(dtype=img.dtype), txt_tokens.to(dtype=img.dtype)], dim=1)
-		txt_mask = torch.cat([vis_mask, text_mask], dim=1)
+		txt_mask = torch.cat([vis_mask, txt_mask], dim=1)
 		geo = geo_tokens.to(dtype=img.dtype)
 
 		reference_count = int(batch["vis_ref_images"].size(0))
-		img_freqs, geo_freqs, txt_freqs = self._build_positions(
+		(
+			img_rope_spans,
+			geo_rope_spans,
+			txt_rope_spans,
+			img_kv_spans,
+			geo_kv_spans,
+			txt_kv_spans,
+		) = self._build_rope_and_kv_spans(
 			video_grid=video_grid,
+			video_token_count=video_token_count,
 			vae_grid=vae_grid,
+			vae_token_count=int(vae_tokens.size(1)),
 			geo_grid=geo_grid,
+			geo_token_count=int(geo_tokens.size(1)),
 			vis_tokens_per_ref=vis_tokens_per_ref,
-			text_length=int(txt_tokens.size(1)),
+			vis_token_count=int(vis_tokens.size(1)),
+			txt_token_count=int(txt_tokens.size(1)),
 			reference_count=reference_count,
 			device=device,
 		)
-		img, img_freqs, _, _ = self._split_for_sequence_parallel(img, img_freqs, "image")
-		geo, geo_freqs, _, _ = self._split_for_sequence_parallel(geo, geo_freqs, "geometry")
+		# TODO: You have embeded _localize_rope_spans into _split_for_sequence_parallel, why not do the same with `_localize_gate_spans`?
+		img, img_rope_spans, img_local_start, img_local_end = self._split_for_sequence_parallel(
+			img, img_rope_spans, "image",
+		)
+		img_kv_spans = self._localize_gate_spans(img_kv_spans, img_local_start, img_local_end)
+		geo, geo_rope_spans, geo_local_start, geo_local_end = self._split_for_sequence_parallel(
+			geo, geo_rope_spans, "geometry",
+		)
+		geo_kv_spans = self._localize_gate_spans(geo_kv_spans, geo_local_start, geo_local_end)
 
 		self.transformer.attn_param["thw"] = list(video_grid)
 		vec = self._time_vector(timesteps, dtype=img.dtype)
@@ -831,9 +1084,12 @@ class DeepWorldHY(nn.Module):
 				geo=geo,
 				txt=txt,
 				vec=vec,
-				img_freqs=img_freqs,
-				geo_freqs=geo_freqs,
-				txt_freqs=txt_freqs,
+				img_rope_spans=img_rope_spans,
+				geo_rope_spans=geo_rope_spans,
+				txt_rope_spans=txt_rope_spans,
+				img_kv_spans=img_kv_spans,
+				geo_kv_spans=geo_kv_spans,
+				txt_kv_spans=txt_kv_spans,
 				text_mask=txt_mask,
 				attn_param=self.transformer.attn_param,
 				is_flash=False,
@@ -842,6 +1098,16 @@ class DeepWorldHY(nn.Module):
 
 		img_len, geo_len, txt_len = img.size(1), geo.size(1), txt.size(1)
 		x = torch.cat([img, geo, txt], dim=1)
+		single_rope_spans = (
+			img_rope_spans
+			+ _offset_rope_spans(geo_rope_spans, img_len)
+			+ _offset_rope_spans(txt_rope_spans, img_len + geo_len)
+		)
+		single_kv_spans = _merge_kv_spans(
+			img_kv_spans,
+			_offset_kv_spans(geo_kv_spans, img_len),
+			_offset_kv_spans(txt_kv_spans, img_len + geo_len),
+		)
 		
 		for index, block in enumerate(self.transformer.single_blocks):
 			self.transformer.attn_param["layer-name"] = f"world_single_block_{index + 1}"
@@ -851,9 +1117,8 @@ class DeepWorldHY(nn.Module):
 				img_len=img_len,
 				geo_len=geo_len,
 				txt_len=txt_len,
-				img_freqs=img_freqs,
-				geo_freqs=geo_freqs,
-				txt_freqs=txt_freqs,
+				rope_spans=single_rope_spans,
+				kv_spans=single_kv_spans,
 				text_mask=txt_mask,
 				attn_param=self.transformer.attn_param,
 				is_flash=False,
@@ -941,7 +1206,7 @@ class DeepWorldHY(nn.Module):
 
 		return FlowMatchDiscreteScheduler(
 			num_train_timesteps=self.hy_config.num_train_timesteps,
-			shift=self.hy_config.validation_timestep_shift,
+			shift=self.hy_config.eval_timestep_shift,
 			reverse=True,
 			solver="euler",
 		)
@@ -987,7 +1252,26 @@ class DeepWorldHY(nn.Module):
 				model_input,
 				timestep.view(1),
 				batch,
+				sample_dropout=False,
 			)
+			if self.hy_config.cfg_guidance_scale > 1.0:
+				model_output_uncond = self.predict_velocity(
+					model_input,
+					timestep.view(1),
+					batch,
+					force_drop_condition=True,
+					sample_dropout=False,
+				)
+				model_output_text = model_output
+				model_output = model_output_uncond + self.hy_config.cfg_guidance_scale * (
+					model_output_text - model_output_uncond
+				)
+				if self.hy_config.cfg_guidance_rescale > 0.0:
+					model_output = rescale_noise_cfg(
+						model_output,
+						model_output_text,
+						guidance_rescale=self.hy_config.cfg_guidance_rescale,
+					)
 			latents = scheduler.step(model_output, timestep, latents, return_dict=False)[0].to(dtype=dtype)
 
 		return self.decode_latents(latents)[0]
@@ -1006,7 +1290,7 @@ class DeepWorldHY(nn.Module):
 
 		device = next(self.transformer.parameters()).device
 		video = batch["video"].unsqueeze(0).to(device=device, non_blocking=True)
-		latents = self.encode_vae(video, sample_posterior=False)
+		latents = self.encode_vae(video, sample_posterior=self.hy_config.video_vae_sample)
 
 		noise = torch.randn_like(latents)
 		timesteps = self._sample_timestep(device=latents.device)

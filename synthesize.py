@@ -774,6 +774,7 @@ class DataSamplingStage:
 			"split": self.args.split,
 			"ref_imgs": [],
 			"gt_clip": {},
+			"video_caption": "",
 			"synthesized_prompt": "",
 			"distilled_prompts": {},
 		}
@@ -1253,7 +1254,7 @@ class VideoCaptioningStage:
 		
 
 	def __call__(self, ctx: SampleContext) -> None:
-		"""Save `video_caption.json`."""
+		"""Update the manifest entry with `video_caption`."""
 
 		clip_seconds = f"{ctx.clip_duration_s:g}"
 		path = ctx.intermediate_dir / "motion_caption.json"
@@ -1277,9 +1278,8 @@ class VideoCaptioningStage:
 				"resized_height": self.args.video_captioning_height,
 			}],
 		)
-		write_json_file(ctx.intermediate_dir / "video_caption.json", {
-			"video_caption": self.vlm.json_by_key(result, "video_caption"),
-		})
+		video_caption = self.vlm.json_by_key(result, "video_caption")
+		ctx.manifest_entry["video_caption"] = video_caption
 
 
 class ImageCaptioningStage:
@@ -1334,13 +1334,12 @@ class CaptionWiringStage:
 	def __call__(self, ctx: SampleContext) -> None:
 		"""Save `wired_caption.json`."""
 
-		path = ctx.intermediate_dir / "video_caption.json"
-		video_caption_json = self.llm.json_to_str(read_json_file(path))
+		video_caption = ctx.manifest_entry["video_caption"]
 		path = ctx.intermediate_dir / "image_captions.json"
 		image_captions_json = self.llm.json_to_str(read_json_file(path))
 		prompt = (
 			CAPTION_WIRING_TEMPLATE
-			.replace("<VIDEO_CAPTION_JSON>", video_caption_json)
+			.replace("<VIDEO_CAPTION>", video_caption)
 			.replace("<IMAGE_CAPTIONS_JSON>", image_captions_json)
 		)
 		result = self.llm.generate_json(
@@ -1402,15 +1401,14 @@ class CriticJudgingStage:
 
 		path = ctx.intermediate_dir / "motion_caption.json"
 		motion_caption_json = self.llm.json_to_str(read_json_file(path))
-		path = ctx.intermediate_dir / "video_caption.json"
-		video_caption_json = self.llm.json_to_str(read_json_file(path))
+		video_caption = ctx.manifest_entry["video_caption"]
 		path = ctx.intermediate_dir / "image_captions.json"
 		image_captions_json = self.llm.json_to_str(read_json_file(path))
 		synthesized_prompt = ctx.manifest_entry["synthesized_prompt"]
 		prompt = (
 			CRITIC_JUDGING_TEMPLATE
 			.replace("<MOTION_CAPTION_JSON>", motion_caption_json)
-			.replace("<VIDEO_CAPTION_JSON>", video_caption_json)
+			.replace("<VIDEO_CAPTION>", video_caption)
 			.replace("<IMAGE_CAPTIONS_JSON>", image_captions_json)
 			.replace("<SYNTHESIZED_PROMPT>", synthesized_prompt)
 		)

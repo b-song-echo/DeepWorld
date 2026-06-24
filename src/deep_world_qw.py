@@ -230,6 +230,7 @@ class DeepWorldQWBrain(nn.Module):
 		self.vision_encoder = qwen.visual
 		self.get_image_features = qwen.get_image_features
 		self.hidden_size = qwen.config.text_config.hidden_size
+		# TODO: Remove this property. It should be inferred locally inside `_encode_visual`.
 		self.vis_patch_size = qwen.config.vision_config.spatial_merge_size
 
 		replaced_layers = [MoFfnQwenDecoderLayer(
@@ -276,6 +277,7 @@ class DeepWorldQWBrain(nn.Module):
 			self.geometry_encoder.to(dtype=vggt_dtype)
 		self.geometry_encoder.requires_grad_(False)
 
+		# TODO: Remove this property. It is inferred locally inside `encode_geometry`, nor is it accessed outside.
 		self.geo_patch_size = self.geometry_encoder.aggregator.patch_size
 		geo_hidden_size = self.geometry_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
 		self.geo_bridge = nn.Sequential(

@@ -10,6 +10,7 @@ dataset:
   prompt_rich_prob: 0.5
   prompt_medium_prob: 0.3
   prompt_coarse_prob: 0.2
+  mixing_t2v_prob: 0.0
   vis_image_size: 448
   geo_image_size: 448
   max_text_length: 512
