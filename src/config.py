@@ -28,7 +28,7 @@ class DatasetConfig:
 	prompt_coarse_prob: float = 0.2
 	mixing_t2v_prob: float = 0.2
 	vis_image_size: int = 448
-	geo_image_size: int | None = None
+	geo_image_size: int = 448
 	max_text_length: int = 1024
 	eval_num_samples: int = 0
 	shuffle: bool = True
@@ -264,15 +264,10 @@ class DeepWorldHYModelConfig:
 	video_vae_sample: bool = False
 	cfg_guidance_scale: float = 1.0
 	cfg_guidance_rescale: float = 0.0
-	# TODO: Merge `use_xxx_kv_gate` and `xxx_kv_gate_init` into a single one: `xxx_kv_gate`. When set to None, do not use gates, otherwise, use it as init value for learnable gates.
-	use_vae_kv_gate: bool = True
-	use_geo_kv_gate: bool = True
-	use_vis_kv_gate: bool = True
-	use_txt_kv_gate: bool = False
-	vae_kv_gate_init: float = 0.0
-	geo_kv_gate_init: float = 0.0
-	vis_kv_gate_init: float = 0.0
-	txt_kv_gate_init: float = 0.0
+	vae_kv_gate: float | None = 0.0
+	geo_kv_gate: float | None = 0.0
+	vis_kv_gate: float | None = 0.0
+	txt_kv_gate: float | None = None
 	lora_rank: int = 16
 	lora_alpha: int | None = None
 	lora_dropout: float = 0.05
@@ -285,7 +280,6 @@ class DeepWorldHYModelConfig:
 	guidance: float = 6016.0
 	num_train_timesteps: int = 1000
 	train_timestep_shift: float = 3.0
-	# TODO: You included this config but never used it. I have told you, never leave unused or redundant code, either use it, or remove it.
 	eval_timestep_shift: float = 5.0
 	snr_type: str = "lognorm"
 	inference_steps: int = 50
@@ -328,6 +322,14 @@ class DeepWorldHYModelConfig:
 				"`model.cfg_guidance_rescale` must be in [0, 1], "
 				f"got {self.cfg_guidance_rescale}."
 			)
+		for name, value in (
+			("vae_kv_gate", self.vae_kv_gate),
+			("geo_kv_gate", self.geo_kv_gate),
+			("vis_kv_gate", self.vis_kv_gate),
+			("txt_kv_gate", self.txt_kv_gate),
+		):
+			if value is not None:
+				setattr(self, name, float(value))
 		if self.lora_rank <= 0:
 			raise ValueError(f"`model.lora_rank` must be positive, got {self.lora_rank}.")
 		if self.geo_stream_init not in {"copy_image", "fresh"}:
@@ -430,49 +432,9 @@ def load_qw_config(path: str | Path) -> DeepWorldQWConfig:
 def load_hy_config(path: str | Path) -> DeepWorldHYConfig:
 	"""Load a DeepWorldHY YAML config."""
 
-	payload = load_yaml_config(path)
-	if "flow_matching" in payload:
-		model_payload = payload.setdefault("model", {})
-		for key, value in payload.pop("flow_matching").items():
-			if key in model_payload:
-				raise ValueError(
-					f"`flow_matching.{key}` duplicates `model.{key}`; keep the setting under `model`."
-				)
-			model_payload[key] = value
-
-	optimizer_payload = payload.get("optimizer", {})
-	# TODO: Would you stop doing these? I have already told you, remove legacy code, **do not** maintain compatability with previous code.
-	for old_name, new_name in (
-		("transformer_learning_rate", "adapter_learning_rate"),
-		("geometry_learning_rate", "geo_stream_learning_rate"),
-	):
-		if old_name in optimizer_payload:
-			if new_name in optimizer_payload:
-				raise ValueError(
-					f"`optimizer.{old_name}` duplicates `optimizer.{new_name}`; use `{new_name}`."
-				)
-			optimizer_payload[new_name] = optimizer_payload.pop(old_name)
-
-	model_payload = payload.get("model", {})
-	for old_name, new_name in (
-		("use_reference_vae_tokens", "use_vae_tokens"),
-		("use_siglip_tokens", "use_vis_tokens"),
-		("use_geometry_tokens", "use_geo_tokens"),
-	):
-		if old_name in model_payload:
-			if new_name in model_payload:
-				raise ValueError(
-					f"`model.{old_name}` duplicates `model.{new_name}`; use `{new_name}`."
-				)
-			model_payload[new_name] = model_payload.pop(old_name)
-
-	valid_sections = {field.name for field in fields(DeepWorldHYConfig)}
-	unknown_sections = sorted(set(payload) - valid_sections)
-	if unknown_sections:
-		raise ValueError(f"Unknown root config section(s): {', '.join(unknown_sections)}")
-	return DeepWorldHYConfig(
-		dataset=dataclass_from_dict(DatasetConfig, payload.get("dataset", {})),
-		optimizer=dataclass_from_dict(DeepWorldHYOptimizerConfig, optimizer_payload),
-		training=dataclass_from_dict(TrainingConfig, payload.get("training", {})),
-		model=dataclass_from_dict(DeepWorldHYModelConfig, model_payload),
-	)
+	return load_config_from_sections(path, DeepWorldHYConfig, {
+		"dataset": DatasetConfig,
+		"optimizer": DeepWorldHYOptimizerConfig,
+		"training": TrainingConfig,
+		"model": DeepWorldHYModelConfig,
+	})

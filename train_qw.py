@@ -520,7 +520,7 @@ def evaluate(
 			
 			with torch.no_grad():
 				with accelerator.autocast():
-					outputs = model(batch, generate_samples=True, generator=generator)
+					outputs = model(batch, generate_sample=True, generator=generator)
 
 			video = outputs["video"].detach().cpu()
 			global_eval_index = num_saved * accelerator.num_processes + accelerator.process_index
@@ -629,18 +629,11 @@ def main() -> None:
 
 	dataset = WorldDataset(config.dataset)
 	processor = AutoProcessor.from_pretrained(config.brain.checkpoint_path, local_files_only=True)
-	# TODO: Collator should no longer accept geo_patch_size. And do not print patch size here.
 	collator = DeepWorldQWBatchCollator(
 		dataset_config=config.dataset,
 		tokenizer=processor.tokenizer,
 		image_processor=processor.image_processor,
-		geo_patch_size=model.brain.geo_patch_size,
 	)
-	if collator.geo_image_size != config.dataset.vis_image_size:
-		accelerator.print(
-			f"Adjusted VGGT geometry image size from {config.dataset.vis_image_size} to {collator.geo_image_size} "
-			f"to match patch size {collator.geo_patch_size}."
-		)
 
 	dataloader = create_train_dataloader(
 		dataset=dataset,

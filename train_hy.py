@@ -494,8 +494,7 @@ def main() -> None:
 	load_pretrained_model_state(model, config.training.pretrained_model_path, is_main_process)
 	optimizer = build_optimizer(model, config)
 
-	# TODO: Collator should no longer take geo_patch_size as argument.
-	collator = DeepWorldHYBatchCollator(config.dataset, geo_patch_size=model.geo_patch_size)
+	collator = DeepWorldHYBatchCollator(config.dataset)
 	dataloader = build_train_dataloader(config, collator)
 	eval_bundle = build_eval_dataloader(config, collator, rank)
 	total_training_steps = compute_total_training_steps(dataloader, config)

@@ -1,4 +1,4 @@
-    ## Overview
+## Overview
 
 I’m working on `DeepWorldHY`. It is a world model built on top of HunyuanVideo-1.5, to be trained on synthesized data to perform scene-grounded video generation.
 
@@ -13,9 +13,9 @@ Additionally, we may use adapters, projectors, embeddings, and other tricks to m
 For distributed training, we will train the model on 8 NVIDIA A100-80G GPUs. Use optional FSDP2, sequence parallelism, and gradient checkpointing. Local batch size is no larger than 1. For evaluation, we generate a couple of samples from the eval set and save the, to disk.
 
 
-## Your task
+## The previous tasks
 
-This is a tough task, it involves edits across different topics. Please think carefully and implement synergistically.
+These are the prompted to Codex in another session. Codex had already implemented them.
 
 ### Config toggles
 

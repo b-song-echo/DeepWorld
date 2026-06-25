@@ -19,43 +19,6 @@ from src.utils import (
 )
 
 
-# TODO: Get rid of this function. There is no need to check geometry image size in code. This is always chosen by hand to ensure divisibility.
-def resolve_geo_image_size(dataset_config: DatasetConfig, patch_size: int) -> int:
-	"""Resolve the square VGGT input size from config and patch-grid constraints.
-
-	Args:
-		dataset_config: Dataset section of the root config.
-		patch_size: VGGT patch size that the image resolution must be divisible by.
-
-	Returns:
-		A valid VGGT image size divisible by `patch_size`.
-
-	Raises:
-		ValueError: If the configured geometry image size is invalid.
-	"""
-
-	if patch_size <= 0:
-		raise ValueError(f"`patch_size` must be positive, got {patch_size}.")
-
-	if dataset_config.geo_image_size is not None:
-		if dataset_config.geo_image_size < patch_size:
-			raise ValueError(
-				f"`dataset.geo_image_size={dataset_config.geo_image_size}` must be at least the VGGT patch size {patch_size}."
-			)
-		if dataset_config.geo_image_size % patch_size != 0:
-			raise ValueError(
-				f"`dataset.geo_image_size={dataset_config.geo_image_size}` must be divisible by the VGGT patch size {patch_size}."
-			)
-		return dataset_config.geo_image_size
-
-	aligned_size = (dataset_config.vis_image_size // patch_size) * patch_size
-	if aligned_size < patch_size:
-		raise ValueError(
-			f"`dataset.vis_image_size={dataset_config.vis_image_size}` is too small for the VGGT patch size {patch_size}."
-		)
-	return aligned_size
-
-
 @dataclass
 class WorldModelSample:
 	"""In-memory representation of one training sample.
@@ -65,14 +28,12 @@ class WorldModelSample:
 		prompt: Text prompt describing scene and camera motion.
 		reference_images: List of RGB reference images as PIL objects.
 		video: GT video clip tensor with shape `(T, 3, H, W)`.
-		is_t2v: Whether this sample is assigned to the pure text-to-video task.
 	"""
 
 	sample_id: str
 	prompt: str
 	reference_images: list[Any]
 	video: Tensor
-	is_t2v: bool = False
 
 
 class WorldDataset(Dataset):
@@ -84,19 +45,16 @@ class WorldDataset(Dataset):
 	the prompt may refer to "the first image" or similar fixed indices.
 	"""
 
-	# TODO: This is absurd, why include a separate `mixing_t2v_prob` when the config already had one? You can simply change DeepWorldQW config then you don't have to patch the code like this! I have already fixed it, this is really ugly, please don't do something like this again.
-	def __init__(self, config: DatasetConfig, mixing_t2v_prob: float | None = None):
+	def __init__(self, config: DatasetConfig):
 		"""Initialize the dataset and load the manifest.
 
 		Args:
 			config: Dataset section of the root config.
-			mixing_t2v_prob: Optional override for mixed pure-T2V sampling.
 		"""
 
 		if not config.manifest_path:
 			raise ValueError("`dataset.manifest_path` must point to a curated JSONL manifest.")
 		self.config = config
-		self.mixing_t2v_prob = config.mixing_t2v_prob if mixing_t2v_prob is None else mixing_t2v_prob
 		self.data_root = Path(config.data_root) if config.data_root else Path(config.manifest_path).parent
 		self.records = self._load_manifest(config.manifest_path)
 		if config.num_samples > 0:
@@ -141,16 +99,18 @@ class WorldDataset(Dataset):
 			return candidate
 		return self.data_root / candidate
 
-	# TODO: Why not merge the following two methods into a single one?
-	def _choose_prompt(self, record: dict[str, Any]) -> str:
-		"""Sample one prompt granularity according to configured probabilities.
+	def _choose_prompt(self, record: dict[str, Any]) -> tuple[str, bool]:
+		"""Choose one task assignment and the matching prompt.
 
 		Args:
-			record: Parsed manifest row containing rich and distilled prompts.
+			record: Parsed manifest row containing caption and prompt fields.
 
 		Returns:
-			The selected prompt string.
+			The selected prompt and whether reference images should be loaded.
 		"""
+
+		if random.random() < self.config.mixing_t2v_prob:
+			return str(record.get("video_caption") or record["synthesized_prompt"]), False
 
 		distilled = record.get("distilled_prompts") or {}
 		prompt_table = [
@@ -164,23 +124,8 @@ class WorldDataset(Dataset):
 		for prompt, weight in prompt_table:
 			running += weight
 			if draw <= running:
-				return prompt
-		return prompt_table[-1][0]
-
-	def _choose_task_prompt(self, record: dict[str, Any]) -> tuple[str, bool]:
-		"""Choose the task assignment and matching prompt for one manifest row.
-
-		Args:
-			record: Parsed manifest row containing caption and prompt fields.
-
-		Returns:
-			The selected prompt and whether the sample is pure text-to-video.
-		"""
-
-		is_t2v = random.random() < self.mixing_t2v_prob
-		if is_t2v:
-			return str(record.get("video_caption") or record["synthesized_prompt"]), True
-		return self._choose_prompt(record), False
+				return prompt, True
+		return prompt_table[-1][0], True
 
 	def __len__(self) -> int:
 		"""Return the active manifest subset size."""
@@ -198,11 +143,10 @@ class WorldDataset(Dataset):
 		"""
 
 		record = self.records[index]
-		prompt, is_t2v = self._choose_task_prompt(record)
-		# TODO: `WorldModelSample` should not include a dedicated `is_t2v` property, it automatically becomes pure-text-to-video when `reference_images` is empty.
+		prompt, use_references = self._choose_prompt(record)
 		reference_images = [
 			load_image(self._resolve_path(ref["path"]))
-			for ref in ([] if is_t2v else record["ref_imgs"])
+			for ref in (record["ref_imgs"] if use_references else [])
 		]
 		video = load_video_frames(
 			self._resolve_path(record["gt_clip"]["path"]),
@@ -217,11 +161,9 @@ class WorldDataset(Dataset):
 			prompt=prompt,
 			reference_images=reference_images,
 			video=video,
-			is_t2v=is_t2v,
 		)
 
 
-# TODO: The following two collators should not take `geo_patch_size` as argument, because they are no longer responsible for checking VGGT patch size divisibility.
 class DeepWorldQWBatchCollator:
 	"""Collate raw samples into the Qwen/Wan model-specific input views.
 
@@ -229,28 +171,25 @@ class DeepWorldQWBatchCollator:
 	reference-image, prompt, and video views without adding a sample batch axis.
 	"""
 
-	def __init__(self, dataset_config: DatasetConfig, tokenizer, image_processor, geo_patch_size: int):
+	def __init__(self, dataset_config: DatasetConfig, tokenizer, image_processor):
 		"""Create the QW collator.
 
 		Args:
 			dataset_config: Dataset section of the root config.
 			tokenizer: Qwen tokenizer used for prompt text.
 			image_processor: Qwen image processor used for reference images.
-			geo_patch_size: VGGT patch size used to validate geometry image resolution.
 		"""
 
 		self.dataset_config = dataset_config
 		self.tokenizer = tokenizer
 		self.image_processor = image_processor
-		self.geo_patch_size = geo_patch_size
-		self.geo_image_size = resolve_geo_image_size(dataset_config, geo_patch_size)
 
 	def _build_reference_views(self, sample: WorldModelSample) -> tuple[list[Any], Tensor]:
 		"""Prepare one sample's reference images for Qwen and VGGT."""
 
 		reference_count = len(sample.reference_images)
 		vis_size = self.dataset_config.vis_image_size
-		geo_size = self.geo_image_size
+		geo_size = self.dataset_config.geo_image_size
 		vis_images_flat: list[Any] = []
 		geo_images = torch.empty(reference_count, 3, geo_size, geo_size, dtype=torch.float32)
 
@@ -284,7 +223,13 @@ class DeepWorldQWBatchCollator:
 			return_tensors="pt",
 		)
 		vis_images_flat, geo_images = self._build_reference_views(sample)
-		vis_inputs = self.image_processor(images=vis_images_flat, do_resize=False, return_tensors="pt")
+		if vis_images_flat:
+			vis_inputs = self.image_processor(images=vis_images_flat, do_resize=False, return_tensors="pt")
+			qwen_vis_pixel_values = vis_inputs["pixel_values"]
+			qwen_vis_grid_thw = torch.as_tensor(vis_inputs["image_grid_thw"], dtype=torch.long)
+		else:
+			qwen_vis_pixel_values = torch.empty(0)
+			qwen_vis_grid_thw = torch.empty(0, 3, dtype=torch.long)
 		video = sample.video.permute(1, 0, 2, 3).contiguous()
 
 		return {
@@ -292,11 +237,10 @@ class DeepWorldQWBatchCollator:
 			"prompt": sample.prompt,
 			"txt_input_ids": txt_inputs["input_ids"][0],
 			"txt_attention_mask": txt_inputs["attention_mask"][0],
-			"qwen_vis_pixel_values": vis_inputs["pixel_values"],
-			"qwen_vis_grid_thw": torch.as_tensor(vis_inputs["image_grid_thw"], dtype=torch.long),
+			"qwen_vis_pixel_values": qwen_vis_pixel_values,
+			"qwen_vis_grid_thw": qwen_vis_grid_thw,
 			"geo_images": geo_images,
 			"video": video,
-			"is_t2v": sample.is_t2v,
 		}
 
 
@@ -315,17 +259,14 @@ class DeepWorldHYBatchCollator:
 	added here.
 	"""
 
-	def __init__(self, dataset_config: DatasetConfig, geo_patch_size: int):
+	def __init__(self, dataset_config: DatasetConfig):
 		"""Create the Hunyuan collator.
 
 		Args:
 			dataset_config: Dataset section of the root config.
-			geo_patch_size: VGGT patch size used to validate geometry image resolution.
 		"""
 
 		self.dataset_config = dataset_config
-		self.geo_patch_size = geo_patch_size
-		self.geo_image_size = resolve_geo_image_size(dataset_config, geo_patch_size)
 
 	def _build_reference_views(
 		self,
@@ -335,7 +276,7 @@ class DeepWorldHYBatchCollator:
 
 		reference_count = len(sample.reference_images)
 		vis_size = self.dataset_config.vis_image_size
-		geo_size = self.geo_image_size
+		geo_size = self.dataset_config.geo_image_size
 		vae_height = self.dataset_config.video_height
 		vae_width = self.dataset_config.video_width
 
@@ -367,5 +308,4 @@ class DeepWorldHYBatchCollator:
 			"geo_ref_images": geo_ref_images,
 			"vae_ref_images": vae_ref_images,
 			"video": video,
-			"is_t2v": sample.is_t2v,
 		}

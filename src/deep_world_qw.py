@@ -230,8 +230,6 @@ class DeepWorldQWBrain(nn.Module):
 		self.vision_encoder = qwen.visual
 		self.get_image_features = qwen.get_image_features
 		self.hidden_size = qwen.config.text_config.hidden_size
-		# TODO: Remove this property. It should be inferred locally inside `_encode_visual`.
-		self.vis_patch_size = qwen.config.vision_config.spatial_merge_size
 
 		replaced_layers = [MoFfnQwenDecoderLayer(
 			original_layer=layer,
@@ -277,8 +275,6 @@ class DeepWorldQWBrain(nn.Module):
 			self.geometry_encoder.to(dtype=vggt_dtype)
 		self.geometry_encoder.requires_grad_(False)
 
-		# TODO: Remove this property. It is inferred locally inside `encode_geometry`, nor is it accessed outside.
-		self.geo_patch_size = self.geometry_encoder.aggregator.patch_size
 		geo_hidden_size = self.geometry_encoder.aggregator.frame_blocks[0].norm1.weight.size(0) * 2
 		self.geo_bridge = nn.Sequential(
 			nn.Linear(geo_hidden_size, self.hidden_size, dtype=trainable_dtype),
@@ -303,6 +299,9 @@ class DeepWorldQWBrain(nn.Module):
 	) -> tuple[list[Tensor], list[tuple[int, int, int]]]:
 		"""Extract one sample's reference-image tokens with Qwen's frozen vision encoder."""
 
+		if image_grid_thw.numel() == 0:
+			return [], []
+
 		device = next(self.parameters()).device
 		vis_dtype = next(self.vision_encoder.parameters()).dtype
 		with torch.no_grad():
@@ -323,9 +322,9 @@ class DeepWorldQWBrain(nn.Module):
 			vis_features = [image_features] if image_features.dim() == 2 else list(image_features)
 
 		vis_grids: list[tuple[int, int, int]] = []
+		patch_size = self.vision_encoder.config.spatial_merge_size
 		for grid in image_grid_thw:
 			grid_t, grid_h, grid_w = grid.tolist()
-			patch_size = self.vis_patch_size
 			vis_grids.append((grid_t, grid_h // patch_size, grid_w // patch_size))
 		return vis_features, vis_grids
 
@@ -333,6 +332,9 @@ class DeepWorldQWBrain(nn.Module):
 		self, geo_images: Tensor,
 	) -> tuple[list[Tensor], list[tuple[int, int, int]]]:
 		"""Extract one sample's reference-image geometry tokens with frozen VGGT."""
+
+		if geo_images.numel() == 0:
+			return [], []
 
 		device = next(self.parameters()).device
 		vggt_dtype = next(self.geometry_encoder.aggregator.parameters()).dtype
@@ -1095,17 +1097,7 @@ class DeepWorldQW(nn.Module):
 		generate_sample: bool = False,
 		generator: torch.Generator | None = None,
 	) -> dict[str, Tensor]:
-		"""Run one training forward pass and return latent-space denoising loss.
-
-		Args:
-			batch: Collated training batch produced by the dataset pipeline.
-			return_auxiliary: Whether to include non-loss tensors in the return payload.
-			generate_samples: Whether to run the inference path instead of training loss computation.
-			generator: Optional random generator used by the inference path.
-
-		Returns:
-			A dictionary containing the scalar loss, generated videos, or optional auxiliary tensors.
-		"""
+		"""Run one training forward pass and return latent-space denoising loss."""
 
 		if generate_sample:
 			return {"video": self.generate(batch, generator=generator)}

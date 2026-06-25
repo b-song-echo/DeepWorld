@@ -68,14 +68,10 @@ model:
   video_vae_sample: false
   cfg_guidance_scale: 1.0
   cfg_guidance_rescale: 0.0
-  use_vae_kv_gate: true
-  use_geo_kv_gate: true
-  use_vis_kv_gate: true
-  use_txt_kv_gate: false
-  vae_kv_gate_init: 0.0
-  geo_kv_gate_init: 0.0
-  vis_kv_gate_init: 0.0
-  txt_kv_gate_init: 0.0
+  vae_kv_gate: 0.0
+  geo_kv_gate: 0.0
+  vis_kv_gate: 0.0
+  txt_kv_gate: null
   lora_rank: 16
   lora_alpha: null
   lora_dropout: 0.05
